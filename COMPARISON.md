@@ -1,0 +1,37 @@
+# Alternatives and tradeoffs
+
+Reviewed September 6, 2026 using upstream documentation and source at the revisions below. This is an engineering assessment, **not a runtime benchmark or security audit** of competitors. Only this project's stated acceptance tests were run locally. Feature groups in a cross-platform README do not necessarily work on Linux.
+
+## Decision
+
+Keep and share this project as a focused X11 option. Its useful combination is persistent agent-side Python variables, loops and state checks, real Linux accessibility, physical input with recovery, and a five-tool MCP interface. It works with the existing Codex installation, without repackaging the desktop app. The recorded fresh-session test establishes that this integration works on the tested machine.
+
+For native Wayland or broader compositor support, **agent-sh/computer-use-linux is the stronger starting point**. Adopting or contributing to that project is preferable to claiming this X11 implementation already covers those environments. A future adapter could retain the persistent Python API while delegating Wayland operations to an existing backend, but no such adapter is implemented or needed for the current X11 use case.
+
+## Closest options
+
+| Project | Useful strengths | How this project compares |
+| --- | --- | --- |
+| [agent-sh/computer-use-linux](https://github.com/agent-sh/computer-use-linux/tree/c9ab855e5d35420faafadc41a7ab0474b26358a2) | Standalone Rust MCP/CLI; real AT-SPI; Wayland portals, uinput and compositor-aware window targeting. Includes cancellation handling. MIT. | Much broader desktop support. Its exposed API provides individual actions and an optional one-shot shell tool; ours supplies persistent Python window references, loops and local checks in the same execution context. Ours is not uniquely cancellation-safe. |
+| [ilysenko/codex-desktop-linux](https://github.com/ilysenko/codex-desktop-linux/tree/135ec96016c8f43b0d9676ee496a444117aa2333) | Community ChatGPT Linux distribution with optional computer-use UI/backend integration and packaging. Community-owned code is MIT; upstream software has separate terms. | Better fit when the in-app UI integration is the priority. Ours is a standalone MCP addition to the installed host, with a smaller installation scope. Standalone alternatives also avoid repackaging. |
+| [OpenComputerUse](https://github.com/TopherMayor/open-computer-use/tree/300afea07582a8623d703284753cc56f9750f4fd) | Close Python X11/macOS alternative: accessibility, screenshots, OCR, image diffs, audit/rate controls, emergency-stop file and Docker tests. | Ours adds a persistent model-visible Python execution API and uses a persistent Xlib connection for normal X11 input. Their Linux implementation uses helper subprocesses, including xdotool. That avoids some subprocess creation in ours, but does not establish an end-to-end speedup. Their README/metadata say MIT; no standalone license file was found at this revision. |
+| [Zavora computer-use-mcp](https://github.com/zavora-ai/computer-use-mcp/tree/5e52308f1ca667cb1433cfd99065fb792db44652) | Broad macOS/Windows/Linux package, Rust native bindings, policy controls and 64 tools. MIT. | Its [Linux accessibility implementation](https://github.com/zavora-ai/computer-use-mcp/blob/5e52308f1ca667cb1433cfd99065fb792db44652/native/src/accessibility.rs) still contains stubs for semantic actions and value setting. Our real AT-SPI implementation is a concrete Linux advantage. This does not discount its other platforms or physical input. |
+| [Deskbrid](https://github.com/coe0718/deskbrid/tree/61847a886794a71fb31377ad638ec23a7b166033) | Rust daemon/socket/MCP architecture, broad compositor and OS integrations, macros, and explicit per-backend limitations. MIT. | Their support matrix marks generic X11 untested, and some UI operations remain stubs. Ours has a narrower tested X11 accessibility path. Deskbrid offers many useful system features ours does not attempt. |
+| [claude-linux-mcp](https://github.com/jslatten/claude-linux-mcp/tree/148e191d860f343237fb955e061856082dde9c4a) | Standard-library Python server and desktop extension bundle; absolute uinput, compositor-specific windows, screenshots, clipboard. MIT. | Appealing dependency footprint and broader compositor targeting. Ours offers AT-SPI semantic controls and needs no uinput access for its supported X11 path. No memory or CPU comparison was performed. |
+| [lowlevel-computer-use-mcp](https://github.com/Ding-Ding-Projects/lowlevel-computer-use-mcp/tree/5629aa2b4871f518b7326521e92c1804553be987) | Hidden desktops/Xvfb, recording and human handoff; Linux X11 helpers and Windows support. | A stronger starting point for isolated desktop workflows. Ours targets the logged-in desktop and combines semantic controls with physical input. Their README says MIT; no standalone license file was found at this revision. |
+
+## Resource efficiency: reasons, not invented numbers
+
+- Persistent X11 connections and one worker avoid restarting the input/runtime stack for each action. Batching a sequence with local checks can avoid model round trips.
+- Accessibility diffs and window crops can reduce repeated response content. A smaller tool catalog is simpler, but MCP hosts can defer tool schemas, so catalog size is not a proven token-cost advantage.
+- Persistence costs memory: a used connection keeps a Python MCP server, Python worker, accessibility listener and caches alive until reset/session close. Multiple active host sessions can multiply that footprint. Reset stops the worker; the server remains.
+- Python, GI, AT-SPI and Pillow are heavier dependencies than a single compiled binary or a standard-library-only tool. Rust does not automatically make the full task faster; application response time, image encoding and model calls also matter.
+- Every accessibility search still traverses an app tree; screenshot capture/PNG encoding can dominate local work. Use named controls, bounded observations, `screenshot=False` when images are unnecessary, and batch only actions whose intermediate results can be checked.
+
+There is no evidence here that ours uses the least RAM, CPU, tokens, or time. Its advantages are the verified workflow and implementation choices. A broad comparative benchmark would be disproportionate to establishing whether this small project is useful.
+
+## Limits to consider before adopting
+
+Native Wayland, lock-screen operation, secure prompts, a global stop hotkey, takeover overlay, and isolated-desktop management are not implemented. An additional Xvfb/Openbox release check exposed failures in Unicode/control lookup, drag verification and a worker exit; isolated headless behavior is not reliable in this release. Mixed-DPI/multiple-monitor setups, complex input methods and broad app coverage remain unvalidated. Long-lived arbitrary Python is powerful but unsandboxed; see [SECURITY.md](SECURITY.md). AT-SPI depends on what each app exposes, and fixed keyboard-map pacing does not guarantee perfect text entry in every app/layout.
+
+Prefer an existing alternative when one of those missing features matters more than persistent Python orchestration. Prefer this project when you want an inspectable X11 implementation with working semantic controls, explicit observation checks, and demonstrated Codex integration. Contributions that improve those boundaries are useful; universal superiority is not the goal.

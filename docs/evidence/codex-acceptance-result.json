@@ -1,0 +1,32 @@
+{
+  "codex_exit": 0,
+  "fixture_state": {
+    "saved": "Fresh Codex native desktop acceptance — Grüße 391",
+    "checked": true,
+    "drop": false,
+    "scroll": 0,
+    "selected_file": null
+  },
+  "tool_calls": [
+    {
+      "server": "linux_desktop",
+      "tool": "desktop_status",
+      "status": "completed"
+    },
+    {
+      "server": "linux_desktop",
+      "tool": "desktop_observe",
+      "status": "completed"
+    },
+    {
+      "server": "linux_desktop",
+      "tool": "desktop_exec",
+      "status": "completed"
+    },
+    {
+      "server": "linux_desktop",
+      "tool": "desktop_exec",
+      "status": "completed"
+    }
+  ]
+}

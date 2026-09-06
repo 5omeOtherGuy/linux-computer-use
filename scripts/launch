@@ -1,0 +1,33 @@
+#!/usr/bin/python3
+"""Start the MCP server with this login's graphical environment, without a shell."""
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+root = Path(__file__).resolve().parents[1]
+python = root / ".venv/bin/python"
+if not python.exists():
+    sys.exit("Linux Desktop is not installed. Run scripts/install.py first.")
+
+environment = dict(os.environ)
+# MCP clients may strip both DISPLAY and the user-bus environment. Locate the
+# standard, owner-checked runtime directory before contacting the user manager.
+if not environment.get("XDG_RUNTIME_DIR"):
+    runtime = Path(f"/run/user/{os.getuid()}")
+    if runtime.is_dir() and runtime.stat().st_uid == os.getuid() and (runtime / "bus").exists():
+        environment["XDG_RUNTIME_DIR"] = str(runtime)
+allowed = {"DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "XDG_SESSION_TYPE"}
+if any(not environment.get(key) for key in allowed):
+    try:
+        result = subprocess.run(["systemctl", "--user", "show-environment"],
+                                capture_output=True, text=True, timeout=5, check=True, env=environment)
+        for line in result.stdout.splitlines():
+            key, separator, value = line.partition("=")
+            if separator and key in allowed and not environment.get(key):
+                environment[key] = value
+    except (OSError, subprocess.SubprocessError):
+        pass
+if not environment.get("DISPLAY"):
+    sys.exit("No X11 display in this login. Start Codex from the graphical session or import its environment with systemctl --user import-environment DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS XDG_SESSION_TYPE.")
+os.execve(python, [str(python), "-m", "linux_computer_use.server"], environment)
