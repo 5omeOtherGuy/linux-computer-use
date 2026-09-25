@@ -7,6 +7,7 @@ Run: python3 -m unittest discover -s tests -v
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import struct
@@ -244,6 +245,58 @@ class AgentDesktopTest(unittest.TestCase):
         title = [w["title"] for w in json.loads(ad("windows", "t-menu", "--json").stdout)
                  if int(w["id"], 16) == int(wid)]
         self.assertTrue(title and "agent:t-a" in title[0], title)
+
+    def test_panel_installer_in_sandbox(self):
+        """install-panel.sh --apply/--uninstall against a copy of the owner's panel config,
+        served by a private xfconfd inside a workspace; the owner's panel is only read."""
+        src = Path.home() / ".config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml"
+        if not src.exists() or not shutil.which("xfce4-panel"):
+            self.skipTest("no xfce4-panel config to copy")
+        owner_ids = subprocess.run(["xfconf-query", "-c", "xfce4-panel", "-p", "/panels/panel-1/plugin-ids"],
+                                   capture_output=True, text=True).stdout
+        new_ws(self, "--name", "t-pan")
+        wsenv = dict(os.environ)
+        for line in ad("env", "t-pan").stdout.splitlines():
+            parts = shlex.split(line)
+            if parts[0] == "export":
+                k, v = parts[1].split("=", 1)
+                wsenv[k] = v
+            elif parts[0] == "unset":
+                for k in parts[1:]:
+                    wsenv.pop(k, None)
+        dst = Path(wsenv["XDG_CONFIG_HOME"]) / "xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml"
+        dst.parent.mkdir(parents=True)
+        dst.write_text(re.sub(r'(<property name="size" type="uint" value=")\d+', r"\g<1>41",
+                              src.read_text(), count=1))
+        run_app(self, "t-pan", "xfce4-panel")
+        ad("wait", "t-pan", "--class", "xfce4-panel", "--timeout", "20")
+
+        def q(*args):
+            return subprocess.run(["xfconf-query", "-c", "xfce4-panel", *args], env=wsenv,
+                                  capture_output=True, text=True).stdout.split()
+        # safety: the queries must reach the sandbox's xfconfd, never the owner's
+        self.assertEqual(q("-p", "/panels/panel-1/size"), ["41"])
+        before = q("-p", "/panels/panel-1/plugin-ids")[2:]
+        bindir = self.tmp / "bin"
+        inst = [str(ROOT / "panel" / "install-panel.sh"), "--no-packages", "--bin-dir", str(bindir)]
+        r = subprocess.run(inst + ["--apply"], env=wsenv, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        after = q("-p", "/panels/panel-1/plugin-ids")[2:]
+        added = [i for i in after if i not in before]
+        self.assertEqual(len(added), 1, (before, after))
+        pid_ = added[0]
+        self.assertEqual(q("-p", f"/plugins/plugin-{pid_}"), ["genmon"])
+        rc = Path(wsenv["XDG_CONFIG_HOME"]) / f"xfce4/panel/genmon-{pid_}.rc"
+        self.assertIn(f"Command={bindir}/agent-desktop-genmon", rc.read_text())
+        self.assertTrue((bindir / "agent-desktop").resolve() == ROOT / "bin" / "agent-desktop")
+        time.sleep(3)
+        r = subprocess.run(inst + ["--uninstall"], env=wsenv, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(q("-p", "/panels/panel-1/plugin-ids")[2:], before)
+        self.assertFalse(rc.exists())
+        self.assertEqual(owner_ids, subprocess.run(
+            ["xfconf-query", "-c", "xfce4-panel", "-p", "/panels/panel-1/plugin-ids"],
+            capture_output=True, text=True).stdout)
 
 
 if __name__ == "__main__":
