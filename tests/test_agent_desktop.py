@@ -224,6 +224,27 @@ class AgentDesktopTest(unittest.TestCase):
         bright = sum(1 for v in im.getdata() if v > 200)
         self.assertGreater(bright, 20000, "viewer does not show the 200x200 clock face")
 
+    def test_panel_genmon_and_menu(self):
+        genmon = str(ROOT / "panel" / "agent-desktop-genmon")
+        out = subprocess.run([genmon], env=env(), capture_output=True, text=True).stdout
+        self.assertIn("<txt></txt>", out)
+        new_ws(self, "--name", "t-a", "--label", "target <x>")
+        new_ws(self, "--name", "t-menu", "--label", "host")  # stands in for the owner's desktop
+        out = subprocess.run([genmon], env=env(), capture_output=True, text=True).stdout
+        self.assertIn("🖥 2", out)
+        self.assertIn("t-a  :1", out)
+        self.assertIn("target &lt;x&gt;", out)
+        self.assertIn("<txtclick>", out)
+        run_app(self, "t-a", "xclock", "-geometry", "200x200+50+50")
+        run_app(self, "t-menu", str(ROOT / "panel" / "agent-desktop-menu"))
+        ad("wait", "t-menu", "--name", "^Agent workspaces$", "--timeout", "20")
+        time.sleep(0.8)
+        ad("key", "t-menu", "Down", "Up", "Return")  # select row 1 (t-a), Watch
+        wid = ad("wait", "t-menu", "--class", "vnc", "--timeout", "15").stdout.split()[0]
+        title = [w["title"] for w in json.loads(ad("windows", "t-menu", "--json").stdout)
+                 if int(w["id"], 16) == int(wid)]
+        self.assertTrue(title and "agent:t-a" in title[0], title)
+
 
 if __name__ == "__main__":
     unittest.main()
