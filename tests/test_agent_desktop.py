@@ -154,8 +154,9 @@ class AgentDesktopTest(unittest.TestCase):
         new_ws(self, "--name", "t-env")
         r = ad("run", "t-env", "--wait", "--force", "--", "sh", "-c",
                'echo "$DISPLAY|$DBUS_SESSION_BUS_ADDRESS|$XDG_CONFIG_HOME|$XDG_RUNTIME_DIR|'
-               '${WAYLAND_DISPLAY-unset}|${SESSION_MANAGER-unset}|${TMUX-unset}|$PULSE_SERVER"')
-        d, bus, cfg, rt, wl, sm, tmux, pulse = r.stdout.strip().split("|")
+               '${WAYLAND_DISPLAY-unset}|${SESSION_MANAGER-unset}|${TMUX-unset}|$PULSE_SERVER|$DISABLE_AUTOUPDATER"')
+        d, bus, cfg, rt, wl, sm, tmux, pulse, noupd = r.stdout.strip().split("|")
+        self.assertEqual(noupd, "1")
         self.assertRegex(d, r"^:1\d\d$")
         self.assertIn(str(RUNTIME), bus)
         self.assertIn(str(CACHE), cfg)

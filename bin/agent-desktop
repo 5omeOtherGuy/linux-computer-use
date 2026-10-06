@@ -250,7 +250,10 @@ class Workspace:
         if not s.get("share_home"):
             h = self.files / "home"
             env.update({"XDG_CONFIG_HOME": str(h / "config"), "XDG_DATA_HOME": str(h / "data"),
-                        "XDG_CACHE_HOME": str(h / "cache"), "XDG_STATE_HOME": str(h / "state")})
+                        "XDG_CACHE_HOME": str(h / "cache"), "XDG_STATE_HOME": str(h / "state"),
+                        # Claude Code's updater installs into XDG_DATA_HOME but relinks the real
+                        # ~/.local/bin/claude; close then deletes the target (2026-10-05).
+                        "DISABLE_AUTOUPDATER": "1"})
         if not (s.get("audio") if audio is None else audio):
             env["PULSE_SERVER"] = "unix:/nonexistent-agent-desktop"
         return env
@@ -545,7 +548,7 @@ def cmd_env(a):
     env = w.env()
     keys = ["AGENT_DESKTOP_RUNTIME", "AGENT_DESKTOP_CACHE", "DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "AGENT_DESKTOP",
             "AGENT_DESKTOP_ID", "NO_AT_BRIDGE", "GDK_BACKEND", "QT_QPA_PLATFORM", "PULSE_SERVER",
-            "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"]
+            "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "DISABLE_AUTOUPDATER"]
     for k in keys:
         if k in env:
             print(f"export {k}={shlex.quote(env[k])}")
