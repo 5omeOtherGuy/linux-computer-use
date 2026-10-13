@@ -28,7 +28,8 @@ CACHE = Path(tempfile.mkdtemp(prefix="adt-cache-"))
 
 def env(**extra):
     e = dict(os.environ)
-    e.update({"AGENT_DESKTOP_RUNTIME": str(RUNTIME), "AGENT_DESKTOP_CACHE": str(CACHE)})
+    e.update({"AGENT_DESKTOP_RUNTIME": str(RUNTIME), "AGENT_DESKTOP_CACHE": str(CACHE),
+              "AGENT_DESKTOP_NOTIFY": "0"})
     e.update({k: str(v) for k, v in extra.items()})
     return e
 

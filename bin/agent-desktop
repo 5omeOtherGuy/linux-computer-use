@@ -170,6 +170,23 @@ def log_event(msg):
         pass
 
 
+def notify_owner(summary, body):
+    """Desktop notification plus sound on the owner's session; fire and forget."""
+    if os.environ.get("AGENT_DESKTOP_NOTIFY", "1") == "0":
+        return
+    run = f"/run/user/{UID}"
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("PULSE_SERVER", "AGENT_DESKTOP_ID")}
+    # The owner's session bus and Pulse/PipeWire socket, even when called with a workspace env.
+    env.update({"DBUS_SESSION_BUS_ADDRESS": f"unix:path={run}/bus", "XDG_RUNTIME_DIR": run})
+    sound = "/usr/share/sounds/freedesktop/stereo/message-new-instant.oga"
+    for cmd in (["notify-send", "--app-name=agent-desktop", "--icon=video-display", summary, body],
+                ["paplay", sound]):
+        if shutil.which(cmd[0]):
+            subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+
+
 def fmt_age(sec):
     sec = int(sec)
     if sec < 90:
@@ -485,6 +502,8 @@ def cmd_new(a):
         tmp.rename(w.dir / "state.json")
     log_event(f"new {name} display=:{n} owner={owner} label={w._state['label']!r}")
     spawn_reaper()
+    notify_owner(f"Agent desktop {name} started",
+                 f"{w._state['owner_comm'] or 'agent'}: {w._state['label']} (display :{n})")
     out = {"name": name, "display": f":{n}", "geometry": a.geometry,
            "idle_timeout_min": a.idle, "owner_pid": owner, "files": str(w.files)}
     if a.json:
