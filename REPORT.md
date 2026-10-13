@@ -27,7 +27,7 @@ agent (claude/codex/p1) ── agent-desktop CLI ──┬─ Xvnc :1NN  (-auth 
                                                                SESSION_MANAGER unset; marker AGENT_DESKTOP_ID)
 agent-desktop _reaper (one per user; exits 30 s after the last workspace)
     closes a workspace whose server died, which is idle > --idle (default 60 min),
-    or whose creating session exited (--owner-pid auto = nearest claude/codex/p1/opencode/pi ancestor)
+    or whose creating session exited (--owner-pid auto = nearest claude/codex/p1/opencode/pi/amp ancestor)
 owner: panel genmon item "🖥 N" → agent-desktop-menu (zenity) → vncviewer on :0 (view-only, or "Take control")
 ```
 

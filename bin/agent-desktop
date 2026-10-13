@@ -34,7 +34,7 @@ DEFAULT_IDLE_MIN = float(os.environ.get("AGENT_DESKTOP_IDLE_MIN", "60"))
 DISPLAYS = range(100, 200)
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
 OWNER_COMMS = set(os.environ.get("AGENT_DESKTOP_OWNER_COMMS",
-                                 "claude codex p1 opencode .opencode pi").split())
+                                 "claude codex p1 opencode .opencode pi amp").split())
 REAPER_PERIOD = 5
 
 EXIT_ERR, EXIT_USAGE, EXIT_REFUSED, EXIT_TIMEOUT = 1, 2, 3, 4
