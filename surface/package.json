@@ -1,0 +1,30 @@
+{
+  "name": "linux-cua-surface",
+  "version": "0.1.0",
+  "private": true,
+  "description": "MCP stdio surface for the linux-cua engine: isolated persistent JS REPL, discrete tools, provider adapters",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "bin": {
+    "linux-cua-mcp": "bin/linux-cua-mcp.js"
+  },
+  "main": "src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./adapters/anthropic": "./src/adapters/anthropic.js",
+    "./adapters/openai": "./src/adapters/openai.js"
+  },
+  "scripts": {
+    "start": "node bin/linux-cua-mcp.js",
+    "test": "node --test --test-concurrency=1 \"test/*.test.js\""
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.1",
+    "acorn": "^8.19.0",
+    "pngjs": "^7.0.0",
+    "quickjs-emscripten": "^0.32.0"
+  }
+}
