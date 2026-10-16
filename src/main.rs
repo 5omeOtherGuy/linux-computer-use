@@ -42,6 +42,9 @@ const SETTLE_REACT: Duration = Duration::from_millis(100);
 /// Quiet interval after the last reaction.
 const SETTLE_QUIET: Duration = Duration::from_millis(35);
 const SETTLE_CAP: Duration = Duration::from_millis(600);
+/// Longest wait, from the action, for a dialog to close after its confirm
+/// key or button.
+const DIALOG_CLOSE_WAIT: Duration = Duration::from_millis(1000);
 
 fn int_param(p: &serde_json::Map<String, Value>, k: &str) -> Option<u32> {
     p.get(k)
@@ -414,6 +417,27 @@ impl Engine {
         let settled = self
             .desktop
             .settle(SETTLE_REACT, SETTLE_QUIET, SETTLE_CAP, &mut external)?;
+        // A dialog confirmed or dismissed (Return, Escape, a button) often
+        // closes only after a file check or similar, past the quiet window;
+        // wait for that so the next action and the observation see the app's
+        // next window rather than the closing dialog.
+        let confirms = match (method, element) {
+            ("press_key", _) => p.get("key").and_then(Value::as_str).is_some_and(|k| {
+                matches!(
+                    k.trim().to_ascii_lowercase().as_str(),
+                    "return" | "enter" | "kp_enter" | "escape" | "esc"
+                )
+            }),
+            ("click", Some(idx)) => self.ax.as_ref().is_some_and(|ax| ax.element_is_button(idx)),
+            _ => false,
+        };
+        if w.transient_for.is_some() && confirms {
+            let left = DIALOG_CLOSE_WAIT.saturating_sub(start.elapsed());
+            if self.desktop.wait_closed(w.window_id, left)? {
+                self.desktop
+                    .settle(SETTLE_REACT, SETTLE_QUIET, SETTLE_CAP, &mut external)?;
+            }
+        }
         self.desktop.check_user_input()?;
         // One re-check after settling: the window the result describes.
         let (after, wins) = if app_scope {

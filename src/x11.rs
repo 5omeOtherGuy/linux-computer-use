@@ -141,6 +141,9 @@ const REPAINT_WAIT: Duration = Duration::from_millis(300);
 const REPAINT_QUIET: Duration = Duration::from_millis(15);
 /// Granularity for noticing accessibility events while waiting on X.
 const POLL_SLICE: Duration = Duration::from_millis(4);
+/// How long settling waits for a new top-level of an observed client (a
+/// dialog being built) to map.
+const MAP_WAIT: Duration = Duration::from_millis(1500);
 
 // Core modifier / button masks (X11 protocol constants).
 const SHIFT: u16 = 0x0001;
@@ -705,6 +708,8 @@ pub struct Desktop {
     tracked: HashMap<Window, Tracked>,
     /// Mapped override-redirect top-level windows -> (owner client base, PID).
     popups: HashMap<Window, (u32, u32)>,
+    /// Top-levels of observed clients created but not yet mapped.
+    creating: HashMap<Window, Instant>,
     abort: Option<String>,
     /// Relevant UI activity since `prepare_action`, and when it last happened.
     activity: bool,
@@ -854,6 +859,7 @@ impl Desktop {
             shm_disabled: false,
             tracked: HashMap::new(),
             popups: HashMap::new(),
+            creating: HashMap::new(),
             abort: None,
             activity: false,
             last_activity: Instant::now(),
@@ -1599,7 +1605,31 @@ impl Desktop {
                     self.note_activity();
                 }
             }
+            Event::CreateNotify(e)
+                if e.parent == self.root
+                    && !e.override_redirect
+                    && self
+                        .tracked
+                        .keys()
+                        .any(|&w| self.client_base(w) == self.client_base(e.window)) =>
+            {
+                // A client we observe is building a new top-level (a dialog):
+                // settling waits for it to map. Its own MapNotify is selected
+                // because a reparenting window manager reports the map to the
+                // frame, not to the root.
+                let _ = self.conn.change_window_attributes(
+                    e.window,
+                    &xproto::ChangeWindowAttributesAux::new()
+                        .event_mask(EventMask::STRUCTURE_NOTIFY),
+                );
+                self.creating.insert(e.window, Instant::now());
+                self.note_activity();
+            }
+            Event::MapNotify(e) if self.creating.remove(&e.window).is_some() => {
+                self.note_activity();
+            }
             Event::DestroyNotify(e) if e.event == self.root || e.event == e.window => {
+                self.creating.remove(&e.window);
                 // The server frees damage objects with their drawable.
                 self.popups.remove(&e.window);
                 self.tracked.remove(&e.window);
@@ -1737,6 +1767,12 @@ impl Desktop {
             }
             let now = Instant::now();
             let elapsed = now - start;
+            // A new top-level of an observed client is still being built.
+            self.creating.retain(|_, t| now - *t < MAP_WAIT);
+            if !self.creating.is_empty() && elapsed < MAP_WAIT {
+                self.wait_readable(POLL_SLICE)?;
+                continue;
+            }
             let left = if self.activity {
                 let quiet_for = now - self.last_activity.max(start);
                 if quiet_for >= quiet {
@@ -1762,6 +1798,29 @@ impl Desktop {
                 });
             }
             self.wait_readable(left.min(cap - elapsed).min(POLL_SLICE))?;
+        }
+    }
+
+    /// Waits up to `max` for `window` to stop being viewable (a dialog
+    /// closing after its confirm key or button). True if it closed.
+    pub fn wait_closed(&mut self, window: Window, max: Duration) -> Result<bool> {
+        let start = Instant::now();
+        loop {
+            self.pump()?;
+            if self.abort.is_some() {
+                return Ok(false);
+            }
+            let open = match self.conn.get_window_attributes(window)?.reply() {
+                Ok(a) => a.map_state == xproto::MapState::VIEWABLE,
+                Err(_) => false,
+            };
+            if !open {
+                return Ok(true);
+            }
+            if start.elapsed() >= max {
+                return Ok(false);
+            }
+            self.wait_readable(Duration::from_millis(20).min(max - start.elapsed()))?;
         }
     }
 

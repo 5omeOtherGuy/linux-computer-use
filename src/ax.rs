@@ -150,6 +150,7 @@ const R_REDUNDANT_OBJECT: u32 = 86;
 const R_LIST_BOX: u32 = 98;
 const R_SWITCH: u32 = 130;
 const R_ENTRY: u32 = 79;
+const R_PUSH_BUTTON: u32 = 43;
 
 const A11Y_DISABLED: &str = "org.a11y.Status.IsEnabled is false on the session bus; Qt and Electron applications may need QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1 or --force-renderer-accessibility to expose a tree";
 
@@ -1289,6 +1290,14 @@ impl Accessibility {
     /// Window (among `wins`) holding element `idx`, for app-scoped actions.
     pub fn window_of_element(&self, idx: u32) -> Option<u32> {
         self.obs.window_of(idx)
+    }
+
+    /// Whether element `idx` was last observed as a push button.
+    pub fn element_is_button(&self, idx: u32) -> bool {
+        self.obs
+            .windows
+            .values()
+            .any(|ws| ws.ids.values().any(|&(id, role)| id == idx && role == R_PUSH_BUTTON))
     }
 
     /// Clear observation state (element bindings, diffs and cached trees).
