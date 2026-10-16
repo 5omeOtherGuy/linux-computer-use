@@ -36,25 +36,32 @@ export function sanitizeLabel(value, max = 200) {
 
 function validateApprovalData(data) {
   if (!data || typeof data !== 'object') throw new CuaError('protocol_error', 'approval_required without data');
-  const { app_id, window_id, title } = data;
+  const { app_id, window_id, title, executable } = data;
   if (typeof app_id !== 'string' || !app_id || app_id.length > 512) throw new CuaError('protocol_error', 'approval_required: bad app_id');
   if (!Number.isInteger(window_id) || window_id < 0 || window_id > 0xffffffff) throw new CuaError('protocol_error', 'approval_required: bad window_id');
-  return { app_id, window_id, title: typeof title === 'string' ? title : '' };
+  if (executable !== undefined && executable !== null && (typeof executable !== 'string' || executable.length > 4096)) throw new CuaError('protocol_error', 'approval_required: bad executable');
+  return { app_id, window_id, title: typeof title === 'string' ? title : '', executable: executable || null };
 }
 
-// Persistent "always allow" list: {"always_allowed_app_ids": ["AppId", ...]}.
-// Only the trusted host writes it, after an explicit user choice; the
-// operator may edit or delete it. Read on every approval check.
+// Persistent "always allow" list:
+//   {"always_allowed": [{"app_id": "Xed", "executable": "/usr/bin/xed"}, ...]}
+// An entry matches only the app ID together with the executable the daemon
+// reports for the window's server-verified process. Only the trusted host
+// writes it, after an explicit user choice; the operator may edit or delete
+// it. It is read once, when the server starts: changes made while a session
+// runs (by the operator, or by a controlled app running as the same user)
+// apply to later sessions only.
 export class ApprovalStore {
   constructor(file) {
     this.file = file || null;
+    this.entries = this.#read();
   }
 
   get available() {
     return this.file !== null;
   }
 
-  list() {
+  #read() {
     if (!this.file) return [];
     let raw;
     try {
@@ -63,23 +70,28 @@ export class ApprovalStore {
       if (err.code === 'ENOENT') return [];
       throw new CuaError('approval_store', `cannot read ${this.file}: ${err.message}`);
     }
-    const ids = JSON.parse(raw)?.always_allowed_app_ids;
-    if (!Array.isArray(ids) || !ids.every((x) => typeof x === 'string')) {
-      throw new CuaError('approval_store', `${this.file}: always_allowed_app_ids must be an array of strings`);
-    }
-    return ids;
+    const list = JSON.parse(raw)?.always_allowed;
+    const ok = Array.isArray(list) && list.every((e) => e && typeof e.app_id === 'string' && typeof e.executable === 'string');
+    if (!ok) throw new CuaError('approval_store', `${this.file}: always_allowed must be an array of {app_id, executable}`);
+    return list.map((e) => ({ app_id: e.app_id, executable: e.executable }));
   }
 
-  has(appId) {
-    return this.list().includes(appId);
+  list() {
+    return this.entries.map((e) => ({ ...e }));
   }
 
-  add(appId) {
-    const ids = this.list();
-    if (ids.includes(appId)) return;
+  has(appId, executable) {
+    return !!executable && this.entries.some((e) => e.app_id === appId && e.executable === executable);
+  }
+
+  add(appId, executable) {
+    if (!this.file) throw new CuaError('approval_store', 'no approvals file configured');
+    if (!executable) throw new CuaError('approval_store', 'the app\'s executable is unknown; it cannot be allowed permanently');
+    if (this.has(appId, executable)) return;
+    this.entries.push({ app_id: appId, executable });
     mkdirSync(path.dirname(this.file), { recursive: true, mode: 0o700 });
     const tmp = `${this.file}.${process.pid}.tmp`;
-    writeFileSync(tmp, JSON.stringify({ always_allowed_app_ids: [...ids, appId] }, null, 2) + '\n', { mode: 0o600 });
+    writeFileSync(tmp, JSON.stringify({ always_allowed: this.entries }, null, 2) + '\n', { mode: 0o600 });
     renameSync(tmp, this.file);
   }
 }
@@ -97,18 +109,27 @@ export class HostApi {
     this.axSeen = new Map(); // window_id -> accessibility text the model last received
     this.approvedWindows = new Map(); // window_id -> app_id, approved at the daemon this turn
     this.turnEpoch = 0;
+    // Highest element ID any daemon of this session reported. A respawned
+    // daemon starts above it, so an ID the model holds never names another
+    // element.
+    this.lastElementId = 0;
     this.queue = Promise.resolve();
-    this.engine = engine || new EngineClient({ ...engineOptions, log, onSpawn: (send) => this.#replayApprovals(send) });
-    if (engine && !engine.onSpawn) engine.onSpawn = (send) => this.#replayApprovals(send);
+    const onSpawn = (send) => this.#onSpawn(send);
+    const spawnArgs = () => ['--first-element-id', String(this.lastElementId + 1)];
+    this.engine = engine || new EngineClient({ ...engineOptions, log, onSpawn, spawnArgs });
+    if (engine && !engine.onSpawn) engine.onSpawn = onSpawn;
+    if (engine && !engine.spawnArgs) engine.spawnArgs = spawnArgs;
   }
 
   get methods() {
     return exposedMethods(this.extensions);
   }
 
-  // A restarted daemon has lost its approvals; restore the ones the user
-  // granted during the current turn.
-  async #replayApprovals(send) {
+  // A restarted daemon has lost its approvals and observations: restore the
+  // approvals the user granted during the current turn, and forget what the
+  // model saw (the next observation of each window is a full tree).
+  async #onSpawn(send) {
+    this.axSeen.clear();
     for (const [window_id, app_id] of this.approvedWindows) {
       try {
         await send('approve_app', { window_id, app_id });
@@ -153,7 +174,10 @@ export class HostApi {
       for (let attempt = 0; ; attempt++) {
         if (deadline !== undefined && Date.now() >= deadline) throw new CuaError('timeout', `${method}: deadline passed`);
         try {
-          return await this.engine.request(method, p, { signal, deadline });
+          const result = await this.engine.request(method, p, { signal, deadline });
+          const last = result?.last_element_id;
+          if (Number.isInteger(last) && last > this.lastElementId) this.lastElementId = last;
+          return result;
         } catch (err) {
           if (err.code !== 'approval_required' || attempt >= 2) throw toCuaError(err);
           await this.#authorize(err.data, { signal, deadline });
@@ -168,14 +192,14 @@ export class HostApi {
     if (this.deniedApps.has(data.app_id)) {
       throw new CuaError('approval_denied', `the user denied access to app ${data.app_id} for this turn`, { app_id: data.app_id });
     }
-    const known = this.approvedApps.has(data.app_id) || this.sessionApps.has(data.app_id) || this.store.has(data.app_id);
+    const known = this.approvedApps.has(data.app_id) || this.sessionApps.has(data.app_id) || this.store.has(data.app_id, data.executable);
     if (!known) {
       if (!this.elicit) throw new CuaError('approval_unavailable', 'app approval required but no approval channel is configured');
       let decision;
       try {
         decision = await this.elicit(
           { app_id: data.app_id, window_id: data.window_id, title: sanitizeLabel(data.title) },
-          { signal, policyText: this.policyText, canPersist: this.store.available },
+          { signal, policyText: this.policyText, canPersist: this.store.available && !!data.executable },
         );
       } catch (err) {
         if (signal?.aborted) throw new CuaError('cancelled', 'cancelled while waiting for app approval');
@@ -191,7 +215,7 @@ export class HostApi {
       if (decision !== 'turn') this.sessionApps.add(data.app_id);
       if (decision === 'always') {
         try {
-          this.store.add(data.app_id);
+          this.store.add(data.app_id, data.executable);
         } catch (err) {
           this.log(`could not persist the always-allow decision for ${data.app_id}; allowed for this session only: ${err.message}`);
         }

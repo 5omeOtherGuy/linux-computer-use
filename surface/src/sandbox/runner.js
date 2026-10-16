@@ -22,8 +22,11 @@ import { appInfos, fenceUntrusted, isScreenshot, windowInfo } from '../format.js
 const here = path.dirname(fileURLToPath(import.meta.url));
 const SURFACE_ROOT = path.resolve(here, '..', '..');
 const CHILD = path.join(here, 'child.js');
-const MAX_IMAGES = 64;
+// Screenshots the host keeps so model code can emit them without re-encoding;
+// bounded by total size (base64 characters), oldest dropped first.
+const MAX_HELD_IMAGE_CHARS = 64_000_000;
 const MAX_CELL_IMAGES = 16;
+const STDERR_TAIL = 4000;
 const MAX_EMITTED_IMAGE_CHARS = 16_000_000;
 const VIEWS = ['windows', 'apps', 'state', 'getApp', 'ax', 'screenshot', 'action'];
 const ACTIONS = ['click', 'drag', 'scroll', 'type_text', 'press_key', 'paste', 'set_value', 'perform_secondary_action', 'mouse_move'];
@@ -40,7 +43,10 @@ export class SandboxRunner {
     this.cell = null;
     this.seq = 0;
     this.images = new Map();
+    this.imageChars = 0;
     this.imageSeq = 0;
+    this.stderrTail = '';
+    this.fatal = null;
     this.stateLost = false;
     this.generation = 0;
   }
@@ -59,7 +65,13 @@ export class SandboxRunner {
       stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
       serialization: 'json',
     });
-    child.stderr.on('data', (d) => this.log(`sandbox: ${d.toString('utf8').trimEnd()}`));
+    this.stderrTail = '';
+    this.fatal = null;
+    child.stderr.on('data', (d) => {
+      const text = d.toString('utf8');
+      this.stderrTail = (this.stderrTail + text).slice(-STDERR_TAIL);
+      this.log(`sandbox: ${text.trimEnd()}`);
+    });
     child.on('message', (msg) => this.#onMessage(gen, msg));
     child.on('exit', (code, signal) => {
       if (this.child !== child) return;
@@ -67,7 +79,9 @@ export class SandboxRunner {
       this.ready = null;
       this.stateLost = true;
       this.log(`sandbox exited (${signal || code})`);
-      if (this.cell) this.#complete(this.cell, { ok: false, error: `SandboxError: sandbox process exited (${signal || code}); REPL state was lost`, stateLost: true });
+      // The cause, when the sandbox reported one, goes into the cell result.
+      const cause = (this.fatal || this.stderrTail.trim()).slice(-1500);
+      if (this.cell) this.#complete(this.cell, { ok: false, error: `SandboxError: sandbox process exited (${signal || code}); REPL state was lost${cause ? `\n${cause}` : ''}`, stateLost: true });
     });
     this.child = child;
     this.ready = new Promise((resolve, reject) => {
@@ -96,6 +110,7 @@ export class SandboxRunner {
         this.readyWaiter?.resolve();
         break;
       case 'fatal':
+        this.fatal = String(msg.error).slice(0, 4000);
         this.log(`sandbox fatal: ${msg.error}`);
         break;
       case 'host_call':
@@ -105,7 +120,7 @@ export class SandboxRunner {
         this.#emit(msg);
         break;
       case 'done':
-        if (this.cell && this.cell.id === msg.id) this.#complete(this.cell, msg);
+        if (this.cell && this.cell.id === msg.id) this.#finish(this.cell, msg);
         break;
       default:
         break;
@@ -136,7 +151,7 @@ export class SandboxRunner {
       const view = opts?.view;
       if (!VIEWS.includes(view)) throw new CuaError('invalid_params', 'unknown result view');
       const emit = opts.emit === true;
-      const value = await this.#view(cell, method, params, view, emit, opts.disableDiffing === true);
+      const value = await this.#view(cell, method, params, view, emit, opts);
       if (cell.finished) throw new CuaError('cell_finished', 'the cell finished before this call completed');
       this.#reply(msg.callId, { ok: true, value });
     } catch (err) {
@@ -159,7 +174,7 @@ export class SandboxRunner {
   }
 
   // Runs one host call and shapes its result for the VM and the cell output.
-  async #view(cell, method, params, view, emit, disableDiffing) {
+  async #view(cell, method, params, view, emit, opts = {}) {
     switch (view) {
       case 'windows': case 'apps': case 'state': {
         // AppInfo is built from the window list (it carries the windows).
@@ -171,27 +186,33 @@ export class SandboxRunner {
         return value;
       }
       case 'getApp': {
-        if (method !== 'list_windows' || !params || typeof params !== 'object') throw new CuaError('invalid_params', 'getApp requires {windowId} or {appId}');
+        if (method !== 'list_windows' || !params || typeof params !== 'object') throw new CuaError('invalid_params', 'getApp requires an app id, {appId} or {windowId}');
         const { windowId, appId } = params;
         if (windowId !== undefined && (!Number.isInteger(windowId) || windowId < 0 || windowId > 0xffffffff)) throw new CuaError('invalid_params', 'getApp: windowId must be a WindowInfo id from cua.listWindows()');
         if (appId !== undefined && typeof appId !== 'string') throw new CuaError('invalid_params', 'getApp: appId must be a string');
-        const windows = (await this.#call(cell, 'list_windows', {})).map(windowInfo);
-        const matches = windowId !== undefined ? windows.filter((w) => w.id === windowId) : windows.filter((w) => w.app === appId);
-        if (matches.length === 0) throw new CuaError('window_not_found', windowId !== undefined ? `no listed window has id ${windowId}` : `no listed window belongs to app ${JSON.stringify(appId).slice(0, 80)}`);
-        if (matches.length > 1) throw new CuaError('ambiguous_app', `app has ${matches.length} windows; pass {windowId} from cua.listWindows()`);
-        const window = matches[0];
-        const app = appInfos([window])[0];
+        const raw = await this.#call(cell, 'list_windows', {});
+        const window = windowId !== undefined ? raw.find((w) => w.window_id === windowId) : mainWindow(raw, appId);
+        if (!window) {
+          const apps = [...new Set(raw.map((w) => String(w.app_id)))].join(', ');
+          throw new CuaError('window_not_found', windowId !== undefined
+            ? `no listed window has id ${windowId}; open windows belong to: ${apps.slice(0, 300)}`
+            : `no app ${JSON.stringify(appId).slice(0, 80)} is open; open apps: ${apps.slice(0, 300)}`);
+        }
+        // The App covers all windows of that process (dialogs included).
+        const windows = raw.filter((w) => w.app_id === window.app_id && w.pid === window.pid).map(windowInfo);
+        const app = { ...appInfos(windows)[0], windows };
         if (emit) this.#emitText(cell, fenceUntrusted('app', JSON.stringify(app)));
-        return { window, app };
+        return { window: windowInfo(window), app };
       }
       case 'ax': {
         if (method !== 'get_ax_state') throw new CuaError('invalid_params', 'method does not match view');
         const obs = await this.#call(cell, method, params);
-        const text = this.host.axView(obs, { diff: !disableDiffing, commit: emit });
+        const query = typeof opts.query === 'string' && opts.query.trim() ? opts.query.trim() : null;
+        const text = query ? queryTree(obs.accessibility, query) : this.host.axView(obs, { diff: !opts.disableDiffing, commit: emit });
         if (emit) {
           this.#emitText(cell, observationHeader(obs));
           this.#emitText(cell, fenceUntrusted('accessibility', text));
-          if (cell.pending?.window?.window_id === obs.window?.window_id) cell.pending = null;
+          if (!query && cell.pending?.window?.window_id === obs.window?.window_id) cell.pending = null;
         }
         return text;
       }
@@ -201,12 +222,16 @@ export class SandboxRunner {
         if (!isScreenshot(shot)) throw new CuaError('protocol_error', 'engine returned no screenshot');
         const id = this.#storeImage(shot);
         if (emit) cell.outputs.push({ type: 'image', id });
+        // The sandbox decodes $bytes natively and hands model code a Uint8Array.
         return { $bytes: shot.data, $image: id };
       }
       case 'action': {
         if (!ACTIONS.includes(method)) throw new CuaError('invalid_params', 'not an action');
         const obs = await this.#call(cell, method, params);
-        if (obs && typeof obs === 'object' && obs.window) cell.pending = obs;
+        if (obs && typeof obs === 'object' && obs.window) {
+          cell.pending = obs;
+          cell.pendingTarget = params.app ? { window_id: params.window_id, app: true } : { window_id: obs.window.window_id };
+        }
         if (Array.isArray(obs?.warnings) && obs.warnings.length) {
           this.#emitText(cell, `warnings after ${method}: ${fenceUntrusted('warnings', obs.warnings.map(String).join('\n'))}`);
         }
@@ -220,7 +245,12 @@ export class SandboxRunner {
   #storeImage(shot) {
     const id = `img_${++this.imageSeq}`;
     this.images.set(id, { data: shot.data, mimeType: shot.mimeType, width: shot.width, height: shot.height });
-    while (this.images.size > MAX_IMAGES) this.images.delete(this.images.keys().next().value);
+    this.imageChars += shot.data.length;
+    while (this.imageChars > MAX_HELD_IMAGE_CHARS && this.images.size > 1) {
+      const [oldest, img] = this.images.entries().next().value;
+      this.images.delete(oldest);
+      this.imageChars -= img.data.length;
+    }
     return id;
   }
 
@@ -241,6 +271,8 @@ export class SandboxRunner {
       if (typeof payload.id === 'string') {
         if (this.images.has(payload.id)) cell.outputs.push({ type: 'image', id: payload.id });
         else cell.outputs.push({ type: 'text', text: '[warn] emitImage(): that screenshot is no longer held by the host' });
+      } else if (payload.tooLarge) {
+        cell.outputs.push({ type: 'text', text: '[warn] emitImage(): image too large' });
       } else if (typeof payload.data === 'string' && ['image/png', 'image/jpeg'].includes(payload.mimeType)
         && payload.data.length <= MAX_EMITTED_IMAGE_CHARS && /^[A-Za-z0-9+/]*={0,2}$/.test(payload.data)) {
         cell.outputs.push({ type: 'image', id: this.#storeImage({ data: payload.data, mimeType: payload.mimeType }) });
@@ -248,6 +280,21 @@ export class SandboxRunner {
         cell.outputs.push({ type: 'text', text: '[warn] emitImage(): unsupported image' });
       }
     }
+  }
+
+  // The state shown after the cell is observed afresh when the cell ends:
+  // apps often finish reacting (a dialog closing after Save) after the last
+  // action's settle.
+  async #finish(cell, msg) {
+    if (cell.pending && cell.pendingTarget && !isScreenshot(cell.pending.screenshot) && !msg.reason && Date.now() < cell.deadline) {
+      try {
+        const obs = await this.host.call('get_ax_state', cell.pendingTarget, { signal: cell.controller.signal, deadline: Math.min(cell.deadline, Date.now() + 3000) });
+        if (obs?.window) cell.pending = obs;
+      } catch {
+        // keep the action's own observation
+      }
+    }
+    this.#complete(cell, msg);
   }
 
   #complete(cell, msg) {
@@ -347,6 +394,7 @@ export class SandboxRunner {
   reset() {
     this.#kill('js_reset');
     this.images.clear();
+    this.imageChars = 0;
     this.stateLost = false;
     if (this.cell) this.#complete(this.cell, { ok: false, error: 'ResetError: REPL was reset', reason: 'reset', stateLost: true });
   }
@@ -358,8 +406,43 @@ export class SandboxRunner {
 
 function observationHeader(obs) {
   const w = obs.window || {};
-  const lines = [`window ${w.window_id} (${w.width}x${w.height})`];
-  if (obs.timing) lines.push(`timing: settle_ms=${obs.timing.settle_ms} observation_ms=${obs.timing.observation_ms}`);
+  const lines = [`window ${w.window_id} (${w.width}x${w.height})${obs.closed ? ' closed' : ''}`];
+  const others = Array.isArray(obs.app_windows) ? obs.app_windows : [];
+  if (others.length) {
+    const list = others.map((o) => `${o.window_id} ${JSON.stringify(String(o.title ?? '')).slice(0, 80)}`).join('; ');
+    lines.push(`other windows of this app: ${fenceUntrusted('windows', list)}`);
+  }
+  if (obs.timing) lines.push(`timing: settle_ms=${round(obs.timing.settle_ms)} observation_ms=${round(obs.timing.observation_ms)}`);
   if (Array.isArray(obs.warnings) && obs.warnings.length) lines.push(`warnings: ${fenceUntrusted('warnings', obs.warnings.map(String).join('\n'))}`);
   return lines.join('\n');
+}
+
+const round = (v) => (typeof v === 'number' ? Math.round(v) : v);
+
+// The app's main window for getApp(appId): matched case-insensitively on the
+// app id; a window that is not a dialog (no WM_TRANSIENT_FOR) wins.
+function mainWindow(raw, appId) {
+  const want = String(appId).toLowerCase();
+  const mine = raw.filter((w) => String(w.app_id).toLowerCase() === want);
+  return mine.find((w) => !w.transient_for) || mine[0];
+}
+
+// Subtrees of an accessibility tree whose lines match `query` (case-
+// insensitive substring): each match with its ancestors and descendants.
+export function queryTree(text, query, maxLines = 400) {
+  const lines = String(text ?? '').split('\n');
+  const depth = (l) => l.length - l.trimStart().length;
+  const q = query.toLowerCase();
+  const keep = new Set();
+  for (let i = 0; i < lines.length; i++) {
+    if (!/^\s*\[\d+\]/.test(lines[i]) || !lines[i].toLowerCase().includes(q)) continue;
+    const d = depth(lines[i]);
+    keep.add(i);
+    for (let j = i - 1, need = d; j >= 0 && need > 0; j--) if (depth(lines[j]) < need) { keep.add(j); need = depth(lines[j]); }
+    for (let j = i + 1; j < lines.length && depth(lines[j]) > d; j++) keep.add(j);
+  }
+  const out = [...keep].sort((a, b) => a - b).map((i) => lines[i]);
+  if (out.length === 0) return `# no element matches ${JSON.stringify(query)}`;
+  const head = `# elements matching ${JSON.stringify(query)} with their ancestors and descendants`;
+  return [head, ...out.slice(0, maxLines), ...(out.length > maxLines ? [`… ${out.length - maxLines} more lines`] : [])].join('\n');
 }

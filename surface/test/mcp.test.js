@@ -297,17 +297,35 @@ describe('approval scopes', () => {
     try {
       const r = await t.js(`${APP} await app.getAXState({emit: false}); "a"`);
       assert.match(t.text(r), /=> a/);
-      assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), { always_allowed_app_ids: ['org.example.Notes'] });
+      const notes = { app_id: 'org.example.Notes', executable: '/usr/bin/org.example.Notes' };
+      const calc = { app_id: 'org.example.Calc', executable: '/usr/bin/org.example.Calc' };
+      assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), { always_allowed: [notes] });
       // A new server process with the same file does not ask again.
       const t2 = await startClient({ decide: () => 'decline', env: { CUA_APPROVALS_FILE: file } });
       try {
         const r2 = await t2.js(`${APP} await app.click(1); "b"`);
         assert.match(t2.text(r2), /=> b/);
         assert.equal(t2.elicitations.length, 0);
+        // Regression: the file used to be re-read on every check, so anything
+        // running as the user could add itself mid-session.
+        writeFileSync(file, JSON.stringify({ always_allowed: [notes, calc] }));
+        const r3 = await t2.js('try { await (await cua.getApp({windowId: 12}, {emit: false})).getAXState() } catch (e) { e.code }');
+        assert.match(t2.text(r3), /=> approval_denied/);
+        assert.equal(t2.elicitations.length, 1, 'a file change mid-session does not grant access');
       } finally {
         await t2.close();
       }
-      writeFileSync(file, JSON.stringify({ always_allowed_app_ids: ['org.example.Notes', 'org.example.Calc'] }));
+      // Entries bind the app ID to its executable.
+      writeFileSync(file, JSON.stringify({ always_allowed: [{ ...calc, executable: '/usr/bin/impostor' }] }));
+      const t4 = await startClient({ decide: () => 'decline', env: { CUA_APPROVALS_FILE: file } });
+      try {
+        const r4 = await t4.js('try { await (await cua.getApp({windowId: 12}, {emit: false})).getAXState() } catch (e) { e.code }');
+        assert.match(t4.text(r4), /=> approval_denied/);
+        assert.equal(t4.elicitations.length, 1);
+      } finally {
+        await t4.close();
+      }
+      writeFileSync(file, JSON.stringify({ always_allowed: [notes, calc] }));
       const t3 = await startClient({ decide: () => 'accept', env: { CUA_APPROVALS_FILE: file, CUA_DENY_APPS: 'org.example.Calc' } });
       try {
         const r3 = await t3.js('try { await (await cua.getApp({windowId: 12}, {emit: false})).getAXState() } catch (e) { e.code }');

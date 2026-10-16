@@ -26,9 +26,12 @@ export function checkDisplay(display) {
 }
 
 export class EngineClient {
-  constructor({ command = DEFAULT_ENGINE, args = [], env = process.env, display, onSpawn, log = () => {} } = {}) {
+  // spawnArgs(): extra arguments computed at each (re)spawn (HostApi passes
+  // the session's next element ID).
+  constructor({ command = DEFAULT_ENGINE, args = [], spawnArgs, env = process.env, display, onSpawn, log = () => {} } = {}) {
     this.command = command;
     this.args = args;
+    this.spawnArgs = spawnArgs;
     this.display = checkDisplay(display);
     this.env = { ...env, CUA_DISPLAY: this.display };
     this.onSpawn = onSpawn;
@@ -57,7 +60,8 @@ export class EngineClient {
   async #start() {
     if (this.exiting) await this.exiting;
     const gen = ++this.generation;
-    const proc = spawn(this.command, this.args, { stdio: ['pipe', 'pipe', 'pipe'], env: this.env });
+    const args = [...this.args, ...(this.spawnArgs ? this.spawnArgs() : [])];
+    const proc = spawn(this.command, args, { stdio: ['pipe', 'pipe', 'pipe'], env: this.env });
     this.proc = proc;
     let resolveExit;
     proc.exitPromise = new Promise((r) => (resolveExit = r));

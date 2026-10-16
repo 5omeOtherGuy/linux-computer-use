@@ -59,12 +59,25 @@ function describe(handle, formatter) {
   });
 }
 
+// Host results reach the VM as a JSON string. Image bytes (`$bytes`, base64
+// from the engine) are decoded here, natively, and passed as an ArrayBuffer
+// next to the JSON: decoding in VM JavaScript took ~0.4 s per megabyte.
+function resultHandle(payload) {
+  const v = payload?.value;
+  if (!payload?.ok || !v || typeof v !== 'object' || typeof v.$bytes !== 'string') return vm.newString(JSON.stringify(payload));
+  const bytes = Buffer.from(v.$bytes, 'base64');
+  const obj = vm.newObject();
+  vm.newString(JSON.stringify({ ok: true, value: { ...v, $bytes: true } })).consume((h) => vm.setProp(obj, 'json', h));
+  vm.newArrayBuffer(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)).consume((h) => vm.setProp(obj, 'bytes', h));
+  return obj;
+}
+
 function settleCall(callId, payload) {
   const entry = pending.get(callId);
   if (!entry) return;
   pending.delete(callId);
   if (entry.timer) clearTimeout(entry.timer);
-  const h = payload === undefined ? vm.undefined : vm.newString(JSON.stringify(payload));
+  const h = payload === undefined ? vm.undefined : resultHandle(payload);
   entry.deferred.resolve(h);
   if (payload !== undefined) h.dispose();
   entry.deferred.dispose();
@@ -108,10 +121,16 @@ function init({ memoryLimitMb = 128, stackKb = 1024 }) {
       return deferred.handle;
     });
 
-    const emit = vm.newFunction('__cua_emit', (kindH, payloadH) => {
+    const emit = vm.newFunction('__cua_emit', (kindH, payloadH, bytesH) => {
       if (!current) return vm.undefined;
       const kind = vm.getString(kindH);
-      const payload = vm.getString(payloadH);
+      let payload = vm.getString(payloadH);
+      if (kind === 'image' && bytesH && vm.typeof(bytesH) === 'object') {
+        // Raw image bytes from model code: encoded natively.
+        const meta = JSON.parse(payload);
+        const data = vm.getArrayBuffer(bytesH).consume(({ value: u8 }) => (u8.length * 4 / 3 > MAX_IMAGE_CHARS ? null : Buffer.from(u8).toString('base64')));
+        payload = JSON.stringify(data === null ? { mimeType: meta.mimeType, tooLarge: true } : { mimeType: meta.mimeType, data });
+      }
       current.emits++;
       if (kind === 'image') current.imageChars += payload.length;
       else current.chars += payload.length;
@@ -250,3 +269,16 @@ process.on('message', async (msg) => {
   }
 });
 process.on('disconnect', () => process.exit(0));
+// Anything that escapes (e.g. a QuickJS/WebAssembly abort inside a promise
+// continuation) is reported to the host before the process exits, so the
+// cause reaches the cell result and the server log.
+for (const ev of ['uncaughtException', 'unhandledRejection']) {
+  process.on(ev, (err) => {
+    try {
+      send({ type: 'fatal', error: `${ev}: ${String(err?.stack || err)}` });
+    } finally {
+      process.exitCode = 70;
+      setImmediate(() => process.exit(70));
+    }
+  });
+}

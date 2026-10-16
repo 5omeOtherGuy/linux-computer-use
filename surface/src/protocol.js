@@ -173,6 +173,24 @@ export function parseExtensions(value) {
 }
 
 // Methods model code and discrete tools may call, given enabled extensions.
+// `app: true` (engine): window_id names any window of an app, and the engine
+// acts on the app's window the input belongs to (dialogs included).
+const APP_SCOPED = ['get_app_state', 'get_ax_state', 'get_screenshot', 'click', 'drag', 'scroll', 'type_text', 'press_key', 'paste', 'set_value', 'perform_secondary_action'];
+for (const m of APP_SCOPED) {
+  const spec = METHODS[m];
+  const build = spec.build;
+  spec.keys = [...spec.keys, 'app'];
+  spec.build = (method, p) => {
+    const { app, ...rest } = p;
+    const out = build(method, rest);
+    if (app !== undefined) {
+      if (typeof app !== 'boolean') fail(method, 'app must be a boolean');
+      out.app = app;
+    }
+    return out;
+  };
+}
+
 export function exposedMethods(extensions = new Set()) {
   return Object.keys(METHODS).filter((m) => !METHODS[m].extension || extensions.has(METHODS[m].extension));
 }
@@ -228,6 +246,7 @@ export function toolInputSchema(method, extensions = new Set()) {
       case 'key': add(k, { type: 'string', description: 'X keysym or chord, e.g. "Return", "ctrl+s"' }, true); break;
       case 'value': add(k, { type: 'string', maxLength: MAX_TEXT }, true); break;
       case 'action': add(k, { type: 'string', description: 'Secondary accessibility action name' }, true); break;
+      case 'app': add(k, { type: 'boolean', description: 'Treat window_id as the app: act on its focused or dialog window (element: the window holding it)' }); break;
       default: throw new Error(`no schema for ${k}`);
     }
   }

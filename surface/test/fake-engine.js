@@ -23,7 +23,8 @@ const approved = new Set();
 let pointer = null;
 const typed = [];
 
-record({ event: 'start', display: process.env.CUA_DISPLAY });
+record({ event: 'start', display: process.env.CUA_DISPLAY, argv: process.argv.slice(2) });
+const firstId = Number(process.argv[process.argv.indexOf('--first-element-id') + 1]) || 1;
 
 function png(w, h) {
   const p = new PNG({ width: w, height: h });
@@ -52,7 +53,7 @@ function windowFor(params) {
   if (!win) throw new EngineError('window_not_found', `no window ${params.window_id}`);
   if (deny.has(win.app_id)) throw new EngineError('app_denied', `${win.app_id} is denied`);
   if (!allow.has(win.app_id) && !approved.has(win.window_id)) {
-    throw new EngineError('approval_required', 'approval required', { app_id: win.app_id, window_id: win.window_id, title: win.title });
+    throw new EngineError('approval_required', 'approval required', { app_id: win.app_id, window_id: win.window_id, title: win.title, executable: `/usr/bin/${win.app_id}` });
   }
   return win;
 }
@@ -64,6 +65,7 @@ function observation(win, withShot) {
     ax_diff: typed.length ? `+ typed ${typed.length}` : '',
     timing: { settle_ms: 1, observation_ms: 1 },
     warnings: [],
+    last_element_id: firstId + 3,
   };
   if (withShot) obs.screenshot = screenshot(win);
   return obs;
