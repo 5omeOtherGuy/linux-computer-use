@@ -363,6 +363,9 @@ pub enum TextInput {
     /// No accessible editable text has focus (the reason); the caller may
     /// fall back to key events.
     NoTarget(String),
+    /// The target is a single-line field and the text has newlines: the
+    /// caller inserts the lines separately and presses Return between them.
+    SingleLine,
 }
 
 pub struct Accessibility {
@@ -2126,6 +2129,9 @@ impl Accessibility {
                 Err(e) => return Ok(TextInput::NoTarget(format!("{e:#}"))),
             },
         };
+        if text.contains('\n') && has(el.states, S_SINGLE_LINE) {
+            return Ok(TextInput::SingleLine);
+        }
         let mut warnings = Vec::new();
         if let Some(w) = insert_text(&self.conn, &el, text).await? {
             warnings.push(w);

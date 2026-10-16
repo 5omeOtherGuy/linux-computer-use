@@ -124,6 +124,11 @@ describe('MCP surface', () => {
     r = await t.js(`${APP} await app.getScreenshot(); await app.getAXState({emit: false}); "x"`);
     assert.equal(r.content.filter((c) => c.type === 'image').length, 1, 'getScreenshot emits by default');
     assert.doesNotMatch(t.text(r), /UNTRUSTED accessibility/, 'emit:false suppresses the tree');
+    // A screenshot as the cell value says whether it is already shown.
+    r = await t.js(`${APP} await app.getScreenshot()`);
+    assert.match(t.text(r), /=> Uint8Array\(\d+\) \[PNG image, shown in this output\]/);
+    r = await t.js(`${APP} await app.getScreenshot({emit: false})`);
+    assert.match(t.text(r), /\[PNG image; pass it to nodeRepl\.emitImage\(\) to show it\]/);
     r = await t.js(`${APP} await app.getAXStateAndScreenshot(); "y"`);
     assert.match(t.text(r), /<<<UNTRUSTED accessibility nonce=/);
     assert.equal(r.content.filter((c) => c.type === 'image').length, 1);

@@ -392,6 +392,29 @@ impl Engine {
                             "typed as key events to the window's focus ({reason})"
                         )));
                     }
+                    // "path\n" into a location entry: insert, then Return,
+                    // as typing would.
+                    ax::TextInput::SingleLine => {
+                        for (i, line) in text.split('\n').enumerate() {
+                            if i > 0 {
+                                self.desktop.action(
+                                    &w,
+                                    "press_key",
+                                    &json!({"window_id": w.window_id, "key": "Return"}),
+                                )?;
+                            }
+                            if line.is_empty() {
+                                continue;
+                            }
+                            let ax = self.ax.as_mut().expect("text_input came from AT-SPI");
+                            match ax.text_input(&w, line, None).await? {
+                                ax::TextInput::Inserted(w) => {
+                                    warnings.extend(w.into_iter().map(Value::from))
+                                }
+                                _ => self.desktop.type_keys(&w, line)?,
+                            }
+                        }
+                    }
                 }
             }
             ("scroll", Some(idx)) => {
@@ -429,6 +452,9 @@ impl Engine {
                 )
             }),
             ("click", Some(idx)) => self.ax.as_ref().is_some_and(|ax| ax.element_is_button(idx)),
+            ("type_text" | "paste", _) => {
+                p.get("text").and_then(Value::as_str).is_some_and(|t| t.ends_with('\n'))
+            }
             _ => false,
         };
         if w.transient_for.is_some() && confirms {

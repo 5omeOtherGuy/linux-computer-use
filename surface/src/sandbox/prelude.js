@@ -23,7 +23,8 @@ export function preludeSource() {
     if (value instanceof ArrayBuffer) return 'ArrayBuffer(' + value.byteLength + ')';
     if (ArrayBuffer.isView(value)) {
       const b = value;
-      const kind = b instanceof Uint8Array && b[0] === 0x89 && b[1] === 0x50 ? ' [PNG image; pass it to nodeRepl.emitImage() to show it]' : '';
+      const png = b instanceof Uint8Array && b[0] === 0x89 && b[1] === 0x50;
+      const kind = !png ? '' : shownImages.has(b) ? ' [PNG image, shown in this output]' : ' [PNG image; pass it to nodeRepl.emitImage() to show it]';
       return (b.constructor && b.constructor.name || 'TypedArray') + '(' + b.length + ')' + kind;
     }
     const seen = new WeakSet();
@@ -79,6 +80,7 @@ export function preludeSource() {
     if (typeof raw !== 'string' && res.value && res.value.$bytes === true) {
       const bytes = new Uint8Array(raw.bytes);
       hostImages.set(bytes, res.value.$image);
+      if (!opts || opts.emit !== false) shownImages.add(bytes);
       return bytes;
     }
     return res.value;
@@ -87,6 +89,8 @@ export function preludeSource() {
   // --- image bytes -------------------------------------------------------
   // Screenshot bytes the host still holds, so emitting them needs no re-encode.
   const hostImages = new WeakMap();
+  // Images already emitted into the cell output (auto-emitted screenshots).
+  const shownImages = new WeakSet();
   const sniff = (b) => b[0] === 0x89 && b[1] === 0x50 ? 'image/png' : b[0] === 0xff && b[1] === 0xd8 ? 'image/jpeg' : null;
   const emitImage = async (image) => {
     let bytes = image, mimeType;
