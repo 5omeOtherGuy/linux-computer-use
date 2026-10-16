@@ -2377,6 +2377,16 @@ mod tests {
         );
         assert_eq!(parse_key_combo("+").unwrap(), (vec![], '+' as u32));
         assert_eq!(parse_key_combo("F12").unwrap().1, 0xffbe + 11);
+        // GPT-style spellings: any case, Enter for Return, arrow names; a
+        // lone capital letter keeps its case, with modifiers it names the key.
+        for k in ["Ctrl+s", "ctrl+S", "CTRL+s", "Control+s"] {
+            assert_eq!(parse_key_combo(k).unwrap(), (vec![Modifier::Ctrl], 's' as u32), "{k}");
+        }
+        for k in ["Enter", "ENTER", "return"] {
+            assert_eq!(parse_key_combo(k).unwrap(), (vec![], XK_RETURN), "{k}");
+        }
+        assert_eq!(parse_key_combo("ArrowDown").unwrap().1, 0xff54);
+        assert_eq!(parse_key_combo("A").unwrap().1, 'A' as u32);
         assert!(parse_key_combo("cmd+c").is_err());
         assert!(parse_key_combo("hyper+x").is_err());
         assert!(parse_key_combo("NotAKey").is_err());

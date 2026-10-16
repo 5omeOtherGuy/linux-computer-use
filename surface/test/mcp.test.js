@@ -34,7 +34,7 @@ describe('MCP surface', () => {
     let r = await t.js('let n = 2; const f = (x) => x * n; class P { v() { return n } } function g() { return "g" + n }\nconst [w] = await cua.listWindows({emit: false}); w.id', { title: 'setup' });
     assert.equal(r.isError, false, t.text(r));
     assert.match(t.text(r), /\[setup\] ok/);
-    assert.match(t.text(r), /=> 11/);
+    assert.match(t.text(r), /=> 14/);
     r = await t.js('n = n + 1; [f(14), new P().v(), g(), typeof w]');
     assert.match(t.text(r), /42/);
     assert.match(t.text(r), /"g3"/);
@@ -55,7 +55,7 @@ describe('MCP surface', () => {
       JSON.stringify([ws.map((w) => Object.keys(w).sort().join('|')), Object.keys(apps[0]).sort(), Object.keys(state).sort(),
         apps[0].windows[0].id, calc.id, calc.windowId, calc.windows[0].app])`);
     assert.equal(r.isError, false, t.text(r));
-    assert.match(t.text(r), /=> \[\["app\|id\|title","app\|id\|title","app\|id\|title"\],\["displayName","id","isRunning","windows"\],\["apps","browsers"\],11,"org.example.Calc",12,"org.example.Calc"\]/);
+    assert.match(t.text(r), /=> \[\["app\|id\|title","app\|id\|title","app\|id\|title","app\|id\|title"\],\["displayName","id","isRunning","windows"\],\["apps","browsers"\],14,"org.example.Calc",12,"org.example.Calc"\]/);
     assert.doesNotMatch(t.text(r), /window_id/);
     // Discovery calls emit their (untrusted) result by default.
     r = await t.js('await cua.listWindows(); await cua.getApp({windowId: 12}); "x"');
@@ -83,6 +83,29 @@ describe('MCP surface', () => {
     assert.deepEqual(performed.map((e) => e.method).slice(-2), ['click', 'type_text']);
     const approvals = t.events().filter((e) => e.event === 'request' && e.method === 'approve_app');
     assert.deepEqual(approvals.at(-1).params, { window_id: 11, app_id: 'org.example.Notes' });
+  });
+
+  test('getApp by name picks the main window; app methods follow dialogs; GPT argument shapes', async () => {
+    let r = await t.js(`const notes = await cua.getApp("org.example.notes", {emit: false});
+      await notes.click({element: 1}); await notes.click({x: 3, y: 4}); await notes.typeText({text: "x"});
+      await notes.pressKey({key: "Ctrl+s"}); await notes.pressKey(["ctrl", "shift", "n"]);
+      await notes.setValue({element: 3, value: 5}); await notes.scroll({x: 1, y: 2, scrollY: -300});
+      JSON.stringify([notes.windowId, notes.windows.map((w) => w.id).sort()])`);
+    assert.equal(r.isError, false, t.text(r));
+    assert.match(t.text(r), /=> \[11,\[11,14\]\]/, 'main window, not the newer dialog; the app lists both');
+    const done = t.performed().slice(-7).map((e) => [e.method, e.params]);
+    assert.deepEqual(done, [
+      ['click', { window_id: 11, app: true, element_index: 1 }],
+      ['click', { window_id: 11, app: true, x: 3, y: 4 }],
+      ['type_text', { window_id: 11, app: true, text: 'x' }],
+      ['press_key', { window_id: 11, app: true, key: 'Ctrl+s' }],
+      ['press_key', { window_id: 11, app: true, key: 'ctrl+shift+n' }],
+      ['set_value', { window_id: 11, app: true, element_index: 3, value: '5' }],
+      ['scroll', { window_id: 11, app: true, x: 1, y: 2, direction: 'up', pixels: 300 }],
+    ]);
+    // A returned observation that was emitted is not repeated as the value.
+    r = await t.js(`const n2 = await cua.getApp({windowId: 11}, {emit: false}); await n2.getAXState({disableDiffing: true})`);
+    assert.equal(t.text(r).split('[1] button "OK"').length - 1, 1, t.text(r));
   });
 
   test('nodeRepl output API: write, emitImage, auto-emitted observations, PNG bytes', async () => {
@@ -226,6 +249,12 @@ describe('MCP surface', () => {
     r = await t.js(`${APP} await app.click(1); app.windowId`);
     assert.match(t.text(r), /=> 11/);
     assert.equal(t.elicitations.length, before);
+    // The new daemon continues the session's element IDs: an old ID can
+    // never name a different element (the fake's last ID is first + 3).
+    const firstIds = t.events().filter((e) => e.event === 'start')
+      .map((e) => Number(e.argv[e.argv.indexOf('--first-element-id') + 1]));
+    assert.ok(firstIds.length >= 2, JSON.stringify(firstIds));
+    assert.ok(firstIds.at(-1) > firstIds.at(-2) + 3, JSON.stringify(firstIds));
   });
 
   test('MCP cancellation terminates the pending action', async () => {
