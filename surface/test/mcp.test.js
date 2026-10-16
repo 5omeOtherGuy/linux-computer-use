@@ -37,11 +37,13 @@ describe('MCP surface', () => {
   test('lists js, js_reset, turn_ended and discrete tools; never host-only methods', async () => {
     const { tools } = await t.client.listTools();
     const names = tools.map((x) => x.name);
-    for (const n of ['js', 'js_reset', 'turn_ended', 'list_apps', 'list_windows', 'get_app_state', 'get_ax_state', 'get_screenshot', 'click', 'drag', 'scroll', 'type_text', 'press_key', 'paste', 'set_value', 'perform_secondary_action']) {
+    for (const n of ['js', 'js_reset', 'turn_ended', 'list_apps', 'list_windows', 'get_app_state', 'get_ax_state', 'get_screenshot', 'launch_app', 'clipboard_write', 'clipboard_read', 'clipboard_release', 'click', 'drag', 'scroll', 'type_text', 'press_key', 'paste', 'set_value', 'perform_secondary_action', 'mouse_move']) {
       assert.ok(names.includes(n), `missing ${n}`);
     }
     assert.ok(!names.includes('approve_app'));
-    assert.ok(!names.includes('mouse_move'), 'extension tools are off by default');
+    const click = tools.find((x) => x.name === 'click').inputSchema.properties;
+    assert.deepEqual(Object.keys(click).sort(), ['app', 'button', 'click_count', 'element_index', 'hold_ms', 'modifiers', 'screenshot', 'window_id', 'x', 'y']);
+    assert.equal(tools.find((x) => x.name === 'launch_app').inputSchema.properties.app.type, 'string');
     const js = tools.find((x) => x.name === 'js');
     assert.deepEqual(Object.keys(js.inputSchema.properties).sort(), ['code', 'timeout_ms', 'title']);
     assert.match(js.description, /Confirmation policy/);
@@ -147,6 +149,55 @@ describe('MCP surface', () => {
       assert.match(t.text(bad), /invalid_params/);
       assert.equal(t.performed().length, before);
     }
+  });
+
+  test('held modifiers, press durations, hover and mouse buttons reach the engine', async () => {
+    const r = await t.js(`${APP} await app.click([5, 6], {modifiers: "shift+ctrl", durationMs: 50}); await app.rightClick(1); await app.doubleClick([2, 2], {key: "alt"});
+      await app.pressKey("a", {durationMs: 20}); await app.moveMouse([7, 8]); await app.moveMouseRelative(1, -1); await app.hover(1);
+      await app.drag([1, 1], [2, 2], {modifiers: ["alt"]}); await app.drag({path: [[1, 1], [2, 2]], modifiers: "super"});
+      await app.scroll({x: 3, y: 3, direction: "down", modifiers: ["shift"]}); await app.scroll([3, 3], "up", 1, {modifiers: "ctrl"}); "done"`);
+    assert.equal(r.isError, false, t.text(r));
+    const strip = ({ window_id, app, observe, frame_window, ...rest }) => rest;
+    assert.deepEqual(t.performed().slice(-11).map((e) => [e.method, strip(e.params)]), [
+      ['click', { x: 5, y: 6, modifiers: ['shift', 'ctrl'], hold_ms: 50 }],
+      ['click', { element_index: 1, button: 'right' }],
+      ['click', { x: 2, y: 2, click_count: 2, modifiers: ['alt'] }],
+      ['press_key', { key: 'a', hold_ms: 20 }],
+      ['mouse_move', { x: 7, y: 8 }],
+      ['mouse_move', { dx: 1, dy: -1 }],
+      ['mouse_move', { element_index: 1 }],
+      ['drag', { from: [1, 1], to: [2, 2], modifiers: ['alt'] }],
+      ['drag', { path: [[1, 1], [2, 2]], modifiers: ['super'] }],
+      ['scroll', { x: 3, y: 3, direction: 'down', pixels: 500, modifiers: ['shift'] }],
+      ['scroll', { x: 3, y: 3, direction: 'up', pixels: 500, modifiers: ['ctrl'] }],
+    ]);
+  });
+
+  test('getAXStateAndScreenshot is one engine call that returns both', async () => {
+    const r = await t.js(`${APP} const {state, screenshot} = await app.getAXStateAndScreenshot(); [typeof state, screenshot instanceof Uint8Array && screenshot.length > 0].join()`);
+    assert.equal(r.isError, false, t.text(r));
+    assert.match(t.text(r), /=> string,true/);
+    assert.match(t.text(r), /host calls: list_windows, get_ax_state$/m);
+    assert.ok(r.content.some((c) => c.type === 'image'), 'the screenshot is shown');
+    assert.match(t.text(r), /<<<UNTRUSTED accessibility/);
+    assert.equal(t.events().filter((e) => e.event === 'request' && e.method === 'get_ax_state' && e.params.screenshot === true).length >= 1, true);
+  });
+
+  test('launchApp starts an installed app and returns it like getApp; clipboard round trip; help', async () => {
+    let r = await t.js('const launched = await cua.launchApp("drawing"); launched.id');
+    assert.equal(r.isError, false, t.text(r));
+    assert.match(t.text(r), /launched Launched \(pid 121\)/);
+    assert.match(t.text(r), /<<<UNTRUSTED accessibility/);
+    assert.match(t.text(r), /=> org\.example\.Launched/);
+    assert.deepEqual(t.performed().find((e) => e.method === 'launch_app').params, { app: 'drawing' });
+    r = await t.js('try { await cua.launchApp("nothing") } catch (e) { e.code }');
+    assert.match(t.text(r), /=> not_found/);
+    r = await t.js('await cua.clipboard.write("Grüße λ"); const a = await cua.clipboard.read(); await cua.clipboard.release(); [a, await cua.clipboard.read()]');
+    assert.equal(r.isError, false, t.text(r));
+    assert.match(t.text(r), /"Grüße λ",\s*null/);
+    r = await t.js('cua.help()');
+    assert.match(t.text(r), /Run JavaScript in a persistent, isolated REPL/);
+    assert.match(t.text(r), /Confirmation policy/);
   });
 
   test('getApp emits the app state once; prefers the focused main window and names the others', async () => {
@@ -273,7 +324,10 @@ describe('MCP surface', () => {
       'string target': 'app.click("11; rm -rf /")',
       'extra option': 'app.click(1, {approve: true})',
       'negative coord': 'app.click([-5, 1])',
-      'extension option': 'app.click([1, 1], {mouseButton: "right"})',
+      'unknown button': 'app.click([1, 1], {mouseButton: "back"})',
+      'unknown modifier': 'app.click([1, 1], {modifiers: ["cmd"]})',
+      'hold too long': 'app.click([1, 1], {durationMs: 99999})',
+      'launch with a command line': 'cua.launchApp("xterm -e rm\\n")',
       'key injection': 'app.pressKey("ctrl+s\\nrm")',
       'non-string text': 'app.typeText({toString() { return "x" }})',
     };

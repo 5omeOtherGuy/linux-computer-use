@@ -8,14 +8,16 @@ import { CuaError } from './errors.js';
 // Methods only the trusted host may send. Never exposed to model code or tools.
 export const HOST_ONLY_METHODS = Object.freeze(['approve_app', 'turn_ended']);
 
-// Optional engine extensions beyond CONTRACT.md. Off by default; enable with
-// CUA_ENGINE_EXTENSIONS only when the daemon implements them (or rejects them
-// explicitly). The surface never emulates them.
+// Former optional engine extensions (mouse buttons, multi-clicks, held
+// modifiers, pointer moves). The daemon implements them all now, so they are
+// part of the contract; the names are still accepted in CUA_ENGINE_EXTENSIONS
+// for compatibility and change nothing.
 export const KNOWN_EXTENSIONS = Object.freeze(['click_button', 'click_count', 'modifiers', 'mouse_move']);
 
 export const MAX_TEXT = 100_000;
 const MAX_COORD = 65_535; // window-local pixels; WindowInfo width/height are u16
 const MAX_ELEMENT_INDEX = 10_000_000;
+const MAX_HOLD_MS = 10_000;
 const MODIFIERS = ['shift', 'ctrl', 'alt', 'super'];
 
 function fail(method, message) {
@@ -71,6 +73,14 @@ const checks = {
     }
     return out;
   },
+  holdMs(method, v) {
+    if (!Number.isInteger(v) || v < 0 || v > MAX_HOLD_MS) fail(method, `hold_ms must be an integer in [0, ${MAX_HOLD_MS}]`);
+    return v;
+  },
+  bool(method, name, v) {
+    if (typeof v !== 'boolean') fail(method, `${name} must be a boolean`);
+    return v;
+  },
 };
 
 // Target (element_index or x,y) shared by click and scroll.
@@ -87,17 +97,21 @@ function target(method, p, out) {
 }
 
 // spec: allowed keys, validator producing a normalized fresh object.
-// `ext` lists extension params and the extension that enables each one.
 const METHODS = {
   list_apps: { kind: 'read', keys: [], build: () => ({}) },
   list_windows: { kind: 'read', keys: [], build: () => ({}) },
   get_app_state: { kind: 'read', keys: ['window_id'], build: (m, p) => ({ window_id: checks.windowId(m, p.window_id) }) },
   get_ax_state: { kind: 'read', keys: ['window_id'], build: (m, p) => ({ window_id: checks.windowId(m, p.window_id) }) },
   get_screenshot: { kind: 'read', keys: ['window_id'], build: (m, p) => ({ window_id: checks.windowId(m, p.window_id) }) },
+  // Starts an installed desktop application by name; not window-scoped.
+  launch_app: { kind: 'launch', keys: ['app'], build: (m, p) => ({ app: checks.label(m, 'app', p.app) }) },
+  // The display's CLIPBOARD selection (plain text); not window-scoped.
+  clipboard_write: { kind: 'clipboard', keys: ['text'], build: (m, p) => ({ text: checks.text(m, 'text', p.text) }) },
+  clipboard_read: { kind: 'clipboard', keys: [], build: () => ({}) },
+  clipboard_release: { kind: 'clipboard', keys: [], build: () => ({}) },
   click: {
     kind: 'action',
-    keys: ['window_id', 'element_index', 'x', 'y'],
-    ext: { button: 'click_button', click_count: 'click_count', modifiers: 'modifiers' },
+    keys: ['window_id', 'element_index', 'x', 'y', 'button', 'click_count', 'modifiers', 'hold_ms'],
     build(m, p) {
       const out = { window_id: checks.windowId(m, p.window_id) };
       target(m, p, out);
@@ -110,13 +124,13 @@ const METHODS = {
         out.click_count = p.click_count;
       }
       if (p.modifiers !== undefined) out.modifiers = checks.modifiers(m, p.modifiers);
+      if (p.hold_ms !== undefined) out.hold_ms = checks.holdMs(m, p.hold_ms);
       return out;
     },
   },
   drag: {
     kind: 'action',
-    keys: ['window_id', 'from', 'to', 'path'],
-    ext: { modifiers: 'modifiers' },
+    keys: ['window_id', 'from', 'to', 'path', 'modifiers'],
     build(m, p) {
       const out = { window_id: checks.windowId(m, p.window_id) };
       if (p.path !== undefined) {
@@ -133,8 +147,7 @@ const METHODS = {
   },
   scroll: {
     kind: 'action',
-    keys: ['window_id', 'element_index', 'x', 'y', 'direction', 'pixels'],
-    ext: { modifiers: 'modifiers' },
+    keys: ['window_id', 'element_index', 'x', 'y', 'direction', 'pixels', 'modifiers'],
     build(m, p) {
       const out = { window_id: checks.windowId(m, p.window_id) };
       target(m, p, out);
@@ -147,7 +160,15 @@ const METHODS = {
     },
   },
   type_text: { kind: 'action', keys: ['window_id', 'text'], build: (m, p) => ({ window_id: checks.windowId(m, p.window_id), text: checks.text(m, 'text', p.text) }) },
-  press_key: { kind: 'action', keys: ['window_id', 'key'], build: (m, p) => ({ window_id: checks.windowId(m, p.window_id), key: checks.key(m, p.key) }) },
+  press_key: {
+    kind: 'action',
+    keys: ['window_id', 'key', 'hold_ms'],
+    build(m, p) {
+      const out = { window_id: checks.windowId(m, p.window_id), key: checks.key(m, p.key) };
+      if (p.hold_ms !== undefined) out.hold_ms = checks.holdMs(m, p.hold_ms);
+      return out;
+    },
+  },
   paste: { kind: 'action', keys: ['window_id', 'text'], build: (m, p) => ({ window_id: checks.windowId(m, p.window_id), text: checks.text(m, 'text', p.text) }) },
   set_value: {
     kind: 'action',
@@ -159,12 +180,24 @@ const METHODS = {
     keys: ['window_id', 'element_index', 'action'],
     build: (m, p) => ({ window_id: checks.windowId(m, p.window_id), element_index: checks.elementIndex(m, p.element_index), action: checks.label(m, 'action', p.action) }),
   },
-  // Extension method, only with CUA_ENGINE_EXTENSIONS=mouse_move.
+  // Hover: move the virtual pointer to an element, a point, or by an offset.
   mouse_move: {
     kind: 'action',
-    extension: 'mouse_move',
-    keys: ['window_id', 'x', 'y'],
-    build: (m, p) => ({ window_id: checks.windowId(m, p.window_id), x: checks.coord(m, 'x', p.x), y: checks.coord(m, 'y', p.y) }),
+    keys: ['window_id', 'element_index', 'x', 'y', 'dx', 'dy'],
+    build(m, p) {
+      const out = { window_id: checks.windowId(m, p.window_id) };
+      const relative = p.dx !== undefined || p.dy !== undefined;
+      if (relative) {
+        if (p.element_index !== undefined || p.x !== undefined || p.y !== undefined) fail(m, 'provide exactly one of element_index, x,y or dx,dy');
+        for (const k of ['dx', 'dy']) {
+          if (!Number.isInteger(p[k]) || Math.abs(p[k]) > MAX_COORD) fail(m, `${k} must be an integer in [-${MAX_COORD}, ${MAX_COORD}]`);
+          out[k] = p[k];
+        }
+      } else {
+        target(m, p, out);
+      }
+      return out;
+    },
   },
 };
 
@@ -183,16 +216,19 @@ export function parseExtensions(value) {
 // Methods model code and discrete tools may call, given enabled extensions.
 // `app: true` (engine): window_id names any window of an app, and the engine
 // acts on the app's window the input belongs to (dialogs included).
-const APP_SCOPED = ['get_app_state', 'get_ax_state', 'get_screenshot', 'click', 'drag', 'scroll', 'type_text', 'press_key', 'paste', 'set_value', 'perform_secondary_action'];
+const APP_SCOPED = ['get_app_state', 'get_ax_state', 'get_screenshot', 'click', 'drag', 'scroll', 'type_text', 'press_key', 'paste', 'set_value', 'perform_secondary_action', 'mouse_move'];
 for (const m of APP_SCOPED) {
   const spec = METHODS[m];
   const build = spec.build;
-  const pointer = ['click', 'drag', 'scroll', 'type_text', 'paste'].includes(m);
+  const pointer = ['click', 'drag', 'scroll', 'type_text', 'paste', 'mouse_move'].includes(m);
   const action = spec.kind === 'action';
-  spec.keys = [...spec.keys, 'app', ...(pointer ? ['frame_window'] : []), ...(action ? ['observe'] : [])];
+  const observes = action || ['get_app_state', 'get_ax_state'].includes(m);
+  spec.keys = [...spec.keys, 'app', ...(pointer ? ['frame_window'] : []), ...(action ? ['observe'] : []), ...(observes ? ['screenshot'] : [])];
   spec.build = (method, p) => {
-    const { app, frame_window, observe, ...rest } = p;
+    const { app, frame_window, observe, screenshot, ...rest } = p;
     const out = build(method, rest);
+    // One request for the observation and a screenshot of its window.
+    if (screenshot !== undefined) out.screenshot = checks.bool(method, 'screenshot', screenshot);
     if (app !== undefined) {
       if (typeof app !== 'boolean') fail(method, 'app must be a boolean');
       out.app = app;
@@ -213,8 +249,10 @@ for (const m of APP_SCOPED) {
   };
 }
 
-export function exposedMethods(extensions = new Set()) {
-  return Object.keys(METHODS).filter((m) => !METHODS[m].extension || extensions.has(METHODS[m].extension));
+// Methods model code and discrete tools may call. (`extensions` is accepted
+// for compatibility; every method is available.)
+export function exposedMethods() {
+  return Object.keys(METHODS);
 }
 
 export function methodKind(method) {
@@ -222,31 +260,23 @@ export function methodKind(method) {
 }
 
 // Validate a model-originated request; returns a fresh normalized params object.
-export function validateRequest(method, params, extensions = new Set()) {
+export function validateRequest(method, params) {
   if (typeof method !== 'string' || !Object.hasOwn(METHODS, method)) {
     if (HOST_ONLY_METHODS.includes(method)) throw new CuaError('forbidden_method', `${method} is reserved for the trusted host`);
     throw new CuaError('unknown_method', `unknown method: ${String(method).slice(0, 64)}`);
   }
   const spec = METHODS[method];
-  if (spec.extension && !extensions.has(spec.extension)) {
-    throw new CuaError('unsupported', `${method} requires engine extension "${spec.extension}", which is not enabled`);
-  }
   if (params === undefined || params === null) params = {};
   if (!isPlainObject(params)) throw new CuaError('invalid_params', `${method}: params must be a plain object`);
   const allowed = new Set(spec.keys);
-  for (const [k, ext] of Object.entries(spec.ext || {})) if (extensions.has(ext)) allowed.add(k);
   for (const k of Object.keys(params)) {
-    if (!allowed.has(k)) {
-      const ext = spec.ext?.[k];
-      if (ext) throw new CuaError('unsupported', `${method}: parameter "${k}" requires engine extension "${ext}", which is not enabled`);
-      throw new CuaError('invalid_params', `${method}: unknown parameter "${String(k).slice(0, 64)}"`);
-    }
+    if (!allowed.has(k)) throw new CuaError('invalid_params', `${method}: unknown parameter "${String(k).slice(0, 64)}"`);
   }
   return spec.build(method, params);
 }
 
 // JSON Schemas for the discrete MCP tools, derived from the same table.
-export function toolInputSchema(method, extensions = new Set()) {
+export function toolInputSchema(method) {
   const props = {};
   const req = [];
   const spec = METHODS[method];
@@ -260,7 +290,8 @@ export function toolInputSchema(method, extensions = new Set()) {
     switch (k) {
       case 'window_id': add(k, int(0, 0xffffffff, 'Window id from list_windows'), true); break;
       case 'element_index': add(k, int(0, MAX_ELEMENT_INDEX, 'Element index from the accessibility tree'), method === 'set_value' || method === 'perform_secondary_action'); break;
-      case 'x': case 'y': add(k, int(0, MAX_COORD, 'Window-local pixel coordinate'), method === 'mouse_move'); break;
+      case 'x': case 'y': add(k, int(0, MAX_COORD, 'Window-local pixel coordinate')); break;
+      case 'dx': case 'dy': add(k, int(-MAX_COORD, MAX_COORD, 'Offset from the current pointer position (instead of x,y)')); break;
       case 'from': case 'to': add(k, point); break;
       case 'path': add(k, { type: 'array', items: point, minItems: 2, maxItems: 256, description: 'Continuous stroke through every point with the left button held; use instead of from/to' }); break;
       case 'direction': add(k, { type: 'string', enum: ['up', 'down', 'left', 'right'] }, true); break;
@@ -269,16 +300,18 @@ export function toolInputSchema(method, extensions = new Set()) {
       case 'key': add(k, { type: 'string', description: 'X keysym or chord, e.g. "Return", "ctrl+s"' }, true); break;
       case 'value': add(k, { type: 'string', maxLength: MAX_TEXT }, true); break;
       case 'action': add(k, { type: 'string', description: 'Secondary accessibility action name' }, true); break;
-      case 'app': add(k, { type: 'boolean', description: 'Treat window_id as the app: act on its focused or dialog window (element: the window holding it)' }); break;
+      case 'button': add(k, { type: 'string', enum: ['left', 'right', 'middle'] }); break;
+      case 'click_count': add(k, { type: 'integer', enum: [1, 2, 3] }); break;
+      case 'modifiers': add(k, { type: 'array', items: { type: 'string', enum: MODIFIERS }, maxItems: 4, description: 'Modifier keys held during the action' }); break;
+      case 'hold_ms': add(k, int(0, MAX_HOLD_MS, 'How long the button or key stays pressed')); break;
+      case 'screenshot': add(k, { type: 'boolean', description: 'Also return a screenshot of the observed window' }); break;
+      case 'app':
+        if (method === 'launch_app') add(k, { type: 'string', maxLength: 256, description: 'Desktop entry ID (org.gnome.Calculator), its last part, the menu name or the program name' }, true);
+        else add(k, { type: 'boolean', description: 'Treat window_id as the app: act on its focused or dialog window (element: the window holding it)' });
+        break;
       case 'frame_window': case 'observe': break; // set by the host only
       default: throw new Error(`no schema for ${k}`);
     }
-  }
-  for (const [k, ext] of Object.entries(spec.ext || {})) {
-    if (!extensions.has(ext)) continue;
-    if (k === 'button') add(k, { type: 'string', enum: ['left', 'right', 'middle'] });
-    if (k === 'click_count') add(k, { type: 'integer', enum: [1, 2, 3] });
-    if (k === 'modifiers') add(k, { type: 'array', items: { type: 'string', enum: MODIFIERS }, maxItems: 4 });
   }
   return { type: 'object', properties: props, required: req, additionalProperties: false };
 }

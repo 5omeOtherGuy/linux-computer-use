@@ -62,14 +62,13 @@ export class OpenAIComputerTool {
    * @param {object} o
    * @param {{call: Function}} o.host       HostApi (or compatible)
    * @param {number} o.windowId             window the tool drives
-   * @param {Set<string>} [o.extensions]    engine extensions (click_button, click_count, modifiers, mouse_move)
+   * @param {Set<string>} [o.extensions]    accepted for compatibility; buttons, multi-clicks, held keys and moves are always available
    * @param {object} [o.limits]             optional downscale limits, e.g. { maxWidth: 1600, maxHeight: 900 }
    * @param {number} [o.waitMs=1000]        duration of a `wait` action
    * @param {Function} [o.confirmSafetyChecks] async (checks, call) => boolean; required to proceed when checks are pending
    * @param {string} [o.detail='original']  image detail for computer_screenshot
-   * @param {boolean} [o.allowDragPathSimplification=false] run multi-point drag paths as first->last
    */
-  constructor({ host, windowId, extensions = new Set(), limits = {}, waitMs = 1000, confirmSafetyChecks, detail = 'original', allowDragPathSimplification = false, sleep } = {}) {
+  constructor({ host, windowId, extensions = new Set(), limits = {}, waitMs = 1000, confirmSafetyChecks, detail = 'original', sleep } = {}) {
     if (!host || typeof host.call !== 'function') throw new TypeError('host with call() is required');
     if (!Number.isInteger(windowId)) throw new TypeError('windowId must be an integer');
     this.host = host;
@@ -79,7 +78,6 @@ export class OpenAIComputerTool {
     this.waitMs = waitMs;
     this.confirmSafetyChecks = confirmSafetyChecks;
     this.detail = detail;
-    this.allowDragPathSimplification = allowDragPathSimplification;
     this.sleep = sleep || defaultSleep;
     this.geometry = null;
   }
@@ -103,7 +101,6 @@ export class OpenAIComputerTool {
     if (action.keys.length === 0) return undefined;
     const mods = action.keys.map((k) => MODIFIER_TOKENS[normalizeKey(k)]);
     if (mods.some((m) => !m)) throw invalid(`${action.type}.keys may only hold modifier keys (CTRL, SHIFT, ALT, META)`);
-    if (!this.extensions.has('modifiers')) throw new CuaError('unsupported', `${action.type} with held keys is not supported by this engine`);
     return [...new Set(mods)];
   }
 
@@ -128,7 +125,6 @@ export class OpenAIComputerTool {
         case 'click': {
           const button = BUTTONS[a.button ?? 'left'];
           if (!button) throw new CuaError('unsupported', `${where}: mouse button "${a.button}" is not supported`);
-          if (button !== 'left' && !this.extensions.has('click_button')) throw new CuaError('unsupported', `${where}: ${a.button} click is not supported by this engine`);
           const [x, y] = this.#point(g, a.x, a.y, where);
           const params = { window_id: w, x, y };
           if (button !== 'left') params.button = button;
@@ -138,7 +134,6 @@ export class OpenAIComputerTool {
           break;
         }
         case 'double_click': {
-          if (!this.extensions.has('click_count')) throw new CuaError('unsupported', `${where}: double_click is not supported by this engine`);
           const [x, y] = this.#point(g, a.x, a.y, where);
           const params = { window_id: w, x, y, click_count: 2 };
           const mods = this.#modifiers(a);
@@ -152,17 +147,15 @@ export class OpenAIComputerTool {
             const [px, py] = Array.isArray(p) ? p : [p?.x, p?.y];
             return this.#point(g, px, py, `${where}.path[${j}]`);
           });
-          if (pts.length > 2 && !this.allowDragPathSimplification) {
-            throw new CuaError('unsupported', `${where}: drag paths with intermediate points are not supported by this engine (start -> end only)`);
-          }
-          const params = { window_id: w, from: pts[0], to: pts[pts.length - 1] };
+          if (pts.length > 256) throw invalid(`${where}: drag paths have at most 256 points`);
+          // Two points: a straight drag; more: one continuous stroke through all of them.
+          const params = pts.length > 2 ? { window_id: w, path: pts } : { window_id: w, from: pts[0], to: pts[pts.length - 1] };
           const mods = this.#modifiers(a);
           if (mods) params.modifiers = mods;
           steps.push({ method: 'drag', params });
           break;
         }
         case 'move': {
-          if (!this.extensions.has('mouse_move')) throw new CuaError('unsupported', `${where}: pointer move/hover is not supported by this engine`);
           if (this.#modifiers(a)) throw new CuaError('unsupported', `${where}: move with held keys is not supported`);
           const [x, y] = this.#point(g, a.x, a.y, where);
           steps.push({ method: 'mouse_move', params: { window_id: w, x, y } });

@@ -70,10 +70,10 @@ describe('Anthropic computer_toolset_20260801', () => {
     assert.equal(def.name, undefined, 'the toolset rejects name');
     assert.equal(def.display_width_px, undefined);
     const disabled = Object.keys(def.configs).sort();
-    assert.deepEqual(disabled, ['double_click', 'hold_key', 'left_mouse_down', 'left_mouse_up', 'middle_click', 'mouse_move', 'right_click', 'triple_click']);
+    assert.deepEqual(disabled, ['left_mouse_down', 'left_mouse_up']);
     assert.equal(MEMBERS.length, 17);
-    const all = new AnthropicComputerToolset({ host: recordingHost(), windowId: 7, extensions: new Set(['click_button', 'click_count', 'mouse_move']), zoom: false });
-    assert.deepEqual(Object.keys(all.toolDefinition().configs).sort(), ['hold_key', 'left_mouse_down', 'left_mouse_up', 'zoom']);
+    const noZoom = new AnthropicComputerToolset({ host: recordingHost(), windowId: 7, zoom: false });
+    assert.deepEqual(Object.keys(noZoom.toolDefinition().configs).sort(), ['left_mouse_down', 'left_mouse_up', 'zoom']);
   });
 
   test('batch runs in order with toolset_name on every result and maps coordinates', async () => {
@@ -126,7 +126,7 @@ describe('Anthropic computer_toolset_20260801', () => {
     const t = new AnthropicComputerToolset({ host, windowId: 7 });
     const res = await t.runBatch([
       use('1', 'left_click', { coordinate: [10, 10] }),
-      use('2', 'right_click', { coordinate: [10, 10] }),
+      use('2', 'left_mouse_down'),
       use('3', 'type', { text: 'never' }),
       use('4', 'screenshot'),
     ]);
@@ -147,12 +147,12 @@ describe('Anthropic computer_toolset_20260801', () => {
     const cases = [
       [use('x', 'left_click', { action: 'left_click', coordinate: [1, 1] }), /unexpected input field "action"/],
       [use('x', 'left_click', { coordinate: [400, 1] }), /outside/],
-      [use('x', 'left_click', { coordinate: [1, 1], text: 'shift' }), /modifier/],
+      [use('x', 'left_click', { coordinate: [1, 1], text: 'hyper' }), /shift, ctrl, alt or super/],
       [use('x', 'key', { text: 'Tab', repeat: 101 }), /repeat/],
       [use('x', 'scroll', { scroll_direction: 'diagonal', scroll_amount: 1, coordinate: [1, 1] }), /scroll_direction/],
       [use('x', 'wait', { duration: 301 }), /duration/],
       [use('x', 'zoom', { region: [10, 10, 5, 20] }), /region/],
-      [use('x', 'hold_key', { text: 'shift', duration: 1 }), /not supported/],
+      [use('x', 'hold_key', { text: 'shift', duration: 11 }), /duration/],
       [use('x', 'left_mouse_down'), /not supported/],
       [use('x', 'left_click'), /pointer position is unknown/],
       [{ ...use('x', 'teleport'), name: 'teleport' }, /unknown computer member/],
@@ -178,20 +178,23 @@ describe('Anthropic computer_toolset_20260801', () => {
     assert.ok(Math.abs(w / h - 2) < 0.02, 'aspect ratio preserved');
   });
 
-  test('modifiers and click variants map to engine extensions when enabled', async () => {
-    const extensions = new Set(['click_button', 'click_count', 'modifiers']);
-    const host = recordingHost({ extensions });
-    const t = new AnthropicComputerToolset({ host, windowId: 7, extensions, attachFinalScreenshot: false });
+  test('modifiers, click variants, hover and held keys map to engine parameters', async () => {
+    const host = recordingHost();
+    const t = new AnthropicComputerToolset({ host, windowId: 7, attachFinalScreenshot: false });
     const res = await t.runBatch([
       use('1', 'right_click', { coordinate: [5, 5] }),
       use('2', 'triple_click', { coordinate: [5, 5], text: 'ctrl+shift' }),
       use('3', 'double_click'),
+      use('4', 'mouse_move', { coordinate: [6, 7] }),
+      use('5', 'hold_key', { text: 'shift', duration: 0.5 }),
     ]);
     assert.ok(res.every((r) => !r.is_error), JSON.stringify(res));
     assert.deepEqual(host.actions().map((c) => c.params), [
       { window_id: 7, x: 5, y: 5, button: 'right', observe: false },
       { window_id: 7, x: 5, y: 5, click_count: 3, modifiers: ['ctrl', 'shift'], observe: false },
       { window_id: 7, x: 5, y: 5, click_count: 2, observe: false },
+      { window_id: 7, x: 6, y: 7, observe: false },
+      { window_id: 7, key: 'shift', hold_ms: 500, observe: false },
     ]);
   });
 
@@ -231,10 +234,14 @@ describe('OpenAI computer tool', () => {
       { type: 'keypress', keys: ['ENTER'] },
       { type: 'scroll', x: 10, y: 20, scroll_x: -30, scroll_y: 120 },
       { type: 'drag', path: [{ x: 1, y: 2 }, { x: 30, y: 40 }] },
+      { type: 'drag', path: [{ x: 1, y: 2 }, { x: 30, y: 40 }, { x: 1, y: 40 }], keys: ['SHIFT'] },
+      { type: 'double_click', x: 405, y: 157 },
+      { type: 'move', x: 405, y: 157 },
+      { type: 'click', button: 'right', x: 405, y: 157, keys: ['CTRL'] },
       { type: 'wait' },
     ]));
     assert.equal(r.error, undefined, r.error?.message);
-    assert.equal(r.executed, 8);
+    assert.equal(r.executed, 12);
     assert.deepEqual(slept, [1000]);
     assert.deepEqual(host.actions().map((c) => [c.method, c.params]), [
       ['click', { window_id: 7, x: 811, y: 315, observe: false }],
@@ -244,6 +251,10 @@ describe('OpenAI computer tool', () => {
       ['scroll', { window_id: 7, x: 21, y: 41, direction: 'down', pixels: 240, observe: false }],
       ['scroll', { window_id: 7, x: 21, y: 41, direction: 'left', pixels: 60, observe: false }],
       ['drag', { window_id: 7, from: [3, 5], to: [61, 81], observe: false }],
+      ['drag', { window_id: 7, path: [[3, 5], [61, 81], [3, 81]], modifiers: ['shift'], observe: false }],
+      ['click', { window_id: 7, x: 811, y: 315, click_count: 2, observe: false }],
+      ['mouse_move', { window_id: 7, x: 811, y: 315, observe: false }],
+      ['click', { window_id: 7, x: 811, y: 315, button: 'right', modifiers: ['ctrl'], observe: false }],
     ]);
     assert.equal(r.output.type, 'computer_call_output');
     assert.equal(r.output.call_id, 'call_1');
@@ -257,13 +268,12 @@ describe('OpenAI computer tool', () => {
   test('invalid action anywhere in the batch: nothing runs', async () => {
     const bad = [
       [{ type: 'click', button: 'left', x: 1, y: 1 }, { type: 'click', button: 'back', x: 1, y: 1 }],
-      [{ type: 'click', button: 'left', x: 1, y: 1 }, { type: 'double_click', x: 1, y: 1 }],
-      [{ type: 'move', x: 1, y: 1 }],
+      [{ type: 'click', button: 'left', x: 1, y: 1 }, { type: 'move', x: 1, y: 1, keys: ['SHIFT'] }],
       [{ type: 'click', button: 'left', x: 1.5, y: 1 }],
-      [{ type: 'click', button: 'left', x: 1, y: 1, keys: ['SHIFT'] }],
+      [{ type: 'click', button: 'left', x: 1, y: 1, keys: ['A'] }],
       [{ type: 'type', text: 'a', extra: 1 }],
       [{ type: 'drag', path: [{ x: 1, y: 1 }] }],
-      [{ type: 'drag', path: [{ x: 1, y: 1 }, { x: 2, y: 2 }, { x: 3, y: 3 }] }],
+      [{ type: 'drag', path: Array.from({ length: 257 }, (_, i) => ({ x: i, y: 1 })) }],
       [{ type: 'keypress', keys: [] }],
       [{ type: 'click', button: 'left', x: 1, y: 9999 }],
       [{ type: 'launch_missiles' }],

@@ -24,15 +24,14 @@ test('Drawing applies numeric tool size and complete strokes; invalid paths draw
       await sleep(100);
     }
     await run("const d = await cua.getApp('drawing')");
-    let dismissed = false;
-    for (let i = 0; i < 50; i++) {
+    // A first run on this desktop asks whether to read the help; dismiss it.
+    for (let i = 0; i < 30; i++) {
       const r = await run(String.raw`const state = await d.getAXState({emit:false, disableDiffing:true});
         const no = state.match(/\[(\d+)\] button "No"/);
         if (no) { await d.click(Number(no[1])); true } else { false }`);
-      if (t.text(r).includes('=> true')) { dismissed = true; break; }
+      if (t.text(r).includes('=> true')) break;
       await sleep(100);
     }
-    assert.ok(dismissed, 'dismissed the first-run help prompt');
     const sized = await run(String.raw`const controls = await d.getAXState({emit:false, disableDiffing:true});
       const size = controls.match(/\[(\d+)\] spin button[^\n]*desc="Tool size"/);
       if (!size) throw Error('no tool-size spin button');

@@ -91,7 +91,7 @@ function failPending(evalId, code, message) {
   }
 }
 
-function init({ memoryLimitMb = 128, stackKb = 1024 }) {
+function init({ memoryLimitMb = 128, stackKb = 1024, help = '' }) {
   return getQuickJS().then((QuickJS) => {
     rt = QuickJS.newRuntime();
     rt.setMemoryLimit(memoryLimitMb * 1024 * 1024);
@@ -168,6 +168,8 @@ function init({ memoryLimitMb = 128, stackKb = 1024 }) {
       vm.setProp(vm.global, fn === hostCall ? '__cua_host_call' : fn === emit ? '__cua_emit' : '__cua_sleep', fn);
       fn.dispose();
     }
+    // The API description, for cua.help() (a model that lost its context).
+    vm.newString(String(help)).consume((h) => vm.setProp(vm.global, '__cua_help', h));
     const r = vm.evalCode(preludeSource(), 'prelude.js');
     if (r.error) {
       const msg = JSON.stringify(vm.dump(r.error));

@@ -9,9 +9,11 @@ export function preludeSource() {
   const hostCall = globalThis.__cua_host_call;
   const emit = globalThis.__cua_emit;
   const nativeSleep = globalThis.__cua_sleep;
+  const helpText = typeof globalThis.__cua_help === 'string' ? globalThis.__cua_help : '';
   delete globalThis.__cua_host_call;
   delete globalThis.__cua_emit;
   delete globalThis.__cua_sleep;
+  delete globalThis.__cua_help;
 
   const fmt = (value) => {
     if (value === undefined) return 'undefined';
@@ -81,6 +83,8 @@ export function preludeSource() {
       const bytes = new Uint8Array(raw.bytes);
       hostImages.set(bytes, res.value.$image);
       if (!opts || opts.emit !== false) shownImages.add(bytes);
+      // An observation captured together with its screenshot.
+      if (res.value.state !== undefined) return { state: res.value.state, screenshot: bytes };
       return bytes;
     }
     return res.value;
@@ -149,29 +153,32 @@ export function preludeSource() {
     return k.trim().replace(/ *\\+ */g, '+');
   };
   const SCROLL_DIRS = ['up', 'down', 'left', 'right'];
+  // Held modifier keys of a pointer action: {modifiers: ["shift", "ctrl"]},
+  // {modifiers: "shift+ctrl"}, or the key/keys/holdKeys spellings.
+  const MOD_OPTS = ['modifiers', 'holdKeys', 'keys', 'key'];
+  const MOD_ALIAS = { control: 'ctrl', ctl: 'ctrl', meta: 'alt', option: 'alt', win: 'super', windows: 'super', logo: 'super' };
+  const modsOf = (o, what) => {
+    let m = o.modifiers ?? o.holdKeys ?? o.keys ?? o.key;
+    if (m === undefined) return undefined;
+    if (typeof m === 'string') m = m.split('+');
+    if (!Array.isArray(m)) throw new CuaError('invalid_params', what + ': modifiers must be "shift", "ctrl+shift" or an array of modifier names');
+    return m.map((s) => { s = String(s).trim().toLowerCase(); return MOD_ALIAS[s] || s; });
+  };
+  // How long a button or key stays pressed: {durationMs} (or holdMs).
+  const HOLD_OPTS = ['durationMs', 'holdMs', 'duration_ms', 'hold_ms'];
+  const holdOf = (o) => o.durationMs ?? o.holdMs ?? o.duration_ms ?? o.hold_ms;
+  const CLICK_OPTS = ['mouseButton', 'button', 'clickCount', ...MOD_OPTS, ...HOLD_OPTS];
 
-  const cua = Object.create(null);
-  cua.CuaError = CuaError;
-  cua.listWindows = (o) => call('list_windows', {}, 'windows', emitOpt(options(o, ['emit'], 'listWindows')));
-  cua.listApps = (o) => call('list_windows', {}, 'apps', emitOpt(options(o, ['emit'], 'listApps')));
-  cua.getState = (o) => call('list_windows', {}, 'state', emitOpt(options(o, ['emit'], 'getState')));
-  // getApp("xed"), getApp({appId}), getApp({windowId}) or getApp(windowInfo).
-  cua.getApp = async (target, o) => {
-    o = options(o, ['emit'], 'getApp');
-    let q;
-    if (typeof target === 'string') q = { appId: target };
-    else if (Number.isInteger(target)) q = { windowId: target };
-    else if (isObj(target)) {
-      if (target.windowId !== undefined) q = { windowId: target.windowId };
-      else if (target.appId !== undefined) q = { appId: target.appId };
-      else if (Number.isInteger(target.id) && target.app !== undefined) q = { windowId: target.id };
-      else if (typeof target.id === 'string') q = { appId: target.id };
-    }
-    if (!q) throw new CuaError('invalid_params', 'getApp requires an app id ("xed"), {appId}, or {windowId} (a WindowInfo id)');
-    const info = await call('list_windows', q, 'getApp', emitOpt(o));
+  // An App object for a window the host resolved ({window, app}).
+  const makeApp = (info) => {
     const window_id = info.window.id;
     const act = (method, params) => call(method, Object.assign({ window_id, app: true }, params), 'action').then(() => undefined);
     const obs = (method, view, opts) => call(method, { window_id, app: true }, view, opts);
+    const axOptions = (o, what) => {
+      o = options(o, ['emit', 'disableDiffing', 'query'], what);
+      if (o.query !== undefined && typeof o.query !== 'string') throw new CuaError('invalid_params', what + ': query must be a string');
+      return { emit: o.emit !== false, disableDiffing: !!o.disableDiffing, query: o.query };
+    };
     const app = Object.freeze({
       id: info.app.id,
       displayName: info.app.displayName,
@@ -179,67 +186,94 @@ export function preludeSource() {
       windows: Object.freeze(info.app.windows),
       window: info.window,
       windowId: window_id,
+      // The process launchApp started (absent for getApp).
+      ...(Number.isInteger(info.pid) ? { pid: info.pid } : {}),
       // The app's focused (or modal dialog) window first, then a line listing its other windows.
       getAXState(o = {}) {
-        o = options(o, ['emit', 'disableDiffing', 'query'], 'getAXState');
-        if (o.query !== undefined && typeof o.query !== 'string') throw new CuaError('invalid_params', 'getAXState: query must be a string');
-        return obs('get_ax_state', 'ax', { emit: o.emit !== false, disableDiffing: !!o.disableDiffing, query: o.query });
+        return obs('get_ax_state', 'ax', axOptions(o, 'getAXState'));
       },
       getScreenshot(o = {}) {
         o = options(o, ['emit'], 'getScreenshot');
         return obs('get_screenshot', 'screenshot', emitOpt(o));
       },
-      async getAXStateAndScreenshot(o = {}) {
-        o = options(o, ['emit', 'disableDiffing', 'query'], 'getAXStateAndScreenshot');
-        const state = await app.getAXState(o);
-        const screenshot = await obs('get_screenshot', 'screenshot', emitOpt(o));
-        return { state, screenshot };
+      // One engine request for the tree and the screenshot: {state, screenshot}.
+      getAXStateAndScreenshot(o = {}) {
+        return call('get_ax_state', { window_id, app: true, screenshot: true }, 'ax', axOptions(o, 'getAXStateAndScreenshot'));
       },
-      // click(id | [x, y] | {x, y} | {element}, {mouseButton, clickCount})
+      // click(id | [x, y] | {x, y} | {element}, {mouseButton, clickCount, modifiers, durationMs})
       click(target, o = {}) {
-        if (isObj(target) && isObj(o) && Object.keys(o).length === 0) o = pick(target, ['mouseButton', 'button', 'clickCount']);
-        o = options(o, ['mouseButton', 'button', 'clickCount'], 'click');
+        if (isObj(target) && isObj(o) && Object.keys(o).length === 0) o = pick(target, CLICK_OPTS);
+        o = options(o, CLICK_OPTS, 'click');
         const p = at(target, 'click');
         const button = o.mouseButton !== undefined ? o.mouseButton : o.button;
         if (button !== undefined && button !== 'left') p.button = button;
         if (o.clickCount !== undefined && o.clickCount !== 1) p.click_count = o.clickCount;
+        const mods = modsOf(o, 'click');
+        if (mods) p.modifiers = mods;
+        const hold = holdOf(o);
+        if (hold !== undefined) p.hold_ms = hold;
         return act('click', p);
       },
-      doubleClick(target) { return app.click(target, { clickCount: 2 }); },
-      // drag(from, to), drag({from, to}), or a continuous drag({path}).
-      drag(from, to) {
+      doubleClick(target, o) { return app.click(target, Object.assign({}, o || {}, { clickCount: 2 })); },
+      rightClick(target, o) { return app.click(target, Object.assign({}, o || {}, { mouseButton: 'right' })); },
+      // Hover: moveMouse(id | [x, y] | {x, y}) or moveMouse({dx, dy}); tooltips need ~0.5 s before a screenshot.
+      moveMouse(target) {
+        if (isObj(target) && (target.dx !== undefined || target.dy !== undefined) && elementOf(target) === undefined && pointOf(target) === undefined) {
+          return act('mouse_move', { dx: target.dx ?? 0, dy: target.dy ?? 0 });
+        }
+        return act('mouse_move', at(target, 'moveMouse'));
+      },
+      moveMouseRelative(dx, dy) {
+        if (isObj(dx)) { dy = dx.dy; dx = dx.dx; }
+        return act('mouse_move', { dx, dy });
+      },
+      hover(target) { return app.moveMouse(target); },
+      // drag(from, to, {modifiers}), drag({from, to}), or a continuous drag({path}).
+      drag(from, to, o = {}) {
         const pt = (v) => Array.isArray(v) ? v : isObj(v) ? [v.x, v.y] : v;
+        let p;
         if (isObj(from) && to === undefined) {
+          o = pick(from, MOD_OPTS);
           if (from.path !== undefined) {
             if (from.from !== undefined || from.to !== undefined) throw new CuaError('invalid_params', 'drag: provide path or from/to, not both');
-            return act('drag', { path: Array.isArray(from.path) ? from.path.map(pt) : from.path });
+            p = { path: Array.isArray(from.path) ? from.path.map(pt) : from.path };
+          } else {
+            p = { from: pt(from.from), to: pt(from.to) };
           }
-          to = from.to; from = from.from;
+        } else {
+          o = options(o, MOD_OPTS, 'drag');
+          p = { from: pt(from), to: pt(to) };
         }
-        return act('drag', { from: pt(from), to: pt(to) });
+        const mods = modsOf(o, 'drag');
+        if (mods) p.modifiers = mods;
+        return act('drag', p);
       },
-      // scroll(target, direction, distance = 1 page-ish unit) or
-      // scroll({x, y | element, direction, distance | pixels | scrollX/scrollY})
-      scroll(target, direction, distance = 1) {
+      // scroll(target, direction, distance = 1 page-ish unit, {modifiers}) or
+      // scroll({x, y | element, direction, distance | pixels | scrollX/scrollY, modifiers})
+      scroll(target, direction, distance = 1, o = {}) {
         let p, pixels;
         if (isObj(target) && direction === undefined) {
-          const o = target;
-          p = at(elementOf(o) !== undefined ? { element: elementOf(o) } : o, 'scroll');
-          direction = o.direction;
-          const sx = o.scrollX ?? o.scroll_x ?? 0, sy = o.scrollY ?? o.scroll_y ?? 0;
+          const t = target;
+          o = pick(t, MOD_OPTS);
+          p = at(elementOf(t) !== undefined ? { element: elementOf(t) } : t, 'scroll');
+          direction = t.direction;
+          const sx = t.scrollX ?? t.scroll_x ?? 0, sy = t.scrollY ?? t.scroll_y ?? 0;
           if (direction === undefined && (sx || sy)) {
             direction = Math.abs(sy) >= Math.abs(sx) ? (sy > 0 ? 'down' : 'up') : (sx > 0 ? 'right' : 'left');
             pixels = Math.max(Math.abs(sx), Math.abs(sy));
           }
-          if (o.pixels !== undefined) pixels = o.pixels;
-          else if (pixels === undefined) distance = o.distance ?? o.amount ?? 1;
+          if (t.pixels !== undefined) pixels = t.pixels;
+          else if (pixels === undefined) distance = t.distance ?? t.amount ?? 1;
         } else {
           p = at(target, 'scroll');
-          if (isObj(distance)) pixels = distance.pixels;
+          if (isObj(distance)) { o = pick(distance, MOD_OPTS); pixels = distance.pixels; }
+          else o = options(o, MOD_OPTS, 'scroll');
         }
         if (typeof direction === 'string') direction = direction.toLowerCase();
         if (!SCROLL_DIRS.includes(direction)) throw new CuaError('invalid_params', 'scroll: direction must be up, down, left or right');
         if (pixels === undefined) pixels = Math.round(Number(distance) * 500);
+        const mods = modsOf(o, 'scroll');
+        if (mods) p.modifiers = mods;
         return act('scroll', Object.assign(p, { direction, pixels: Math.max(1, Math.round(pixels)) }));
       },
       typeText(text) {
@@ -247,11 +281,14 @@ export function preludeSource() {
         if (typeof text !== 'string') throw new CuaError('invalid_params', 'typeText(text) expects a string');
         return act('type_text', { text });
       },
-      // pressKey("ctrl+s"), pressKey(["ctrl", "s"]), pressKey({key}) or pressKey({keys})
+      // pressKey("ctrl+s"), pressKey(["ctrl", "s"]), pressKey({key}) or pressKey({keys}); {durationMs} holds the key.
       pressKey(key, o = {}) {
-        if (isObj(key)) key = key.key ?? key.keys;
-        options(o, [], 'pressKey');
-        return act('press_key', { key: keyName(key) });
+        if (isObj(key)) { if (Object.keys(o).length === 0) o = pick(key, HOLD_OPTS); key = key.key ?? key.keys; }
+        o = options(o, HOLD_OPTS, 'pressKey');
+        const p = { key: keyName(key) };
+        const hold = holdOf(o);
+        if (hold !== undefined) p.hold_ms = hold;
+        return act('press_key', p);
       },
       paste(text, o = {}) {
         if (isObj(text)) { o = pick(text, ['format']); text = text.text; }
@@ -271,6 +308,48 @@ export function preludeSource() {
     });
     return app;
   };
+
+  const cua = Object.create(null);
+  cua.CuaError = CuaError;
+  cua.listWindows = (o) => call('list_windows', {}, 'windows', emitOpt(options(o, ['emit'], 'listWindows')));
+  cua.listApps = (o) => call('list_windows', {}, 'apps', emitOpt(options(o, ['emit'], 'listApps')));
+  cua.getState = (o) => call('list_windows', {}, 'state', emitOpt(options(o, ['emit'], 'getState')));
+  // getApp("xed"), getApp({appId}), getApp({windowId}) or getApp(windowInfo).
+  cua.getApp = async (target, o) => {
+    o = options(o, ['emit'], 'getApp');
+    let q;
+    if (typeof target === 'string') q = { appId: target };
+    else if (Number.isInteger(target)) q = { windowId: target };
+    else if (isObj(target)) {
+      if (target.windowId !== undefined) q = { windowId: target.windowId };
+      else if (target.appId !== undefined) q = { appId: target.appId };
+      else if (Number.isInteger(target.id) && target.app !== undefined) q = { windowId: target.id };
+      else if (typeof target.id === 'string') q = { appId: target.id };
+    }
+    if (!q) throw new CuaError('invalid_params', 'getApp requires an app id ("xed"), {appId}, or {windowId} (a WindowInfo id)');
+    return makeApp(await call('list_windows', q, 'getApp', emitOpt(o)));
+  };
+  // launchApp("drawing"): starts an installed application (desktop entry ID
+  // such as org.gnome.Calculator, its last part, the menu name or the
+  // program) on this desktop and returns its App once its window is up.
+  cua.launchApp = async (name, o) => {
+    o = options(o, ['emit'], 'launchApp');
+    if (isObj(name)) name = name.app ?? name.appId ?? name.name ?? name.id;
+    if (typeof name !== 'string' || !name.trim()) throw new CuaError('invalid_params', 'launchApp(name) expects the application\\'s name or desktop entry ID');
+    return makeApp(await call('launch_app', { app: name }, 'launch', emitOpt(o)));
+  };
+  // The desktop's clipboard (plain text).
+  cua.clipboard = Object.freeze({
+    write(text) {
+      if (isObj(text)) text = text.text;
+      if (typeof text !== 'string') throw new CuaError('invalid_params', 'clipboard.write(text) expects a string');
+      return call('clipboard_write', { text }, 'clipboard').then(() => undefined);
+    },
+    read() { return call('clipboard_read', {}, 'clipboard'); },
+    release() { return call('clipboard_release', {}, 'clipboard').then(() => undefined); },
+  });
+  // Prints the API description again (after a context summary, say).
+  cua.help = () => { write(helpText || 'no API description is available'); };
   Object.freeze(cua);
 
   const log = (level) => (...args) => emit('text', JSON.stringify({ level, text: args.map(fmtText).join(' ') }));

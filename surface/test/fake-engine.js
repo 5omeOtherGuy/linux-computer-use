@@ -34,6 +34,9 @@ let notesDialog = false;
 const active = (win, params) => (params.app && win.pid === 101 && notesDialog ? WINDOWS.find((w) => w.window_id === 14) : win);
 let pointer = null;
 const typed = [];
+let clipboard = null;
+// launch_app "opens" a window of a new app (approval needed like any other).
+const LAUNCHED = { window_id: 21, title: 'Launched', app_id: 'org.example.Launched', pid: 121, width: 500, height: 400 };
 
 record({ event: 'start', display: process.env.CUA_DISPLAY, argv: process.argv.slice(2) });
 const firstId = Number(process.argv[process.argv.indexOf('--first-element-id') + 1]) || 1;
@@ -84,7 +87,7 @@ function observation(win, withShot) {
   return obs;
 }
 
-const ACTIONS = new Set(['click', 'drag', 'scroll', 'type_text', 'press_key', 'paste', 'set_value', 'perform_secondary_action']);
+const ACTIONS = new Set(['click', 'drag', 'scroll', 'type_text', 'press_key', 'paste', 'set_value', 'perform_secondary_action', 'mouse_move']);
 
 async function handle(method, params) {
   switch (method) {
@@ -96,7 +99,22 @@ async function handle(method, params) {
       return screenshot(windowFor(params));
     case 'get_ax_state':
     case 'get_app_state':
-      return observation(active(windowFor(params), params), false);
+      return observation(active(windowFor(params), params), params.screenshot === true);
+    case 'launch_app': {
+      record({ event: 'performed', method, params });
+      if (params.app === 'nothing') throw new EngineError('not_found', `no installed application matches ${JSON.stringify(params.app)}`);
+      if (!WINDOWS.includes(LAUNCHED)) WINDOWS.push(LAUNCHED);
+      return { app: params.app, name: 'Launched', pid: LAUNCHED.pid, windows: [LAUNCHED], warnings: [], timing: { launch_ms: 1 } };
+    }
+    case 'clipboard_write':
+      record({ event: 'performed', method, params });
+      clipboard = params.text;
+      return { written: true };
+    case 'clipboard_read':
+      return { text: clipboard };
+    case 'clipboard_release':
+      clipboard = null;
+      return { released: true };
     case 'approve_app': {
       const win = WINDOWS.find((w) => w.window_id === params.window_id && w.app_id === params.app_id);
       if (!win) throw new EngineError('window_not_found', 'no such window/app');
@@ -120,7 +138,7 @@ async function handle(method, params) {
   if (method === 'press_key' && params.key === 'Escape') notesDialog = false;
   if (params.observe === false) {
     // As the daemon: the window the action landed on, without a tree.
-    const { accessibility, ax_diff, ...rest } = observation(active(win, params), false);
+    const { accessibility, ax_diff, ...rest } = observation(active(win, params), params.screenshot === true);
     return { ...rest, observed: false };
   }
   return observation(active(win, params), true);

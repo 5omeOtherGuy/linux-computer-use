@@ -28,17 +28,19 @@ const MAX_HELD_IMAGE_CHARS = 64_000_000;
 const MAX_CELL_IMAGES = 16;
 const STDERR_TAIL = 4000;
 const MAX_EMITTED_IMAGE_CHARS = 16_000_000;
-const VIEWS = ['windows', 'apps', 'state', 'getApp', 'ax', 'screenshot', 'action'];
+const VIEWS = ['windows', 'apps', 'state', 'getApp', 'ax', 'screenshot', 'action', 'launch', 'clipboard'];
 // Actions whose target window depends on what the model last saw.
-const FRAMED = ['click', 'drag', 'scroll', 'type_text', 'paste'];
+const FRAMED = ['click', 'drag', 'scroll', 'type_text', 'paste', 'mouse_move'];
 const ACTIONS = ['click', 'drag', 'scroll', 'type_text', 'press_key', 'paste', 'set_value', 'perform_secondary_action', 'mouse_move'];
 const KILL_GRACE_MS = 1500;
 const CANCEL_GRACE_MS = 750;
 
 export class SandboxRunner {
-  constructor({ host, memoryLimitMb = 128, log = () => {} }) {
+  // `help`: the API description `cua.help()` prints again inside the VM.
+  constructor({ host, memoryLimitMb = 128, log = () => {}, help = '' }) {
     this.host = host;
     this.memoryLimitMb = memoryLimitMb;
+    this.help = String(help);
     this.log = log;
     this.child = null;
     this.ready = null;
@@ -128,7 +130,7 @@ export class SandboxRunner {
       this.readyWaiter = { resolve, reject };
       child.once('exit', () => reject(new CuaError('sandbox_failed', 'sandbox process exited during startup')));
     });
-    child.send({ type: 'init', methods: this.host.methods, memoryLimitMb: this.memoryLimitMb });
+    child.send({ type: 'init', methods: this.host.methods, memoryLimitMb: this.memoryLimitMb, help: this.help });
     return this.ready;
   }
 
@@ -275,19 +277,52 @@ export class SandboxRunner {
           const cut = (obs.warnings || []).map(String).filter((w) => /truncat|not traversed|not fetched|showing \d|budget|unavailable/i.test(w));
           if (cut.length) text += ` in the observed part of the tree; the observation was partial (${cut.join('; ').slice(0, 300)}), so the element may exist outside it: scroll, or use a screenshot`;
         }
+        // `screenshot: true`: the same request also captured the window
+        // (getAXStateAndScreenshot); model code gets {state, screenshot}.
+        let image = null;
+        if (params.screenshot === true) {
+          if (!isScreenshot(obs.screenshot)) throw new CuaError('protocol_error', 'engine returned no screenshot with the observation');
+          image = this.#storeImage(obs.screenshot);
+        }
+        const value = image ? { state: text, $bytes: obs.screenshot.data, $image: image } : text;
         // Shown already in this cell with no action since (getApp emits the
         // state): not repeated.
-        if (emit && !query && cell.shown.has(obs.window?.window_id)) return text;
+        if (emit && !query && cell.shown.has(obs.window?.window_id)) {
+          if (image) cell.outputs.push({ type: 'image', id: image });
+          return value;
+        }
         if (emit) {
           this.#emitText(cell, observationHeader(this.#visible(obs)));
           this.#emitText(cell, fenceUntrusted('accessibility', text));
+          if (image) cell.outputs.push({ type: 'image', id: image });
           cell.emitted.add(text);
           if (!query) cell.shown.add(obs.window?.window_id);
           // The model asked for this view after the last action; the end of
           // the cell adds no second copy of that window's state.
           if (cell.pending?.window?.window_id === obs.window?.window_id) cell.pending = null;
         }
-        return text;
+        return value;
+      }
+      case 'launch': {
+        if (method !== 'launch_app') throw new CuaError('invalid_params', 'method does not match view');
+        const r = await this.#call(cell, method, params);
+        const windows = Array.isArray(r?.windows) ? r.windows : [];
+        this.#noteWindows(windows);
+        const main = windows.find((w) => !w.transient_for) || windows[0];
+        if (!main || !Number.isInteger(main.window_id)) throw new CuaError('no_window', 'the application started but reported no window');
+        if (emit) {
+          const warnings = Array.isArray(r.warnings) ? r.warnings.map(String) : [];
+          this.#emitText(cell, `launched ${String(r.name ?? r.app ?? '').slice(0, 80)} (pid ${r.pid}) in ${round(r.timing?.launch_ms)} ms${warnings.length ? `; ${fenceUntrusted('warnings', warnings.join('\n'))}` : ''}`);
+        }
+        // The new app is presented like getApp: its state comes with it.
+        const info = await this.#view(cell, 'list_windows', { windowId: main.window_id }, 'getApp', emit, opts);
+        return Number.isInteger(r.pid) ? { ...info, pid: r.pid } : info;
+      }
+      case 'clipboard': {
+        if (!['clipboard_write', 'clipboard_read', 'clipboard_release'].includes(method)) throw new CuaError('invalid_params', 'method does not match view');
+        const r = await this.#call(cell, method, params);
+        if (method === 'clipboard_read') return typeof r?.text === 'string' ? r.text : null;
+        return undefined;
       }
       case 'screenshot': {
         if (method !== 'get_screenshot') throw new CuaError('invalid_params', 'method does not match view');

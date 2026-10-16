@@ -1,11 +1,13 @@
 mod ax;
+mod clipboard;
+mod launch;
 mod policy;
 mod x11;
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use x11::{Desktop, HitArea, WindowInfo};
@@ -32,7 +34,12 @@ struct Engine {
     /// session, so an app-scoped request still finds its app after the
     /// window it names (e.g. a dialog) has closed.
     known: HashMap<u32, (u32, String)>,
+    /// Applications started with `launch_app`, reaped as they exit.
+    children: Vec<std::process::Child>,
 }
+
+/// How long `launch_app` waits for the application's first window.
+const LAUNCH_WAIT: Duration = Duration::from_secs(10);
 
 /// Bound for the first sign that the app reacted to an action. A GTK app
 /// that has to build a file chooser shows nothing for 70-100 ms on an idle
@@ -175,6 +182,154 @@ impl Engine {
         )
     }
 
+    /// Window list as `list_windows` reports it (with `focused`).
+    fn window_list(&mut self) -> Result<Value> {
+        let wins = self.desktop.list_windows()?;
+        self.remember(&wins);
+        let focused = self.desktop.focused_of(&wins);
+        let mut v = serde_json::to_value(&wins)?;
+        for w in v.as_array_mut().expect("window list") {
+            if focused.is_some_and(|f| w["window_id"] == json!(f)) {
+                w["focused"] = json!(true);
+            }
+        }
+        Ok(v)
+    }
+
+    /// Starts an installed desktop application on this display and waits
+    /// for its first window. The model names the application (desktop ID,
+    /// menu name or program), never a command line; the deny lists apply,
+    /// and reading or controlling the windows still needs approval.
+    async fn launch(&mut self, query: &str) -> Result<Value> {
+        if self.desktop.is_live() {
+            return Err(x11_error(
+                "unsupported",
+                "launching applications is not available on a live desktop".into(),
+            ));
+        }
+        let entries = launch::load(&launch::data_dirs());
+        let entry = match launch::find(&entries, query) {
+            launch::Lookup::Found(e) => e,
+            launch::Lookup::Ambiguous(ids) => {
+                return Err(x11_error(
+                    "invalid_params",
+                    format!("{query:?} matches several installed applications: {}; use one of these IDs", ids.join(", ")),
+                ))
+            }
+            launch::Lookup::NotFound => {
+                return Err(x11_error(
+                    "not_found",
+                    format!("no installed application matches {query:?} (a desktop entry ID such as org.gnome.Calculator, its last part, the menu name or the program name)"),
+                ))
+            }
+        };
+        if entry.terminal {
+            return Err(ProtocolError(json!({"code":"app_denied","message":format!("{} runs in a terminal, which is denied", entry.name)})).into());
+        }
+        if let Some(reason) = self.policy.launch_denied(&entry.names()) {
+            return Err(ProtocolError(json!({"code":"app_denied","message":format!("{}: {reason}", entry.name)})).into());
+        }
+        let before: HashSet<u32> = self.desktop.list_windows()?.iter().map(|w| w.window_id).collect();
+        let mut cmd = std::process::Command::new(&entry.exec[0]);
+        cmd.args(&entry.exec[1..])
+            .env("DISPLAY", self.desktop.display())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Some(dir) = entry.path.as_ref().filter(|p| std::path::Path::new(p).is_dir()) {
+            cmd.current_dir(dir);
+        }
+        {
+            use std::os::unix::process::CommandExt as _;
+            cmd.process_group(0);
+        }
+        let mut child = cmd.spawn().map_err(|e| {
+            x11_error("launch_failed", format!("cannot start {} ({}): {e}", entry.name, entry.exec[0]))
+        })?;
+        let pid = child.id();
+        let start = Instant::now();
+        let mut exited: Option<std::process::ExitStatus> = None;
+        loop {
+            if exited.is_none() {
+                if let Ok(Some(status)) = child.try_wait() {
+                    exited = Some(status);
+                }
+            }
+            let wins = self.desktop.list_windows()?;
+            self.remember(&wins);
+            let mut warnings: Vec<String> = Vec::new();
+            let mut mine: Vec<&WindowInfo> = wins.iter().filter(|w| w.pid == pid).collect();
+            if mine.is_empty() {
+                if let Some(status) = exited {
+                    // The process handed over to a running instance (D-Bus
+                    // activation, single-instance apps) and exited: the new
+                    // window belongs to that instance.
+                    mine = wins
+                        .iter()
+                        .filter(|w| !before.contains(&w.window_id) && w.transient_for.is_none())
+                        .collect();
+                    if !mine.is_empty() {
+                        warnings.push(format!(
+                            "the started process exited ({status}); the window belongs to another process of the app"
+                        ));
+                    } else if !status.success() {
+                        return Err(x11_error(
+                            "launch_failed",
+                            format!("{} exited ({status}) before showing a window", entry.name),
+                        ));
+                    }
+                }
+            }
+            if !mine.is_empty() {
+                let ids: Vec<u32> = mine.iter().map(|w| w.window_id).collect();
+                let mut list = self.window_list()?;
+                list.as_array_mut()
+                    .expect("window list")
+                    .retain(|w| w["window_id"].as_u64().is_some_and(|id| ids.contains(&(id as u32))));
+                if exited.is_none() {
+                    self.children.push(child);
+                }
+                return Ok(json!({"app":entry.id,"name":entry.name,"pid":pid,"windows":list,"warnings":warnings,
+                    "timing":{"launch_ms":start.elapsed().as_secs_f64()*1000.0}}));
+            }
+            if start.elapsed() >= LAUNCH_WAIT {
+                if exited.is_none() {
+                    self.children.push(child);
+                }
+                return Err(x11_error(
+                    "no_window",
+                    format!(
+                        "{} (pid {pid}) started but showed no window within {} s; it may still be starting: list the windows again later",
+                        entry.name,
+                        LAUNCH_WAIT.as_secs()
+                    ),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Forgets launched processes that have exited.
+    fn reap(&mut self) {
+        self.children.retain_mut(|c| !matches!(c.try_wait(), Ok(Some(_))));
+    }
+
+    /// Adds a screenshot of the observed window to an observation
+    /// (`screenshot: true`), unless the window closed.
+    fn attach_screenshot(&mut self, observation: &mut Value) -> Result<()> {
+        if observation["closed"].as_bool().unwrap_or(false) {
+            return Ok(());
+        }
+        let Some(id) = observation["window"]["window_id"].as_u64().and_then(|v| u32::try_from(v).ok()) else {
+            return Ok(());
+        };
+        let w = self.desktop.window(id)?;
+        let mut shot = self.desktop.screenshot(&w)?;
+        shot["window_id"] = json!(id);
+        observation["screenshot"] = shot;
+        Ok(())
+    }
+
     async fn execute(&mut self, r: Request) -> std::result::Result<Value, Value> {
         self.execute_inner(r).await.map_err(|e| {
             if let Some(protocol) = e.downcast_ref::<ProtocolError>() {
@@ -213,7 +368,7 @@ impl Engine {
     /// the window the model last saw. Key-typed text is never sent to an
     /// alert or to a dialog whose accessibility tree is unknown: text meant
     /// for another window must not answer an unexpected "Save changes?".
-    async fn enter_text(&mut self, w: &WindowInfo, text: &str, frame: Option<u32>) -> Result<Vec<Value>> {
+    async fn enter_text(&mut self, w: &WindowInfo, text: &str, frame: Option<u32>, via_clipboard: bool) -> Result<Vec<Value>> {
         let mut warnings = Vec::new();
         let outcome = match self.ax.as_mut() {
             Some(ax) => Self::with_input_watch(&mut self.desktop, ax.text_input(w, text, None)).await?,
@@ -263,8 +418,18 @@ impl Engine {
                 w.window_id, w.title
             )));
         }
-        self.desktop.type_keys(w, text)?;
-        warnings.push(json!(format!("typed as key events to the window's focus ({reason})")));
+        if via_clipboard && !self.desktop.is_live() {
+            // `paste` without a text field to insert into pastes the way a
+            // user would: through the clipboard, which also carries text
+            // the keyboard map cannot type.
+            self.desktop.clipboard_write(text)?;
+            self.desktop
+                .action(w, "press_key", &json!({"window_id": w.window_id, "key": "ctrl+v"}))?;
+            warnings.push(json!(format!("pasted through the clipboard (ctrl+v) into the window's focus ({reason})")));
+        } else {
+            self.desktop.type_keys(w, text)?;
+            warnings.push(json!(format!("typed as key events to the window's focus ({reason})")));
+        }
         // Readback where the app reports the focused text object.
         if let Some(ax) = self.ax.as_ref() {
             tokio::time::sleep(Duration::from_millis(30)).await;
@@ -306,38 +471,48 @@ impl Engine {
     async fn execute_inner(&mut self, r: Request) -> Result<Value> {
         let p = r.params.as_object().context("params must be an object")?;
         let method = r.method.as_str();
+        self.reap();
         let keys: &[&str] =
             match method {
-                "list_apps" | "list_windows" | "turn_ended" => &[],
+                "list_apps" | "list_windows" | "turn_ended" | "clipboard_read" | "clipboard_release" => &[],
+                "launch_app" => &["app"],
+                "clipboard_write" => &["text"],
                 "approve_app" => &["window_id", "app_id"],
-                "get_app_state" | "get_ax_state" | "get_screenshot" => &["window_id", "app"],
+                "get_screenshot" => &["window_id", "app"],
+                "get_app_state" | "get_ax_state" => &["window_id", "app", "screenshot"],
                 "click" => &[
                     "window_id",
                     "app",
                     "frame_window",
                     "observe",
+                    "screenshot",
                     "element_index",
                     "x",
                     "y",
                     "button",
                     "click_count",
+                    "modifiers",
+                    "hold_ms",
                 ],
-                "drag" => &["window_id", "app", "frame_window", "observe", "from", "to", "path"],
+                "drag" => &["window_id", "app", "frame_window", "observe", "screenshot", "from", "to", "path", "modifiers"],
                 "scroll" => &[
                     "window_id",
                     "app",
                     "frame_window",
                     "observe",
+                    "screenshot",
                     "element_index",
                     "x",
                     "y",
                     "direction",
                     "pixels",
+                    "modifiers",
                 ],
-                "type_text" | "paste" => &["window_id", "app", "frame_window", "observe", "text"],
-                "press_key" => &["window_id", "app", "observe", "key"],
-                "set_value" => &["window_id", "app", "observe", "element_index", "value"],
-                "perform_secondary_action" => &["window_id", "app", "observe", "element_index", "action"],
+                "mouse_move" => &["window_id", "app", "frame_window", "observe", "screenshot", "element_index", "x", "y", "dx", "dy"],
+                "type_text" | "paste" => &["window_id", "app", "frame_window", "observe", "screenshot", "text"],
+                "press_key" => &["window_id", "app", "observe", "screenshot", "key", "hold_ms"],
+                "set_value" => &["window_id", "app", "observe", "screenshot", "element_index", "value"],
+                "perform_secondary_action" => &["window_id", "app", "observe", "screenshot", "element_index", "action"],
                 _ => return Err(ProtocolError(
                     json!({"code":"unknown_method","message":format!("Unknown method {method}")}),
                 )
@@ -354,12 +529,44 @@ impl Engine {
         {
             return Err(ProtocolError(json!({"code":"invalid_params","message":"Provide exactly one target: element_index or x,y"})).into());
         }
-        if matches!(method, "type_text" | "paste")
+        if method == "mouse_move" {
+            let targets = [
+                p.contains_key("element_index"),
+                p.contains_key("x") || p.contains_key("y"),
+                p.contains_key("dx") || p.contains_key("dy"),
+            ];
+            if targets.iter().filter(|t| **t).count() != 1 {
+                return Err(ProtocolError(json!({"code":"invalid_params","message":"Provide exactly one target: element_index, x,y or dx,dy"})).into());
+            }
+        }
+        if matches!(method, "type_text" | "paste" | "clipboard_write")
             && !p
                 .get("text")
                 .is_some_and(|t| t.as_str().is_some_and(|t| !t.is_empty()))
         {
             return Err(ProtocolError(json!({"code":"invalid_params","message":format!("{method} requires a non-empty string `text`")})).into());
+        }
+        match method {
+            "launch_app" => {
+                let name = p.get("app").and_then(Value::as_str).unwrap_or_default();
+                if name.trim().is_empty() || name.len() > 256 {
+                    return Err(ProtocolError(json!({"code":"invalid_params","message":"launch_app requires `app`, the application's name or desktop entry ID"})).into());
+                }
+                return self.launch(name).await;
+            }
+            "clipboard_write" => {
+                self.desktop.clipboard_write(p["text"].as_str().unwrap_or_default())?;
+                return Ok(json!({"written":true}));
+            }
+            "clipboard_read" => {
+                let text = self.desktop.clipboard_read()?;
+                return Ok(json!({"text":text}));
+            }
+            "clipboard_release" => {
+                self.desktop.clipboard_release()?;
+                return Ok(json!({"released":true}));
+            }
+            _ => {}
         }
         let app_scope = match p.get("app") {
             None => false,
@@ -383,6 +590,18 @@ impl Engine {
                 .into())
             }
         };
+        // `screenshot: true`: the observation also carries a screenshot of
+        // the observed window (one request for tree and image).
+        let screenshot = match p.get("screenshot") {
+            None => false,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => {
+                return Err(ProtocolError(
+                    json!({"code":"invalid_params","message":"screenshot must be a boolean"}),
+                )
+                .into())
+            }
+        };
         if method == "turn_ended" {
             self.policy.reset();
             if let Some(ax) = &mut self.ax {
@@ -392,16 +611,7 @@ impl Engine {
             return Ok(json!({"reset":true}));
         }
         if matches!(method, "list_windows" | "list_apps") {
-            let wins = self.desktop.list_windows()?;
-            self.remember(&wins);
-            let focused = self.desktop.focused_of(&wins);
-            let mut v = serde_json::to_value(&wins)?;
-            for w in v.as_array_mut().expect("window list") {
-                if focused.is_some_and(|f| w["window_id"] == json!(f)) {
-                    w["focused"] = json!(true);
-                }
-            }
-            return Ok(v);
+            return self.window_list();
         }
         let id: u32 = p
             .get("window_id")
@@ -460,7 +670,7 @@ impl Engine {
                 },
                 None => None,
             };
-            let pointer = p.contains_key("x") || p.contains_key("from");
+            let pointer = ["x", "from", "path", "dx"].iter().any(|k| p.contains_key(*k));
             let active = self
                 .desktop
                 .active_window(&wins, id)
@@ -495,12 +705,16 @@ impl Engine {
         if matches!(method, "get_app_state" | "get_ax_state") {
             self.desktop.track(&w)?;
             let scope = app_scope.then_some(&app);
-            let r = self
+            let mut o = self
                 .observe_following(w.clone(), wins, scope, id, Instant::now(), &mut || false)
-                .await;
+                .await?;
             trace.mark("observe");
+            if screenshot {
+                self.attach_screenshot(&mut o)?;
+                trace.mark("capture");
+            }
             trace.done();
-            return r;
+            return Ok(o);
         }
 
         let mut warnings: Vec<Value> = Vec::new();
@@ -551,7 +765,7 @@ impl Engine {
                         // count (right-click opens a context menu, not the
                         // left-click handler).
                         let mut click = json!({"x": x, "y": y});
-                        for k in ["button", "click_count"] {
+                        for k in ["button", "click_count", "modifiers", "hold_ms"] {
                             if let Some(v) = p.get(k) {
                                 click[k] = v.clone();
                             }
@@ -627,9 +841,9 @@ impl Engine {
                 let text = p["text"].as_str().unwrap_or_default();
                 let frame = int_param(p, "frame_window");
                 let w2 = w.clone();
-                warnings.extend(self.enter_text(&w2, text, frame).await?);
+                warnings.extend(self.enter_text(&w2, text, frame, method == "paste").await?);
             }
-            ("scroll", Some(idx)) => {
+            ("scroll" | "mouse_move", Some(idx)) => {
                 let ax = self.ax.as_mut().context("Accessibility unavailable")?;
                 let (x, y) = ax.element_point(&w, idx).await?;
                 let mut params = r.params.clone();
@@ -638,17 +852,20 @@ impl Engine {
                 o.remove("app");
                 o.remove("frame_window");
                 o.remove("observe");
+                o.remove("screenshot");
                 params["x"] = json!(x);
                 params["y"] = json!(y);
                 self.desktop.action(&w, method, &params)?;
             }
             _ => {
-                // `app`, `frame_window` and `observe` were resolved above.
+                // `app`, `frame_window`, `observe` and `screenshot` were
+                // resolved above.
                 let mut params = r.params.clone();
                 let o = params.as_object_mut().unwrap();
                 o.remove("app");
                 o.remove("frame_window");
                 o.remove("observe");
+                o.remove("screenshot");
                 params["window_id"] = json!(w.window_id);
                 self.desktop.action(&w, method, &params)?;
             }
@@ -766,6 +983,10 @@ impl Engine {
             .as_array_mut()
             .expect("observation warnings")
             .extend(warnings);
+        if screenshot {
+            self.attach_screenshot(&mut observation)?;
+            trace.mark("capture");
+        }
         trace.done();
         Ok(observation)
     }
@@ -963,6 +1184,7 @@ async fn main() -> Result<()> {
         ax_error_reported: false,
         policy: policy::Policy::from_env(),
         known: HashMap::new(),
+        children: Vec::new(),
     };
     let mut input = BufReader::new(tokio::io::stdin());
     let mut output = tokio::io::stdout();

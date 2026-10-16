@@ -112,6 +112,7 @@ const I_EDIT: &str = "org.a11y.atspi.EditableText";
 const I_TEXT: &str = "org.a11y.atspi.Text";
 const I_VALUE: &str = "org.a11y.atspi.Value";
 const I_SELECTION: &str = "org.a11y.atspi.Selection";
+const I_TABLE: &str = "org.a11y.atspi.Table";
 const I_CACHE: &str = "org.a11y.atspi.Cache";
 const I_REGISTRY: &str = "org.a11y.atspi.Registry";
 
@@ -3781,14 +3782,29 @@ enum PointHit {
 async fn hit_at_point(conn: &Connection, target: &ObjRef, g: &ClickGeometry) -> PointHit {
     let (x, y) = g.center;
     let ancestors: std::collections::HashSet<&ObjRef> = g.ancestors.iter().collect();
+    let parent = g.ancestors.first();
     let mut cur = g.start.clone();
+    let trace = |what: &str, detail: String| {
+        if crate::trace_on() {
+            eprintln!("trace hit_at_point {what} {detail}");
+        }
+    };
     for _ in 0..MAX_DEPTH {
         let r: Result<(String, OwnedObjectPath)> =
             call(conn, &cur, I_COMPONENT, "GetAccessibleAtPoint", &(x, y, COORD_SCREEN)).await;
-        let Ok(r) = r else { return PointHit::Unknown };
-        let r = ObjRef::from_wire(&r);
+        let r = match r {
+            Ok(r) => ObjRef::from_wire(&r),
+            Err(e) => {
+                trace("call", format!("{} failed: {e:#}", cur.path));
+                return PointHit::Unknown;
+            }
+        };
         if r.is_null() || r == cur {
-            return PointHit::Unknown;
+            // The toolkit stops at a container above the element (GTK's
+            // scrolled window answers null for the rows of a tree view). An
+            // element of a table is then resolved by its row geometry.
+            trace("stop", format!("at {} (null={}) parent={:?}", cur.path, r.is_null(), parent.map(|p| &p.path)));
+            return table_hit(conn, target, &g.ancestors, (x, y)).await;
         }
         if &r == target {
             return PointHit::Element;
@@ -3815,15 +3831,105 @@ async fn hit_at_point(conn: &Connection, target: &ObjRef, g: &ClickGeometry) -> 
             }
             // A sibling of the element is the toolkit's imprecision, not a
             // cover: GTK tree views answer with the neighbouring cell (their
-            // hit test leaves out the header row).
-            if hit_parent.as_ref() == g.ancestors.first() {
-                return PointHit::Unknown;
+            // hit test leaves out the header row). A table resolves it by
+            // the geometry of its rows; anything else does not stop the click.
+            if hit_parent.is_some() && hit_parent.as_ref() == parent {
+                return table_hit(conn, target, &g.ancestors, (x, y)).await;
             }
             let role: u32 = call(conn, &r, I_ACC, "GetRole", &()).await.unwrap_or(0);
             let name: String = get_prop(conn, &r, I_ACC, "Name").await.unwrap_or_default();
             return PointHit::Other(format!("{} {}", role_name(role), quote(&name, 40)));
         }
+        trace("descend", format!("{} -> {}", cur.path, r.path));
         cur = r;
+    }
+    trace("depth", "exhausted".into());
+    PointHit::Unknown
+}
+
+/// Hit test inside a table by the geometry of its cells, for toolkits whose
+/// `GetAccessibleAtPoint` is imprecise there: the row at the point's height
+/// is found by binary search over the rows of the element's column (rows
+/// have increasing y), using the Table interface of the nearest ancestor
+/// that implements it (GTK's multi-renderer cells sit inside a container
+/// cell). `Unknown` when no near ancestor is a table or a row has no
+/// geometry.
+async fn table_hit(conn: &Connection, target: &ObjRef, ancestors: &[ObjRef], (_, y): (i32, i32)) -> PointHit {
+    let trace = |what: &str, detail: String| {
+        if crate::trace_on() {
+            eprintln!("trace table_hit {what} {detail}");
+        }
+    };
+    let mut child = target;
+    let mut found = None;
+    for table in ancestors.iter().take(4) {
+        let idx = match call::<_, i32>(conn, child, I_ACC, "GetIndexInParent", &()).await {
+            Ok(i) => i,
+            Err(e) => {
+                trace("index", format!("{e:#}"));
+                return PointHit::Unknown;
+            }
+        };
+        match (
+            call::<_, i32>(conn, table, I_TABLE, "GetRowAtIndex", &(idx,)).await,
+            call::<_, i32>(conn, table, I_TABLE, "GetColumnAtIndex", &(idx,)).await,
+        ) {
+            (Ok(row), Ok(col)) => {
+                found = Some((table, row, col));
+                break;
+            }
+            // Not a table (or not answering): try the next ancestor.
+            (r, c) => {
+                trace("row/col", format!("{}: {:?} {:?}", table.path, r.err(), c.err()));
+                child = table;
+            }
+        }
+    }
+    let Some((table, row, col)) = found else {
+        trace("table", "none among the near ancestors".into());
+        return PointHit::Unknown;
+    };
+    let nrows = match get_prop::<i32>(conn, table, I_TABLE, "NRows").await {
+        Ok(n) => n,
+        Err(e) => {
+            trace("nrows", format!("{e:#}"));
+            return PointHit::Unknown;
+        }
+    };
+    trace("table", format!("{} row={row} col={col} nrows={nrows} y={y}", table.path));
+    if row < 0 || col < 0 || nrows <= 0 {
+        return PointHit::Unknown;
+    }
+    let (mut lo, mut hi) = (0i32, nrows - 1);
+    for _ in 0..24 {
+        if lo > hi {
+            break;
+        }
+        let mid = lo + (hi - lo) / 2;
+        let Ok(cell) = call::<_, WireRef>(conn, table, I_TABLE, "GetAccessibleAt", &(mid, col)).await else {
+            return PointHit::Unknown;
+        };
+        let cell = ObjRef::from_wire(&cell);
+        let e = match extents(conn, &cell, COORD_SCREEN).await {
+            Ok(Some(e)) if e.h > 0 => e,
+            other => {
+                trace("extents", format!("row {mid}: {other:?}"));
+                return PointHit::Unknown;
+            }
+        };
+        if y < e.y {
+            hi = mid - 1;
+        } else if y >= e.y + e.h {
+            lo = mid + 1;
+        } else if mid == row {
+            return PointHit::Element;
+        } else {
+            let name: String = get_prop(conn, &cell, I_ACC, "Name").await.unwrap_or_default();
+            return PointHit::Other(format!(
+                "table cell {} in row {mid} (the element is in row {row})",
+                quote(&name, 40)
+            ));
+        }
     }
     PointHit::Unknown
 }

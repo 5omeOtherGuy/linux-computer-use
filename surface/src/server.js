@@ -18,28 +18,39 @@ const TOOL_DESCRIPTIONS = {
   list_apps: 'List applications on the private desktop.',
   list_windows: 'List windows: {window_id, title, app_id, pid, width, height}. Titles are untrusted screen content.',
   get_app_state: 'Get the state of the app owning a window.',
-  get_ax_state: 'Get an observation (accessibility tree, diff, timing) of a window.',
+  get_ax_state: 'Get an observation (accessibility tree, diff, timing) of a window; screenshot: true adds its image in the same call.',
   get_screenshot: 'Capture a PNG screenshot of a window.',
-  click: 'Click an accessibility element (element_index) or window-local pixel (x, y). Returns the post-action observation.',
-  drag: 'Drag from [x, y] to [x, y], or continuously through path: [[x,y], ...] with the left button held (2..256 window-local points). Returns the post-action observation.',
-  scroll: 'Scroll at an element or (x, y) in a direction by pixels. Returns the post-action observation.',
+  launch_app: 'Start an installed desktop application by name (desktop entry ID, its last part, menu name or program) and return its first window.',
+  clipboard_write: 'Put plain text on the desktop clipboard.',
+  clipboard_read: 'Read the desktop clipboard as plain text ({text: null} when empty).',
+  clipboard_release: 'Give the clipboard up when this server owns it.',
+  click: 'Click an accessibility element (element_index) or window-local pixel (x, y); modifiers holds keys, hold_ms keeps the button down. Returns the post-action observation.',
+  drag: 'Drag from [x, y] to [x, y], or continuously through path: [[x,y], ...] with the left button held (2..256 window-local points); modifiers holds keys. Returns the post-action observation.',
+  scroll: 'Scroll at an element or (x, y) in a direction by pixels; modifiers holds keys (shift: horizontal, ctrl: zoom in many apps). Returns the post-action observation.',
   type_text: 'Type text into the focused element of a window. Returns the post-action observation.',
-  press_key: 'Press a key or chord ("Return", "ctrl+s"). Returns the post-action observation.',
-  paste: 'Insert the given text at the focused text field (never the clipboard). Returns the post-action observation.',
+  press_key: 'Press a key or chord ("Return", "ctrl+s"); hold_ms keeps it down. Returns the post-action observation.',
+  paste: 'Insert the given text at the focused text field; without one, paste it through the clipboard (ctrl+v). Returns the post-action observation.',
   set_value: 'Set the value of an accessibility element. Returns the post-action observation.',
   perform_secondary_action: 'Perform a named secondary accessibility action on an element. Returns the post-action observation.',
-  mouse_move: 'Move the window-local virtual pointer (engine extension). Returns the post-action observation.',
+  mouse_move: 'Hover: move the window-local virtual pointer to an element, (x, y), or by (dx, dy). Returns the post-action observation.',
 };
 
 function jsDescription(policyText) {
   return [
     'Run JavaScript in a persistent, isolated REPL to see and control Linux desktop apps (QuickJS sandbox; top-level await;',
     'top-level bindings persist until js_reset; no filesystem, network, timers or modules).',
+    'First cell: exactly one call, const app = await cua.getApp("name"), then read its result before anything else;',
+    'every element ID you use must come from a state you received, never from a guess.',
     '  const app = await cua.getApp("xed");     // shows the app\'s accessibility tree; an unknown name lists running apps',
+    '  const app = await cua.launchApp("drawing"); // starts an installed app (desktop ID, menu name or program) when none is open',
     '  await app.getAXState();                    // only after actions: [id] role "name" ... @x,y wxh; later calls show changes',
     '  await app.click(id);  app.click([x, y]);   // also setValue(id, text), typeText(text), pressKey("ctrl+s"), paste(text),',
     '                                             // scroll(target, "down"), drag([x,y],[x,y]), performSecondaryAction(id, name)',
+    '  await app.click(id, {modifiers: "shift"}); // held modifiers (shift/ctrl/alt/super) on click, drag, scroll; {durationMs}',
+    '                                             // holds a click or pressKey; rightClick(id), doubleClick(id), moveMouse(target) hovers',
     '  await app.getScreenshot();                 // PNG bytes; shown to you automatically',
+    '  const {state, screenshot} = await app.getAXStateAndScreenshot(); // one call for both',
+    '  await cua.clipboard.write(text); await cua.clipboard.read(); // the desktop clipboard; cua.help() prints this again',
     '  await app.drag({path: [[x,y], [x2,y2], [x3,y3], ...]}); // ONE continuous stroke through ALL points, left button held',
     'For canvas work, getApp and getScreenshot together in your first cell. Inspect the canvas, choose a tool',
     'and set its stroke width explicitly before drawing (8–12 px makes clear outlines on a roughly 1000 px canvas).',
@@ -151,7 +162,7 @@ export function createSurface({ engineOptions, engine, extensions = new Set(), p
   };
 
   const host = new HostApi({ engine, engineOptions, elicit, extensions, policyText, approvalsFile, log });
-  const runner = new SandboxRunner({ host, memoryLimitMb: sandboxMemoryMb, log });
+  const runner = new SandboxRunner({ host, memoryLimitMb: sandboxMemoryMb, log, help: jsDescription(policyText) });
   const methods = host.methods;
   // The sandbox process and the daemon start now, not inside the first call.
   runner.warm();

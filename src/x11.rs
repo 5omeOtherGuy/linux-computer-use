@@ -46,7 +46,10 @@ x11rb::atom_manager! {
         _NET_CLIENT_LIST_STACKING,
         UTF8_STRING,
         WM_STATE,
+        CLIPBOARD,
+        INCR,
         _LINUX_CUA_TIME,
+        _LINUX_CUA_SELECTION,
     }
 }
 
@@ -149,6 +152,12 @@ const XI_ALL_MASTER_DEVICES: u16 = 1;
 const SCROLL_PIXELS_PER_NOTCH: u32 = 50;
 const MAX_SCROLL_NOTCHES: u32 = 100;
 const DRAG_STEPS: i32 = 12;
+/// Longest a button or key is held on request (`hold_ms`).
+const MAX_HOLD_MS: i64 = 10_000;
+/// How long a clipboard read waits for the owning app to deliver.
+const CLIPBOARD_WAIT: Duration = Duration::from_millis(1500);
+/// Largest clipboard text read back (bytes).
+const CLIPBOARD_MAX: u32 = 4 * 1024 * 1024;
 /// Bound on waiting for a client repaint after a fresh Composite redirect or
 /// a resize, before the first read of its backing pixmap.
 const REPAINT_WAIT: Duration = Duration::from_millis(300);
@@ -794,6 +803,9 @@ pub struct Desktop {
     hover: HashMap<Window, Window>,
     settle_target: Option<Window>,
     live: Option<LiveScope>,
+    display: String,
+    /// CLIPBOARD owner (own connection and thread), started on first use.
+    clipboard: Option<crate::clipboard::Owner>,
 }
 
 impl Desktop {
@@ -942,9 +954,117 @@ impl Desktop {
             hover: HashMap::new(),
             settle_target: None,
             live,
+            display: display.to_string(),
+            clipboard: None,
         };
         desktop.scan_popups()?;
         Ok(desktop)
+    }
+
+    /// The display this session is bound to (for processes it launches).
+    pub fn display(&self) -> &str {
+        &self.display
+    }
+
+    /// Whether this is the explicit live-desktop mode (the owner's display).
+    pub fn is_live(&self) -> bool {
+        self.live.is_some()
+    }
+
+    // ----- clipboard -------------------------------------------------------
+
+    fn clipboard_owner(&mut self) -> Result<&crate::clipboard::Owner> {
+        if self.live.is_some() {
+            return Err(xerr(
+                "unsupported",
+                "the clipboard is not available on a live desktop (it belongs to the owner)",
+            ));
+        }
+        if self.clipboard.as_ref().is_some_and(|o| !o.alive()) {
+            self.clipboard = None;
+        }
+        if self.clipboard.is_none() {
+            self.clipboard = Some(crate::clipboard::Owner::start(&self.display)?);
+        }
+        Ok(self.clipboard.as_ref().expect("started above"))
+    }
+
+    /// Makes `text` the CLIPBOARD contents, served by this daemon until an
+    /// app takes the selection over or it is released.
+    pub fn clipboard_write(&mut self, text: &str) -> Result<()> {
+        self.clipboard_owner()?.set(text)
+    }
+
+    pub fn clipboard_release(&mut self) -> Result<()> {
+        match &self.clipboard {
+            Some(o) if o.alive() => o.release(),
+            _ => Ok(()),
+        }
+    }
+
+    /// The CLIPBOARD contents as text, `None` when nobody owns the
+    /// selection or the owner offers no text.
+    pub fn clipboard_read(&mut self) -> Result<Option<String>> {
+        if self.live.is_some() {
+            return Err(xerr(
+                "unsupported",
+                "the clipboard is not available on a live desktop (it belongs to the owner)",
+            ));
+        }
+        if let Some(text) = self.clipboard.as_ref().and_then(|o| o.owned_text()) {
+            return Ok(Some(text));
+        }
+        let owner = self.conn.get_selection_owner(self.atoms.CLIPBOARD)?.reply()?.owner;
+        if owner == NONE {
+            return Ok(None);
+        }
+        let time = self.server_time()?;
+        self.conn.convert_selection(
+            self.helper,
+            self.atoms.CLIPBOARD,
+            self.atoms.UTF8_STRING,
+            self.atoms._LINUX_CUA_SELECTION,
+            time,
+        )?;
+        self.conn.flush()?;
+        let start = Instant::now();
+        let property = loop {
+            if let Some((ev, seq)) = self.conn.poll_for_event_with_sequence()? {
+                if let Event::SelectionNotify(e) = &ev {
+                    if e.requestor == self.helper && e.selection == self.atoms.CLIPBOARD {
+                        break e.property;
+                    }
+                }
+                self.handle(ev, seq)?;
+                continue;
+            }
+            let left = CLIPBOARD_WAIT.saturating_sub(start.elapsed());
+            if left.is_zero() {
+                return Err(xerr(
+                    "timeout",
+                    "the clipboard owner did not deliver its contents within 1.5 s",
+                ));
+            }
+            self.wait_readable(left.min(Duration::from_millis(50)))?;
+        };
+        if property == NONE {
+            return Ok(None);
+        }
+        let reply = self
+            .conn
+            .get_property(true, self.helper, property, AtomEnum::ANY, 0, CLIPBOARD_MAX / 4)?
+            .reply()?;
+        self.conn.flush()?;
+        if reply.type_ == self.atoms.INCR {
+            return Err(xerr(
+                "unsupported",
+                "the clipboard contents are too large (incremental transfer is not supported)",
+            ));
+        }
+        if reply.format != 8 {
+            return Ok(None);
+        }
+        Ok(Some(String::from_utf8_lossy(&reply.value).into_owned()))
     }
 
     // ----- client identity -------------------------------------------------
@@ -2246,13 +2366,75 @@ impl Desktop {
         self.keymap.lookup.get(&sym).copied()
     }
 
-    /// Presses modifiers, the key, then releases in reverse order.
+    /// Presses modifier keys (for a chord or a modified pointer action) and
+    /// returns the held keycodes with their masks, plus the resulting state.
+    fn press_modifiers(
+        &mut self,
+        o: &KeyOrigin,
+        mods: &[Modifier],
+        time: &mut u32,
+    ) -> Result<(Vec<(u8, u16)>, u16)> {
+        let mut held: Vec<(u8, u16)> = Vec::new();
+        let mut state = 0u16;
+        for &m in mods {
+            let (mask, msym) = self.keymap.modifier(m);
+            if let Some((kc, _)) = self.resolve_keysym(msym) {
+                *time = time.wrapping_add(1);
+                self.key_event(o, true, kc, state, *time)?;
+                held.push((kc, mask));
+            }
+            state |= mask;
+        }
+        Ok((held, state))
+    }
+
+    fn release_modifiers(
+        &mut self,
+        o: &KeyOrigin,
+        held: Vec<(u8, u16)>,
+        mut state: u16,
+        time: &mut u32,
+    ) -> Result<()> {
+        for (kc, mask) in held.into_iter().rev() {
+            *time = time.wrapping_add(1);
+            self.key_event(o, false, kc, state, *time)?;
+            state &= !mask;
+        }
+        Ok(())
+    }
+
+    /// Keeps a pressed button or key down for `hold`, watching for physical
+    /// input. The caller releases in any case, and `time` is resynchronized
+    /// with the server afterwards.
+    fn hold(&mut self, hold: Duration, time: &mut u32) -> Result<()> {
+        if hold.is_zero() {
+            return Ok(());
+        }
+        self.conn.flush()?;
+        let end = Instant::now() + hold;
+        let r = loop {
+            if let Err(e) = self.check_user_input() {
+                break Err(e);
+            }
+            let now = Instant::now();
+            if now >= end {
+                break Ok(());
+            }
+            self.wait_readable((end - now).min(Duration::from_millis(20)))?;
+        };
+        *time = self.server_time()?;
+        r
+    }
+
+    /// Presses modifiers, the key (held for `hold`), then releases in
+    /// reverse order.
     fn send_combo(
         &mut self,
         o: &KeyOrigin,
         mods: &[Modifier],
         sym: u32,
         time: &mut u32,
+        hold: Duration,
     ) -> Result<()> {
         let (keycode, level_state) = self.resolve_keysym(sym).ok_or_else(|| {
             xerr(
@@ -2261,28 +2443,16 @@ impl Desktop {
             )
         })?;
         let o = *o;
-        let mut held: Vec<(u8, u16)> = Vec::new();
-        let mut state = 0u16;
-        for &m in mods {
-            let (mask, msym) = self.keymap.modifier(m);
-            if let Some((kc, _)) = self.resolve_keysym(msym) {
-                self.key_event(&o, true, kc, state, *time)?;
-                held.push((kc, mask));
-            }
-            state |= mask;
-        }
+        let (held, state) = self.press_modifiers(&o, mods, time)?;
         // Explicit modifiers win; a level shift is added only when needed.
         let key_state = state | level_state;
         *time = time.wrapping_add(1);
         self.key_event(&o, true, keycode, key_state, *time)?;
+        let r = self.hold(hold, time);
         *time = time.wrapping_add(1);
         self.key_event(&o, false, keycode, key_state, *time)?;
-        for (kc, mask) in held.into_iter().rev() {
-            *time = time.wrapping_add(1);
-            self.key_event(&o, false, kc, state, *time)?;
-            state &= !mask;
-        }
-        Ok(())
+        self.release_modifiers(&o, held, state, time)?;
+        r
     }
 
     /// Window-bound X11 input for a window the caller already resolved and
@@ -2291,10 +2461,11 @@ impl Desktop {
     /// accessibility layer and are rejected here.
     pub fn action(&mut self, info: &WindowInfo, method: &str, p: &Value) -> Result<()> {
         let allowed: &[&str] = match method {
-            "click" => &["window_id", "x", "y", "button", "click_count"],
-            "drag" => &["window_id", "from", "to", "path"],
-            "scroll" => &["window_id", "x", "y", "direction", "pixels"],
-            "press_key" => &["window_id", "key"],
+            "click" => &["window_id", "x", "y", "button", "click_count", "modifiers", "hold_ms"],
+            "drag" => &["window_id", "from", "to", "path", "modifiers"],
+            "scroll" => &["window_id", "x", "y", "direction", "pixels", "modifiers"],
+            "press_key" => &["window_id", "key", "hold_ms"],
+            "mouse_move" => &["window_id", "x", "y", "dx", "dy"],
             other => {
                 return Err(xerr(
                     "unsupported",
@@ -2324,6 +2495,7 @@ impl Desktop {
             "drag" => self.do_drag(info, p, &mut time),
             "scroll" => self.do_scroll(info, p, &mut time),
             "press_key" => self.do_key(info, p, &mut time),
+            "mouse_move" => self.do_move(info, p, time),
             _ => unreachable!(),
         };
         self.conn.flush()?;
@@ -2370,12 +2542,33 @@ impl Desktop {
                 self.check_user_input()?;
             }
             time = time.wrapping_add(2);
-            self.send_combo(&o, &[], sym, &mut time)?;
+            self.send_combo(&o, &[], sym, &mut time, Duration::ZERO)?;
         }
         self.conn.flush()?;
         Ok(())
     }
 
+    /// Moves the virtual cursor (hover) to `x,y`, or by `dx,dy` from where
+    /// it is.
+    fn do_move(&mut self, info: &WindowInfo, p: &Value, time: u32) -> Result<()> {
+        let absolute = p.get("x").is_some() || p.get("y").is_some();
+        let relative = p.get("dx").is_some() || p.get("dy").is_some();
+        let (x, y) = match (absolute, relative) {
+            (true, false) => point(p, "x", "y")?,
+            (false, true) => {
+                let (dx, dy) = point(p, "dx", "dy")?;
+                let Some((cx, cy)) = self.cursors.get(&info.window_id).copied() else {
+                    return Err(invalid(
+                        "the pointer has no position in this window yet; move to [x, y] first",
+                    ));
+                };
+                (cx + dx, cy + dy)
+            }
+            _ => return Err(invalid("provide x,y or dx,dy")),
+        };
+        self.move_to(info, x, y, time, 0, HitArea::Window)?;
+        Ok(())
+    }
 
     fn do_click(&mut self, info: &WindowInfo, p: &Value, time: &mut u32, area: HitArea) -> Result<()> {
         let (x, y) = point(p, "x", "y")?;
@@ -2395,25 +2588,37 @@ impl Desktop {
                 _ => return Err(invalid("click_count must be 1, 2 or 3")),
             },
         };
+        let mods = parse_modifiers(p.get("modifiers"))?;
+        let hold = hold_ms(p)?;
         let mask = 0x80u16 << button; // Button1Mask = 0x100
-        let t = self.move_to(info, x, y, *time, 0, area)?;
+        let o = self.key_origin(info.window_id)?;
+        let (held, state) = self.press_modifiers(&o, &mods, time)?;
+        let t = self.move_to(info, x, y, *time, state, area)?;
+        let mut r = Ok(());
         for _ in 0..count {
             *time = time.wrapping_add(10);
             self.send(
                 t.win,
-                self.pointer_event(xproto::BUTTON_PRESS_EVENT, button, *time, &t, x, y, 0),
+                self.pointer_event(xproto::BUTTON_PRESS_EVENT, button, *time, &t, x, y, state),
             )?;
+            // A held button is released even when physical input aborts.
+            r = self.hold(hold, time);
             *time = time.wrapping_add(10);
             self.send(
                 t.win,
-                self.pointer_event(xproto::BUTTON_RELEASE_EVENT, button, *time, &t, x, y, mask),
+                self.pointer_event(xproto::BUTTON_RELEASE_EVENT, button, *time, &t, x, y, state | mask),
             )?;
+            if r.is_err() {
+                break;
+            }
         }
-        Ok(())
+        self.release_modifiers(&o, held, state, time)?;
+        r
     }
 
     fn do_drag(&mut self, info: &WindowInfo, p: &Value, time: &mut u32) -> Result<()> {
         let points = drag_points(p)?;
+        let mods = parse_modifiers(p.get("modifiers"))?;
         // Validate the entire path before pressing, including intermediate
         // segment samples: refuse points covered by another client before input.
         let mut motions = Vec::new();
@@ -2428,12 +2633,14 @@ impl Desktop {
             }
         }
         let (x0, y0) = points[0];
-        const B1: u16 = 0x100;
-        let t = self.move_to(info, x0, y0, *time, 0, HitArea::Window)?;
+        let o = self.key_origin(info.window_id)?;
+        let (held, mstate) = self.press_modifiers(&o, &mods, time)?;
+        let b1: u16 = 0x100 | mstate;
+        let t = self.move_to(info, x0, y0, *time, mstate, HitArea::Window)?;
         *time = time.wrapping_add(1);
         self.send(
             t.win,
-            self.pointer_event(xproto::BUTTON_PRESS_EVENT, 1, *time, &t, x0, y0, 0),
+            self.pointer_event(xproto::BUTTON_PRESS_EVENT, 1, *time, &t, x0, y0, mstate),
         )?;
         self.conn.flush()?;
         // Implicit grab semantics: motion and release go to the press window.
@@ -2450,7 +2657,7 @@ impl Desktop {
             let step = (|| -> Result<()> {
                 self.send(
                     t.win,
-                    self.pointer_event(xproto::MOTION_NOTIFY_EVENT, 0, *time, &t, cx, cy, B1),
+                    self.pointer_event(xproto::MOTION_NOTIFY_EVENT, 0, *time, &t, cx, cy, b1),
                 )?;
                 self.conn.flush()?;
                 // GTK coalesces queued motion events to the last position.
@@ -2470,9 +2677,10 @@ impl Desktop {
         *time = time.wrapping_add(1);
         self.send(
             t.win,
-            self.pointer_event(xproto::BUTTON_RELEASE_EVENT, 1, *time, &t, cx, cy, B1),
+            self.pointer_event(xproto::BUTTON_RELEASE_EVENT, 1, *time, &t, cx, cy, b1),
         )?;
         self.cursors.insert(info.window_id, (cx, cy));
+        self.release_modifiers(&o, held, mstate, time)?;
         match aborted {
             Some(e) => Err(e),
             None => Ok(()),
@@ -2481,6 +2689,7 @@ impl Desktop {
 
     fn do_scroll(&mut self, info: &WindowInfo, p: &Value, time: &mut u32) -> Result<()> {
         let (x, y) = point(p, "x", "y")?;
+        let mods = parse_modifiers(p.get("modifiers"))?;
         let button = match p.get("direction").and_then(Value::as_str) {
             Some("up") => 4u8,
             Some("down") => 5,
@@ -2499,13 +2708,15 @@ impl Desktop {
                 ))
             })? as u32;
         let notches = pixels.div_ceil(SCROLL_PIXELS_PER_NOTCH);
-        let t = self.move_to(info, x, y, *time, 0, HitArea::Window)?;
-        let release_mask = if button <= 5 { 0x80u16 << button } else { 0 };
+        let o = self.key_origin(info.window_id)?;
+        let (held, state) = self.press_modifiers(&o, &mods, time)?;
+        let t = self.move_to(info, x, y, *time, state, HitArea::Window)?;
+        let release_mask = (if button <= 5 { 0x80u16 << button } else { 0 }) | state;
         for _ in 0..notches {
             *time = time.wrapping_add(5);
             self.send(
                 t.win,
-                self.pointer_event(xproto::BUTTON_PRESS_EVENT, button, *time, &t, x, y, 0),
+                self.pointer_event(xproto::BUTTON_PRESS_EVENT, button, *time, &t, x, y, state),
             )?;
             self.send(
                 t.win,
@@ -2520,7 +2731,7 @@ impl Desktop {
                 ),
             )?;
         }
-        Ok(())
+        self.release_modifiers(&o, held, state, time)
     }
 
     fn do_key(&mut self, info: &WindowInfo, p: &Value, time: &mut u32) -> Result<()> {
@@ -2529,6 +2740,7 @@ impl Desktop {
             .and_then(Value::as_str)
             .ok_or_else(|| invalid("key must be a string such as \"Return\" or \"ctrl+s\""))?;
         let (mods, sym) = parse_key_combo(key)?;
+        let hold = hold_ms(p)?;
         if self.resolve_keysym(sym).is_none() {
             return Err(xerr(
                 "unsupported",
@@ -2536,7 +2748,38 @@ impl Desktop {
             ));
         }
         let o = self.key_origin(info.window_id)?;
-        self.send_combo(&o, &mods, sym, time)
+        self.send_combo(&o, &mods, sym, time, hold)
+    }
+}
+
+/// `modifiers: ["shift", "ctrl", ...]` held during a pointer action.
+fn parse_modifiers(v: Option<&Value>) -> Result<Vec<Modifier>> {
+    let Some(v) = v else { return Ok(Vec::new()) };
+    let arr = v
+        .as_array()
+        .filter(|a| a.len() <= 4)
+        .ok_or_else(|| invalid("modifiers must be an array of at most 4 of shift, ctrl, alt, super"))?;
+    let mut out = Vec::new();
+    for m in arr {
+        let m = parse_modifier(
+            m.as_str()
+                .ok_or_else(|| invalid("modifiers must be strings such as \"shift\""))?,
+        )?;
+        if !out.contains(&m) {
+            out.push(m);
+        }
+    }
+    Ok(out)
+}
+
+/// `hold_ms`: how long a button or key stays pressed.
+fn hold_ms(p: &Value) -> Result<Duration> {
+    match p.get("hold_ms") {
+        None => Ok(Duration::ZERO),
+        Some(v) => int(v)
+            .filter(|n| (0..=MAX_HOLD_MS).contains(n))
+            .map(|n| Duration::from_millis(n as u64))
+            .ok_or_else(|| invalid(format!("hold_ms must be an integer in 0..={MAX_HOLD_MS}"))),
     }
 }
 
@@ -2614,6 +2857,23 @@ mod tests {
                   json!({"path": [[1,2], [3,4]], "from": [1,2]}),
                   json!({"path": vec![[1,2]; 257]})] {
             assert!(drag_points(&p).is_err(), "{p}");
+        }
+    }
+
+    #[test]
+    fn modifier_and_hold_params() {
+        assert_eq!(
+            parse_modifiers(Some(&json!(["shift", "Ctrl", "shift"]))).unwrap(),
+            vec![Modifier::Shift, Modifier::Ctrl]
+        );
+        assert_eq!(parse_modifiers(None).unwrap(), vec![]);
+        for v in [json!("shift"), json!(["cmd"]), json!([1]), json!(["a", "b", "c", "d", "e"])] {
+            assert!(parse_modifiers(Some(&v)).is_err(), "{v}");
+        }
+        assert_eq!(hold_ms(&json!({})).unwrap(), Duration::ZERO);
+        assert_eq!(hold_ms(&json!({"hold_ms": 250})).unwrap(), Duration::from_millis(250));
+        for v in [json!({"hold_ms": -1}), json!({"hold_ms": 10_001}), json!({"hold_ms": "1"})] {
+            assert!(hold_ms(&v).is_err(), "{v}");
         }
     }
 

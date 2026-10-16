@@ -79,6 +79,25 @@ impl Policy {
         }
     }
 
+    /// Denial reason for launching an application known by `names` (its
+    /// desktop ID, menu name, program and WM class): the deny list and the
+    /// hard denies apply to any of them.
+    pub fn launch_denied(&self, names: &[String]) -> Option<&'static str> {
+        for n in names {
+            let n = n.trim().to_lowercase();
+            if n.is_empty() {
+                continue;
+            }
+            if forbidden(&n) {
+                return Some("the application is denied by policy");
+            }
+            if self.deny.contains(&n) {
+                return Some("the application is on the deny list");
+            }
+        }
+        None
+    }
+
     pub fn approve(&mut self, w: &WindowInfo) {
         if let Some(t) = start_time(w.pid) {
             self.approved.insert((w.pid, t, w.app_id.clone()));
@@ -224,6 +243,16 @@ mod tests {
         let stat = "123 (a b) c) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 4242 99";
         assert_eq!(parse_start_time(stat), Some(4242));
         assert_eq!(parse_start_time("garbage"), None);
+    }
+
+    #[test]
+    fn launching_follows_the_deny_lists() {
+        let mut p = Policy::default();
+        p.deny.insert("drawing".into());
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(p.launch_denied(&names(&["com.github.maoschanz.drawing", "Drawing", "drawing"])).is_some());
+        assert!(p.launch_denied(&names(&["org.gnome.Terminal", "Terminal"])).is_some());
+        assert!(p.launch_denied(&names(&["xed", "Text Editor", "xed"])).is_none());
     }
 
     /// Regression: an unknown process identity used to skip the executable

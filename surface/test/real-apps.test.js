@@ -17,6 +17,7 @@ const skip = !ENGINE ? 'set CUA_REAL_ENGINE and a private display environment' :
 describe('real apps', { skip }, () => {
   let t, dir;
   const procs = [];
+  const launchedPids = [];
   const launch = (cmd, args, extraEnv = {}) => {
     const p = spawn(cmd, args, { cwd: dir, env: { ...process.env, ...extraEnv }, stdio: 'ignore' });
     procs.push(p);
@@ -54,6 +55,7 @@ describe('real apps', { skip }, () => {
   after(async () => {
     await t?.close();
     for (const p of procs) p.kill();
+    for (const pid of launchedPids) { try { process.kill(pid); } catch {} }
     rmSync(dir, { recursive: true, force: true });
   });
 
@@ -106,5 +108,54 @@ describe('real apps', { skip }, () => {
     assert.equal(r.isError, false, t2);
     assert.match(t2, /=> set/);
     assert.match(t2, /decimal separator is a comma/);
+  });
+
+  test('a shift-click extends a file list selection to a range', async () => {
+    const { r, text } = await run(`await x.pressKey("ctrl+o"); await x.pressKey("ctrl+l"); await x.typeText(${JSON.stringify(dir + '/')}); await x.pressKey("Return");
+      const s = await x.getAXState({emit: false, disableDiffing: true});
+      const cells = [...s.matchAll(/\\[(\\d+)\\] table cell "(?:note|other)\\.txt"/g)].map((m) => Number(m[1]));
+      await x.click(cells[0]); await x.click(cells[1], {modifiers: "shift"});
+      const after = await x.getAXState({emit: false, disableDiffing: true});
+      const selected = [...after.matchAll(/\\[\\d+\\] table cell "(?:note|other)\\.txt" \\([^)]*selected/g)].length;
+      await x.pressKey("Escape");
+      [cells.length, selected].join()`);
+    assert.equal(r.isError, false, text);
+    assert.match(text, /=> 2,2/);
+  });
+
+  test('hover moves the virtual pointer; a relative move needs a position first', async () => {
+    const { text } = await run(`let code; try { await c.moveMouseRelative(5, 5) } catch (e) { code = e.code }
+      await x.getScreenshot({emit: false}); await x.moveMouse([300, 200]); await x.moveMouseRelative(10, -10); [code, "moved"].join()`);
+    assert.match(text, /=> invalid_params,moved/);
+  });
+
+  test('getAXStateAndScreenshot is one engine request', async () => {
+    const { text } = await run(`const {state, screenshot} = await x.getAXStateAndScreenshot({emit: false}); [typeof state, screenshot.length > 1000].join()`);
+    assert.match(text, /=> string,true/);
+    assert.match(text, /host calls: get_ax_state$/m);
+  });
+
+  test('the clipboard round-trips with the app in both directions', async () => {
+    const { r, text } = await run(`await cua.clipboard.write("Grüße λ clip"); await x.pressKey("ctrl+v");
+      const s = await x.getAXState({emit: false, disableDiffing: true});
+      await x.pressKey("ctrl+a"); await x.pressKey("ctrl+c");
+      const back = await cua.clipboard.read();
+      await x.pressKey("ctrl+z");
+      [s.includes("Grüße λ clip"), back.includes("Grüße λ clip"), back.includes("hello")].join()`);
+    assert.equal(r.isError, false, text);
+    assert.match(text, /=> true,true,true/);
+  });
+
+  test('launchApp starts an installed application and hands back its App', async () => {
+    const { r, text } = await run(`const d = await cua.launchApp("drawing", {emit: false}); [d.id, d.windows.length > 0, d.pid].join()`);
+    assert.equal(r.isError, false, text);
+    const m = text.match(/=> Drawing,true,(\d+)/);
+    assert.ok(m, text);
+    // The test owns the process the engine started for it.
+    launchedPids.push(Number(m[1]));
+    const bad = await run(`try { await cua.launchApp("no-such-application") } catch (e) { e.code }`);
+    assert.match(bad.text, /=> not_found/);
+    const denied = await run(`try { await cua.launchApp("xterm") } catch (e) { e.code }`);
+    assert.match(denied.text, /=> (app_denied|not_found)/);
   });
 });

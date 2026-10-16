@@ -41,7 +41,7 @@ export class AnthropicComputerToolset {
    * @param {object} o
    * @param {{call: Function}} o.host        HostApi (or compatible) that validates/authorizes engine calls
    * @param {number} o.windowId              window the toolset drives
-   * @param {Set<string>} [o.extensions]     engine extensions (click_button, click_count, modifiers, mouse_move)
+   * @param {Set<string>} [o.extensions]     accepted for compatibility; buttons, multi-clicks, held keys and moves are always available
    * @param {boolean} [o.zoom=true]          offer the zoom member
    * @param {object} [o.limits]              image limits (default: toolset-model limits)
    * @param {number} [o.scrollPixelsPerClick=100]
@@ -66,13 +66,10 @@ export class AnthropicComputerToolset {
   }
 
   enabledMembers() {
-    const ext = this.extensions;
-    const on = new Set(['screenshot', 'left_click', 'left_click_drag', 'cursor_position', 'scroll', 'type', 'key', 'wait']);
+    const on = new Set(['screenshot', 'left_click', 'right_click', 'middle_click', 'double_click', 'triple_click', 'left_click_drag', 'mouse_move', 'cursor_position', 'scroll', 'type', 'key', 'hold_key', 'wait']);
     if (this.zoomEnabled) on.add('zoom');
-    if (ext.has('click_button')) { on.add('right_click'); on.add('middle_click'); }
-    if (ext.has('click_count')) { on.add('double_click'); on.add('triple_click'); }
-    if (ext.has('mouse_move')) on.add('mouse_move');
-    // left_mouse_down, left_mouse_up and hold_key have no engine equivalent.
+    // left_mouse_down and left_mouse_up have no engine equivalent (the
+    // engine presses and releases within one action).
     return on;
   }
 
@@ -110,7 +107,6 @@ export class AnthropicComputerToolset {
     if (typeof text !== 'string' || !text) throw invalid(`${member}.text must be a modifier string such as "shift" or "ctrl+shift"`);
     const mods = text.toLowerCase().split('+').map((m) => MODIFIER_ALIASES[m.trim()]);
     if (mods.some((m) => !m)) throw invalid(`${member}.text must contain only shift, ctrl, alt or super joined with "+"`);
-    if (!this.extensions.has('modifiers')) throw new CuaError('unsupported', `${member} with held modifier keys is not supported by this engine`);
     return [...new Set(mods)];
   }
 
@@ -220,6 +216,13 @@ export class AnthropicComputerToolset {
         const repeat = input.repeat ?? 1;
         if (!Number.isInteger(repeat) || repeat < 1 || repeat > 100) throw invalid('key.repeat must be an integer from 1 to 100');
         for (let i = 0; i < repeat; i++) await this.host.call('press_key', { window_id: w, key: input.text, observe: false }, { signal });
+        return okText();
+      }
+      case 'hold_key': {
+        if (typeof input.text !== 'string' || !input.text) throw invalid('hold_key.text must be a key or chord such as "shift" or "ctrl+s"');
+        const d = input.duration;
+        if (typeof d !== 'number' || !(d >= 0) || d > 10) throw invalid('hold_key.duration must be a number of seconds from 0 to 10');
+        await this.host.call('press_key', { window_id: w, key: input.text, hold_ms: Math.round(d * 1000), observe: false }, { signal });
         return okText();
       }
       case 'wait': {

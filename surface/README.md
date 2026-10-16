@@ -32,7 +32,7 @@ MCP client configuration (stdio):
 | `CUA_ENGINE` | Daemon executable. Default `../target/debug/linux-cua` relative to `surface/`. With `CARGO_TARGET_DIR=/data/scratch/linux-cua-build/target`, point it there. |
 | `CUA_ALLOW_APPS`, `CUA_DENY_APPS` | Inherited by the daemon, which enforces them. |
 | `CUA_APPROVALS_FILE` | "Always allow" decisions, `{"always_allowed_app_ids": [...]}`. Default `$XDG_CONFIG_HOME/linux-cua/approvals.json` (or `~/.config/...`). Written only by this host after the user picks "Always allow"; the operator may edit or delete it. Without a location, only turn and session approval are offered. |
-| `CUA_ENGINE_EXTENSIONS` | Comma list of optional engine features beyond CONTRACT.md: `click_button`, `click_count`, `modifiers`, `mouse_move`. Off by default. Enable only if the daemon implements them. |
+| `CUA_ENGINE_EXTENSIONS` | Accepted for compatibility (`click_button`, `click_count`, `modifiers`, `mouse_move`); these are part of the contract now and always available. |
 | `CUA_CONFIRMATION_POLICY` | Replaces the default confirmation-policy text shown in tool descriptions, server instructions and approval prompts. |
 | `CUA_TOOL_TIMEOUT_MS` | Timeout for discrete tools (default 30000). |
 | `CUA_SANDBOX_MEMORY_MB` | QuickJS heap limit (default 128). |
@@ -44,7 +44,7 @@ The daemon's stderr is forwarded to the server's stderr. stdout carries only MCP
 - `js {title?, code, timeout_ms?}` runs a cell in the persistent REPL. Top-level `await` works. Top-level `let/const/var/function/class` bindings persist across cells as mutable globals, and redeclaring them is allowed. The result contains, in order, everything the cell emitted (auto-emitted observations, `nodeRepl.write`, `nodeRepl.emitImage`, `console.log`), the value of the last expression (also inside a trailing block, `if` or `try`), and, if the cell acted after its last emitted observation of that window, the state after the last action (observed once, when the cell ends: the actions themselves run with `observe: false`). `timeout_ms` defaults to 30000 (maximum 600000). Time spent waiting for app approval counts toward it.
 - `js_reset` discards all REPL state by restarting the sandbox process.
 - `turn_ended` cancels an active JS cell and old-turn queued requests, clears this turn's approvals and denials (session and always approvals stay), and resets the daemon. If the daemon has a pending request or cannot confirm the reset, it is killed. Idle REPL bindings survive.
-- Discrete tools, one per engine method: `list_apps`, `list_windows`, `get_app_state`, `get_ax_state`, `get_screenshot`, `click`, `drag`, `scroll`, `type_text`, `press_key`, `paste`, `set_value`, `perform_secondary_action`, plus `mouse_move` with that extension. Their JSON Schemas come from the same table the host uses for validation (`src/protocol.js`).
+- Discrete tools, one per engine method: `list_apps`, `list_windows`, `get_app_state`, `get_ax_state`, `get_screenshot`, `launch_app`, `clipboard_write`, `clipboard_read`, `clipboard_release`, `click`, `drag`, `scroll`, `mouse_move`, `type_text`, `press_key`, `paste`, `set_value`, `perform_secondary_action`. Their JSON Schemas come from the same table the host uses for validation (`src/protocol.js`); `click` takes `button`, `click_count`, `modifiers` and `hold_ms`, `drag` and `scroll` take `modifiers`, `press_key` takes `hold_ms`, and observations and actions take `screenshot: true` to return the window's image in the same call.
 
 ### JS API (inside the VM)
 
@@ -55,12 +55,19 @@ const windows = await cua.listWindows();                  // WindowInfo[] {id, a
 const apps = await cua.listApps({emit: false});           // AppInfo[] {id, displayName, isRunning, windows}
 const { apps: running } = await cua.getState();           // {apps, browsers: []}
 const app = await cua.getApp({windowId: windows[0].id});  // or {appId}; App {id, displayName, isRunning, windows, window, windowId, ...methods}
+const started = await cua.launchApp('drawing');           // starts an installed app (desktop ID, menu name or program); App with .pid
 await app.getAXState();                     // full tree first, then changes since the tree you last received; emitted
 await app.getAXState({disableDiffing: true, emit: false});
 await app.setValue(observedFieldId, 'Hello');
 await app.click(observedButtonId);          // or app.click([x, y]); resolves when the UI settled
+await app.click(id, {modifiers: 'shift', durationMs: 300}); // held modifiers (shift, ctrl, alt, super) and press duration
+await app.rightClick(id); await app.doubleClick(id); await app.moveMouse([x, y]); await app.moveMouseRelative(10, 0);
+await app.drag([x, y], [x2, y2], {modifiers: 'ctrl'}); await app.scroll([x, y], 'down', 1, {modifiers: 'shift'});
+await app.pressKey('Down', {durationMs: 500});
 const png = await app.getScreenshot();      // Uint8Array PNG bytes; emitted
-const { state, screenshot } = await app.getAXStateAndScreenshot({emit: false});
+const { state, screenshot } = await app.getAXStateAndScreenshot({emit: false}); // one engine request
+await cua.clipboard.write('text'); await cua.clipboard.read(); await cua.clipboard.release();
+cua.help();                                 // prints the js tool description again
 nodeRepl.write({ any: 'value' });           // text output (strings as-is, other values as JSON)
 await nodeRepl.emitImage(png);              // also {bytes, mimeType} or a data:image/png;base64 URL
 try { await app.click(13) } catch (e) { e.code /* approval_denied, invalid_params, timeout, ... */ }
@@ -93,7 +100,7 @@ tools: [toolset.toolDefinition(), ...]           // {type: 'computer_toolset_202
 const results = await toolset.runBatch(message.content);   // tool_result blocks, each with toolset_name: 'computer'
 ```
 
-- Members the engine cannot perform are declared `enabled: false`. Without extensions these are `right_click`, `middle_click`, `double_click`, `triple_click`, `mouse_move`, `left_mouse_down`, `left_mouse_up` and `hold_key`. If Claude calls one of them anyway, it gets `is_error`.
+- Members the engine cannot perform are declared `enabled: false`: `left_mouse_down` and `left_mouse_up` (the engine presses and releases within one action). If Claude calls one of them anyway, it gets `is_error`. `hold_key` maps to `press_key` with `hold_ms` (duration up to 10 s); modifier `text` on clicks, drags and scrolls maps to `modifiers`; `mouse_move` maps to `mouse_move`.
 - Batches run in order and stop at the first failure. Every later block gets exactly `Not executed: an earlier computer action in this turn failed.` Duplicate ids, a wrong `toolset_name`, unknown members, unknown input fields (for example a leftover `action`), out-of-bounds coordinates and invalid values are rejected before that block acts. An optional `confirm(block)` hook runs before each block. When a batch succeeds and does not end with `screenshot` or `zoom`, a screenshot is attached to the last result (`attachFinalScreenshot`).
 - Screenshots are resized to the toolset models' limits: at most 2576 px on the long edge and at most 4784 visual tokens, counted as `ceil(w/28)·ceil(h/28)`. The legacy limits are available as `ANTHROPIC_LEGACY_LIMITS`. Coordinates are mapped from the latest screenshot's pixel space to window pixels by pixel centre. `zoom` crops the window-space region at full resolution and fits it into the screenshot size, keeping the aspect ratio. `key.repeat` (1–100) presses the key that many times. `scroll_amount` is multiplied by `scrollPixelsPerClick` (default 100). `cursor_position` reports the adapter's last pointer position as `[x, y]` in screenshot space. Before any pointer action it fails.
 
@@ -114,17 +121,17 @@ const { output, error, refused } = await computer.handleCall(computerCallItem);
 
   | Action | Engine call |
   |---|---|
-  | `click` | `click` (`left`; `right` and `wheel` need `click_button`; `back` and `forward` are unsupported) |
-  | `double_click` | `click_count: 2` (needs `click_count`) |
-  | `drag` | `drag` from the first to the last path point. Paths with more than two points are rejected unless `allowDragPathSimplification` is set. |
-  | `move` | needs `mouse_move` |
+  | `click` | `click` (`left`, `right`, `wheel` as middle; `back` and `forward` are unsupported) |
+  | `double_click` | `click_count: 2` |
+  | `drag` | `drag` from the first to the last point, or one continuous stroke through all of them (`path`, up to 256 points) |
+  | `move` | `mouse_move` (held keys are not supported on a move) |
   | `scroll` | one `scroll` per non-zero axis, with direction from the sign and distance scaled to window pixels |
   | `keypress` | keys normalized to X keysyms (`ENTER`→`Return`, `CTRL`→`ctrl`, `ARROWLEFT`→`Left`, `A`→`a`) and joined with `+` |
   | `type` | `type_text` |
   | `wait` | `waitMs` (default 1000) |
   | `screenshot` | no-op, because the output screenshot is captured after the batch |
 
-- Mouse `keys` (held modifiers) need the `modifiers` extension.
+- Mouse `keys` (held modifiers) map to `modifiers`.
 - When `pending_safety_checks` is non-empty, nothing runs unless `confirmSafetyChecks(checks, call)` returns true. The checks are then echoed in `acknowledged_safety_checks`.
 - Screenshots use `detail: "original"`. They are downscaled only when `limits` (`maxWidth`, `maxHeight`, `maxLongEdge`, `maxPixels`) require it, and coordinates are then mapped back.
 
@@ -136,7 +143,7 @@ The surface relies on these daemon behaviours:
 2. `list_windows` returns an array of `{window_id, title, app_id, pid, width, height}`. The adapters use width and height until the first screenshot. `get_screenshot` returns `{data, mimeType: 'image/png', width, height}`. Actions and `get_ax_state` return the observation object; an action sent with `observe: false` (every action inside a `js` cell, and every adapter action) returns it without `accessibility` and with `observed: false`, and the surface observes with `get_ax_state` when the cell ends. The surface treats `screenshot` in an observation as optional.
 3. The daemon may be killed with SIGKILL at any time, after a timeout, a cancellation or a protocol violation, and is respawned with the same environment. Approvals granted during the turn are replayed with `approve_app`. Replay failures are ignored, and the next request then triggers `approval_required` again.
 4. Any non-JSON line on stdout kills the daemon. Responses with unknown ids are dropped.
-5. The surface never sends parameters outside CONTRACT.md unless `CUA_ENGINE_EXTENSIONS` enables them. If the parent adds `button`, `click_count`, `modifiers` or a `mouse_move` method, the daemon must implement them, or reject unsupported values with an error rather than ignore them.
+5. The surface never sends parameters outside CONTRACT.md. The daemon rejects unsupported values with an error rather than ignoring them.
 6. `turn_ended` is sent only by the host. A daemon error on `turn_ended` causes a kill and respawn, which leaves no approvals.
 
 Smoke check against the real daemon (no GUI is launched by the surface): start the server with `CUA_DISPLAY` set to the private display, then call `list_windows` and `js` with `await (await cua.getApp({windowId})).getAXState()` from any MCP client that supports form elicitation.
@@ -156,18 +163,19 @@ The tests use `test/fake-engine.js`, an NDJSON test double with daemon-side appr
 - Injection boundaries: host-only methods, Node globals, `import()`, strict parameters, `__proto__`, fence escapes in AX text and titles, and calls from finished cells.
 - Timeout and MCP cancellation, proving via the engine log that the pending action never completed. Approval replay after a restart.
 - Sandbox memory limit, the hard kill of an unresponsive sandbox, output caps, and the sandbox process flags and empty environment.
-- Both provider adapters: definitions, coordinate transforms, image limits, batch halting and validation, zoom, extensions, safety checks and key normalization.
+- Held modifiers, press durations, hover and relative moves, mouse buttons, the one-request tree-plus-screenshot, `launchApp`, the clipboard and `cua.help()`.
+- Both provider adapters: definitions, coordinate transforms, image limits, batch halting and validation, zoom, modifiers and click variants, held keys, moves, safety checks and key normalization.
 
 ## Limitations
 
 - Node 22's permission model does not restrict network sockets, so the sandbox process could open sockets if the VM were escaped. The QuickJS VM itself has no network API. For defence in depth against a QuickJS or WASM escape, run the server in a network namespace or container.
 - QuickJS checks for interrupts periodically. Loops dominated by native work (for example huge `String.repeat`) may run until the parent hard-kills the sandbox, and then REPL state is lost and reported. The memory limit counts QuickJS allocations only.
 - Top-level `const` in the REPL becomes a mutable global. Top-level functions are hoisted per cell and published to `globalThis`. ES module syntax (`import`/`export`) is not supported.
-- The contract has no hover, mouse button down/up, key hold, cursor query, or modifier/button/multi-click parameters. The adapters disable or reject these instead of emulating them. `cursor_position` reports the adapter's own record of the last pointer position, not a value queried from the engine.
+- The contract has no separate mouse button down/up across calls and no cursor query. The adapters disable or reject these instead of emulating them. `cursor_position` reports the adapter's own record of the last pointer position, not a value queried from the engine.
 - Adapters treat one window as the screen. Each coordinate is mapped against the most recent screenshot, so if the window is resized between screenshots, coordinates follow the latest one.
 - Elicitation waiting time counts toward the `js` cell timeout and the discrete tool timeout.
 - Unit/contract tests use the fake daemon; `../bench/integration.mjs` exercises the real Rust engine and GTK fixture on an explicitly owned private display. Neither adapter has been tested with live model inference yet.
 
 ### Continuous canvas strokes
 
-`await app.drag({path: [[100,100], [180,100], [180,180], [100,100]]})` sends every segment with the left button held, then releases and settles once. Paths contain 2–256 integer window-local points; `{x,y}` points also work in the JS API. Use a pencil/brush for arbitrary outlines, and inspect a screenshot after a group of strokes. `drag(from, to)` is unchanged. Discrete `drag` accepts `path` instead of `from`/`to`; the OpenAI adapter retains its separate path-simplification policy.
+`await app.drag({path: [[100,100], [180,100], [180,180], [100,100]]})` sends every segment with the left button held, then releases and settles once. Paths contain 2–256 integer window-local points; `{x,y}` points also work in the JS API. Use a pencil/brush for arbitrary outlines, and inspect a screenshot after a group of strokes. `drag(from, to)` is unchanged. Discrete `drag` accepts `path` instead of `from`/`to`; the OpenAI adapter sends a multi-point `drag` path as one continuous stroke.
