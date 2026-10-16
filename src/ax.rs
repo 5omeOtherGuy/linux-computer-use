@@ -10,8 +10,8 @@
 //!   discovery, and the owner's default `/run/user/<uid>/bus` session bus or
 //!   `/run/user/<uid>/at-spi/bus*` accessibility bus are refused.
 //! * Window mapping: registry applications whose D-Bus connection PID equals the
-//!   window PID; their showing top-level children are scored by title and size.
-//!   Ties or insufficient evidence are rejected as ambiguous.
+//!   window PID; their showing top-level children are scored by title, size and
+//!   position. Ties or insufficient evidence are rejected as ambiguous.
 //! * Tree: bulk `org.a11y.atspi.Cache.GetItems` (both current and legacy
 //!   signatures), invalidated by any event from that application, by cache
 //!   signals and by a maximum age. Holes and cache-less applications are filled
@@ -19,10 +19,17 @@
 //! * IDs: stable per window while the same accessible object (bus name, path,
 //!   role) exists. One counter serves the whole daemon session and is never
 //!   reset, so an old ID can never come to mean a different element.
-//! * Actions: only semantic AT-SPI operations. Every action revalidates the
-//!   element live (not defunct, same role and name, still showing, still a
-//!   descendant of the mapped frame, not removed by an event after the
-//!   observation). Nothing ever falls back to synthesized input.
+//! * Actions: every element action revalidates the element live (not defunct,
+//!   same role and name, still showing, still a descendant of the mapped frame,
+//!   not removed by an event after the observation). This module provides the
+//!   semantic operations (actions, values, selection, text insertion) and the
+//!   facts the engine needs to choose input: an element's visible centre, its
+//!   focus and writability, the focused text field. The engine (`main.rs`) then
+//!   clicks visible elements with the pointer instead of DoAction (toolkits run
+//!   DoAction inside the accessibility call, and a handler that opens a modal
+//!   dialog blocks the app), and types key events where no editable text has
+//!   focus, under the checks documented there. A failed semantic operation is
+//!   reported; it never falls back to an arbitrary other action or input.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

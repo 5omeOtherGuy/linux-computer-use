@@ -117,7 +117,9 @@ function init({ memoryLimitMb = 128, stackKb = 1024 }) {
         pending.set(callId, { deferred, evalId: current.id, kind: 'host' });
         send({ type: 'host_call', evalId: current.id, callId, method, params, opts });
       }
-      deferred.settled.then(() => pump());
+      // A failing pump is reported as the sandbox's fatal error with its
+      // stack (parent stderr), not as a bare unhandled rejection.
+      deferred.settled.then(() => pump()).catch((err) => process.emit('uncaughtException', err));
       return deferred.handle;
     });
 
@@ -156,7 +158,9 @@ function init({ memoryLimitMb = 128, stackKb = 1024 }) {
         const timer = setTimeout(() => settleCall(callId, undefined), wait);
         pending.set(callId, { deferred, evalId: current.id, kind: 'sleep', timer });
       }
-      deferred.settled.then(() => pump());
+      // A failing pump is reported as the sandbox's fatal error with its
+      // stack (parent stderr), not as a bare unhandled rejection.
+      deferred.settled.then(() => pump()).catch((err) => process.emit('uncaughtException', err));
       return deferred.handle;
     });
 

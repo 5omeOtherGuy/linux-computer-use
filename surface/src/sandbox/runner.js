@@ -219,7 +219,8 @@ export class SandboxRunner {
         if (appId !== undefined && typeof appId !== 'string') throw new CuaError('invalid_params', 'getApp: appId must be a string');
         const raw = await this.#call(cell, 'list_windows', {});
         if (Array.isArray(raw)) this.#noteWindows(raw);
-        const window = windowId !== undefined ? raw.find((w) => w.window_id === windowId) : mainWindow(raw, appId);
+        const main = windowId !== undefined ? { window: raw.find((w) => w.window_id === windowId), others: [] } : mainWindow(raw, appId);
+        const window = main.window;
         if (!window) {
           const apps = [...new Set(raw.map((w) => String(w.app_id)))].join(', ');
           throw new CuaError('window_not_found', windowId !== undefined
@@ -229,7 +230,23 @@ export class SandboxRunner {
         // The App covers all windows of that process (dialogs included).
         const windows = raw.filter((w) => w.app_id === window.app_id && w.pid === window.pid).map(windowInfo);
         const app = { ...appInfos(windows)[0], windows };
-        if (emit) this.#emitText(cell, fenceUntrusted('app', JSON.stringify(app)));
+        if (emit) {
+          this.#emitText(cell, fenceUntrusted('app', JSON.stringify(app)));
+          if (main.others.length) {
+            const list = main.others.map((o) => `${o.window_id} ${JSON.stringify(String(o.title ?? '')).slice(0, 80)}`).join('; ');
+            this.#emitText(cell, `this is window ${window.window_id}; other main windows of ${window.app_id}: ${fenceUntrusted('windows', list)} (cua.getApp({windowId}) for one of them)`);
+          }
+          // The app's current state comes with it, so a first look needs no
+          // separate getAXState() call.
+          const obs = await this.#call(cell, 'get_ax_state', { window_id: window.window_id, app: true });
+          this.#observed(obs);
+          this.#sawWindow(obs?.window?.window_id, window.window_id);
+          const text = this.host.axView(obs, { diff: true, shortest: true, commit: true });
+          this.#emitText(cell, observationHeader(obs));
+          this.#emitText(cell, fenceUntrusted('accessibility', text));
+          cell.emitted.add(text);
+          cell.shown.add(obs.window.window_id);
+        }
         return { window: windowInfo(window), app };
       }
       case 'ax': {
@@ -238,11 +255,20 @@ export class SandboxRunner {
         this.#observed(obs);
         this.#sawWindow(obs?.window?.window_id, params.window_id);
         const query = typeof opts.query === 'string' && opts.query.trim() ? opts.query.trim() : null;
-        const text = query ? queryTree(obs.accessibility, query) : this.host.axView(obs, { diff: !opts.disableDiffing, commit: emit });
+        let text = query ? queryTree(obs.accessibility, query) : this.host.axView(obs, { diff: !opts.disableDiffing, commit: emit });
+        if (query && text.startsWith('# no element matches')) {
+          // The query searches the observed tree, which may be partial.
+          const cut = (obs.warnings || []).map(String).filter((w) => /truncat|not traversed|not fetched|showing \d|budget|unavailable/i.test(w));
+          if (cut.length) text += ` in the observed part of the tree; the observation was partial (${cut.join('; ').slice(0, 300)}), so the element may exist outside it: scroll, or use a screenshot`;
+        }
+        // Shown already in this cell with no action since (getApp emits the
+        // state): not repeated.
+        if (emit && !query && cell.shown.has(obs.window?.window_id)) return text;
         if (emit) {
           this.#emitText(cell, observationHeader(obs));
           this.#emitText(cell, fenceUntrusted('accessibility', text));
           cell.emitted.add(text);
+          if (!query) cell.shown.add(obs.window?.window_id);
           // The model asked for this view after the last action; the end of
           // the cell adds no second copy of that window's state.
           if (cell.pending?.window?.window_id === obs.window?.window_id) cell.pending = null;
@@ -266,6 +292,7 @@ export class SandboxRunner {
           if (frame !== undefined) params = { ...params, frame_window: frame };
         }
         const obs = await this.#call(cell, method, params);
+        cell.shown.clear();
         this.#observed(obs);
         if (obs && typeof obs === 'object' && obs.window) {
           cell.pending = obs;
@@ -402,6 +429,7 @@ export class SandboxRunner {
         finished: false,
         pending: null,
         emitted: new Set(),
+        shown: new Set(), // windows whose state was emitted since the last action
       };
       this.cell = cell;
       // Backstop: a sandbox that does not report back in time is killed.
@@ -465,10 +493,18 @@ const round = (v) => (typeof v === 'number' ? Math.round(v) : v);
 
 // The app's main window for getApp(appId): matched case-insensitively on the
 // app id; a window that is not a dialog (no WM_TRANSIENT_FOR) wins.
+// The app's main window: the one with the input focus, or the owner of the
+// focused dialog, else the first non-dialog window. `others` are its other
+// main windows (more windows or processes of the same app).
 function mainWindow(raw, appId) {
   const want = String(appId).toLowerCase();
   const mine = raw.filter((w) => String(w.app_id).toLowerCase() === want);
-  return mine.find((w) => !w.transient_for) || mine[0];
+  const mains = mine.filter((w) => !w.transient_for);
+  const focused = mine.find((w) => w.focused);
+  const pick = (focused && (focused.transient_for
+    ? mains.find((m) => m.window_id === focused.transient_for) || mains.find((m) => m.pid === focused.pid)
+    : focused)) || mains[0] || mine[0];
+  return { window: pick, others: mains.filter((m) => m !== pick) };
 }
 
 // Subtrees of an accessibility tree whose lines match `query` (case-

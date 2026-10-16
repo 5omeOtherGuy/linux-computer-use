@@ -4,7 +4,26 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { startClient, sleep, BIN, FAKE_ENGINE } from './helpers.js';
+import { HostApi } from '../src/host.js';
+
+// Minimal engine double for HostApi: windows needing approval until approved.
+function stubEngine(windows) {
+  const approved = new Set();
+  return {
+    approved,
+    async request(method, p) {
+      if (method === 'approve_app') { approved.add(p.window_id); return { approved: true }; }
+      const w = windows.find((x) => x.window_id === p.window_id);
+      if (!approved.has(w.window_id)) {
+        throw Object.assign(new Error('approval required'), { code: 'approval_required', data: { ...w } });
+      }
+      return { window: w, accessibility: '', warnings: [] };
+    },
+  };
+}
 
 const APP = 'const app = await cua.getApp({windowId: 11}, {emit: false});';
 
@@ -55,7 +74,7 @@ describe('MCP surface', () => {
       JSON.stringify([ws.map((w) => Object.keys(w).sort().join('|')), Object.keys(apps[0]).sort(), Object.keys(state).sort(),
         apps[0].windows[0].id, calc.id, calc.windowId, calc.windows[0].app])`);
     assert.equal(r.isError, false, t.text(r));
-    assert.match(t.text(r), /=> \[\["app\|id\|title","app\|id\|title","app\|id\|title","app\|id\|title"\],\["displayName","id","isRunning","windows"\],\["apps","browsers"\],14,"org.example.Calc",12,"org.example.Calc"\]/);
+    assert.match(t.text(r), /=> \[\["app\|id\|title","app\|id\|title","app\|id\|title","app\|id\|title","app\|id\|title","app\|id\|title"\],\["displayName","id","isRunning","windows"\],\["apps","browsers"\],14,"org.example.Calc",12,"org.example.Calc"\]/);
     assert.doesNotMatch(t.text(r), /window_id/);
     // Discovery calls emit their (untrusted) result by default.
     r = await t.js('await cua.listWindows(); await cua.getApp({windowId: 12}); "x"');
@@ -106,6 +125,17 @@ describe('MCP surface', () => {
     // A returned observation that was emitted is not repeated as the value.
     r = await t.js(`const n2 = await cua.getApp({windowId: 11}, {emit: false}); await n2.getAXState({disableDiffing: true})`);
     assert.equal(t.text(r).split('[1] button "OK"').length - 1, 1, t.text(r));
+  });
+
+  test('getApp emits the app state once; prefers the focused main window and names the others', async () => {
+    let r = await t.js(`const two = await cua.getApp("org.example.two"); await two.getAXState(); two.windowId`);
+    assert.equal(r.isError, false, t.text(r));
+    const text = t.text(r);
+    assert.match(text, /=> 16/, 'the focused main window');
+    assert.match(text, /other main windows of org\.example\.Two: <<<UNTRUSTED windows[^]*15 "Two A"/);
+    assert.equal(text.split('[1] button "OK"').length - 1, 1, 'getApp showed the state; getAXState right after does not repeat it');
+    r = await t.js(`const two2 = await cua.getApp("org.example.Two", {emit: false}); "q"`);
+    assert.doesNotMatch(t.text(r), /UNTRUSTED accessibility/);
   });
 
   test('coordinates refer to the window the model last saw, not one an action opened unseen', async () => {
@@ -385,6 +415,38 @@ describe('approval scopes', () => {
       }
     } finally {
       await t.close();
+    }
+  });
+});
+
+describe('approval identity', () => {
+  test('turn and session approvals bind the app ID to its executable', async () => {
+    const windows = [
+      { window_id: 1, app_id: 'Same', title: 'a', executable: '/usr/bin/real' },
+      { window_id: 2, app_id: 'Same', title: 'b', executable: '/usr/bin/real' },
+      { window_id: 3, app_id: 'Same', title: 'c', executable: '/tmp/impostor' },
+    ];
+    const asked = [];
+    const host = new HostApi({ engine: stubEngine(windows), elicit: async (d) => (asked.push(d.window_id), 'session') });
+    for (const window_id of [1, 2, 3]) await host.call('get_ax_state', { window_id });
+    assert.deepEqual(asked, [1, 3], 'same app ID with another executable is asked again');
+  });
+
+  test('an unreadable, malformed or old-format approvals file is ignored, never fatal or overwritten', async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'cua-approvals-'));
+    try {
+      for (const body of ['{not json', JSON.stringify({ always_allowed_app_ids: ['Same'] })]) {
+        const file = path.join(dir, 'approvals.json');
+        writeFileSync(file, body);
+        const logs = [];
+        const host = new HostApi({ engine: stubEngine([{ window_id: 1, app_id: 'Same', title: '', executable: '/usr/bin/real' }]), approvalsFile: file, log: (m) => logs.push(m), elicit: async () => 'always' });
+        assert.match(logs.join('\n'), /ignoring approvals file/);
+        assert.equal(host.store.available, false);
+        await host.call('get_ax_state', { window_id: 1 }); // asked, approved for the session
+        assert.equal(readFileSync(file, 'utf8'), body, 'file left unchanged');
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

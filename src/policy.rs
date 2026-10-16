@@ -13,9 +13,11 @@ pub enum Decision {
 pub struct Policy {
     allow: HashSet<String>,
     deny: HashSet<String>,
-    /// User-approved apps for this turn: (server-verified PID, app ID). An
-    /// approval covers every window of that process and app (dialogs too).
-    approved: HashSet<(u32, String)>,
+    /// User-approved apps for this turn: (server-verified PID, process
+    /// start time, app ID). An approval covers every window of that process
+    /// and app (dialogs too); a new process that reuses the PID does not
+    /// inherit it.
+    approved: HashSet<(u32, u64, String)>,
 }
 
 impl Policy {
@@ -68,7 +70,8 @@ impl Policy {
             return Decision::Denied(reason);
         }
         if self.allow.contains(&w.app_id.to_lowercase())
-            || self.approved.contains(&(w.pid, w.app_id.clone()))
+            || start_time(w.pid)
+                .is_some_and(|t| self.approved.contains(&(w.pid, t, w.app_id.clone())))
         {
             Decision::Allowed
         } else {
@@ -77,12 +80,26 @@ impl Policy {
     }
 
     pub fn approve(&mut self, w: &WindowInfo) {
-        self.approved.insert((w.pid, w.app_id.clone()));
+        if let Some(t) = start_time(w.pid) {
+            self.approved.insert((w.pid, t, w.app_id.clone()));
+        }
     }
 
     pub fn reset(&mut self) {
         self.approved.clear();
     }
+}
+
+/// Start time of a process (clock ticks since boot, /proc/<pid>/stat field
+/// 22), which distinguishes a reused PID.
+fn start_time(pid: u32) -> Option<u64> {
+    parse_start_time(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+fn parse_start_time(stat: &str) -> Option<u64> {
+    // The command name (field 2) may contain spaces and parentheses.
+    let rest = stat.get(stat.rfind(')')? + 2..)?;
+    rest.split(' ').nth(19)?.parse().ok()
 }
 
 /// Executable path of a server-verified PID, for approval records that bind
@@ -192,6 +209,23 @@ mod tests {
         p.reset();
         assert!(!allowed(&p, &w));
     }
+    /// Regression: approval was keyed by (PID, app ID) only, so a new
+    /// process reusing an approved PID with the same WM_CLASS inherited it.
+    #[test]
+    fn approval_is_bound_to_the_process_start_time() {
+        let w = window("Fixture");
+        let mut p = Policy::default();
+        // Approved for an earlier process that had this PID.
+        let now = start_time(w.pid).unwrap();
+        p.approved.insert((w.pid, now + 1, w.app_id.clone()));
+        assert!(!allowed(&p, &w));
+        p.approve(&w);
+        assert!(allowed(&p, &w));
+        let stat = "123 (a b) c) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 4242 99";
+        assert_eq!(parse_start_time(stat), Some(4242));
+        assert_eq!(parse_start_time("garbage"), None);
+    }
+
     /// Regression: an unknown process identity used to skip the executable
     /// hard-deny (fail open) and let an allow-listed app through.
     #[test]

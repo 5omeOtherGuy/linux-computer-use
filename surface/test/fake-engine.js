@@ -22,6 +22,11 @@ const WINDOWS = [
   { window_id: 14, title: 'Save As', app_id: 'org.example.Notes', pid: 101, width: 300, height: 200, transient_for: 11 },
 ];
 WINDOWS.unshift(WINDOWS.pop());
+// Two main windows of one app; the second has the input focus.
+WINDOWS.push(
+  { window_id: 15, title: 'Two A', app_id: 'org.example.Two', pid: 105, width: 100, height: 100 },
+  { window_id: 16, title: 'Two B', app_id: 'org.example.Two', pid: 106, width: 100, height: 100, focused: true },
+);
 const approved = new Set();
 // App-scoped requests act on the app's active window: a click at x=777 in
 // Notes "opens" its Save As dialog (14), Escape closes it.

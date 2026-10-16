@@ -43,6 +43,8 @@ function validateApprovalData(data) {
   return { app_id, window_id, title: typeof title === 'string' ? title : '', executable: executable || null };
 }
 
+const appKey = (data) => JSON.stringify([data.app_id, data.executable ?? null]);
+
 // Persistent "always allow" list:
 //   {"always_allowed": [{"app_id": "Xed", "executable": "/usr/bin/xed"}, ...]}
 // An entry matches only the app ID together with the executable the daemon
@@ -51,28 +53,48 @@ function validateApprovalData(data) {
 // it. It is read once, when the server starts: changes made while a session
 // runs (by the operator, or by a controlled app running as the same user)
 // apply to later sessions only.
+//
+// A file that cannot be read or parsed (including the older
+// {"always_allowed_app_ids": [...]} format, which had no executables) is
+// ignored with a warning: nothing is allowed from it and it is never
+// overwritten, so "always" is not offered until the operator fixes it.
 export class ApprovalStore {
-  constructor(file) {
+  constructor(file, log = () => {}) {
     this.file = file || null;
-    this.entries = this.#read();
+    this.writable = this.file !== null;
+    this.entries = this.#read(log);
   }
 
   get available() {
-    return this.file !== null;
+    return this.writable;
   }
 
-  #read() {
+  #read(log) {
     if (!this.file) return [];
+    const ignore = (why) => {
+      this.writable = false;
+      log(`ignoring approvals file ${this.file}: ${why}; no app is always-allowed this session, and the file is left unchanged`);
+      return [];
+    };
     let raw;
     try {
       raw = readFileSync(this.file, 'utf8');
     } catch (err) {
       if (err.code === 'ENOENT') return [];
-      throw new CuaError('approval_store', `cannot read ${this.file}: ${err.message}`);
+      return ignore(`cannot read it (${err.message})`);
     }
-    const list = JSON.parse(raw)?.always_allowed;
+    let doc;
+    try {
+      doc = JSON.parse(raw);
+    } catch (err) {
+      return ignore(`invalid JSON (${err.message})`);
+    }
+    if (doc && Array.isArray(doc.always_allowed_app_ids) && !doc.always_allowed) {
+      return ignore('it uses the old {"always_allowed_app_ids": [...]} format without executables; replace it with {"always_allowed": [{"app_id": ..., "executable": ...}]}');
+    }
+    const list = doc?.always_allowed;
     const ok = Array.isArray(list) && list.every((e) => e && typeof e.app_id === 'string' && typeof e.executable === 'string');
-    if (!ok) throw new CuaError('approval_store', `${this.file}: always_allowed must be an array of {app_id, executable}`);
+    if (!ok) return ignore('always_allowed must be an array of {app_id, executable}');
     return list.map((e) => ({ app_id: e.app_id, executable: e.executable }));
   }
 
@@ -85,7 +107,7 @@ export class ApprovalStore {
   }
 
   add(appId, executable) {
-    if (!this.file) throw new CuaError('approval_store', 'no approvals file configured');
+    if (!this.writable) throw new CuaError('approval_store', 'no usable approvals file');
     if (!executable) throw new CuaError('approval_store', 'the app\'s executable is unknown; it cannot be allowed permanently');
     if (this.has(appId, executable)) return;
     this.entries.push({ app_id: appId, executable });
@@ -102,7 +124,10 @@ export class HostApi {
     this.policyText = policyText;
     this.elicit = elicit;
     this.log = log;
-    this.store = new ApprovalStore(approvalsFile);
+    this.store = new ApprovalStore(approvalsFile, log);
+    // Keyed by app ID plus the executable of its verified process
+    // (appKey), like the file store: another program claiming the same
+    // WM_CLASS is asked again.
     this.approvedApps = new Set(); // this turn
     this.sessionApps = new Set(); // until the server exits
     this.deniedApps = new Set();
@@ -192,7 +217,8 @@ export class HostApi {
     if (this.deniedApps.has(data.app_id)) {
       throw new CuaError('approval_denied', `the user denied access to app ${data.app_id} for this turn`, { app_id: data.app_id });
     }
-    const known = this.approvedApps.has(data.app_id) || this.sessionApps.has(data.app_id) || this.store.has(data.app_id, data.executable);
+    const key = appKey(data);
+    const known = this.approvedApps.has(key) || this.sessionApps.has(key) || this.store.has(data.app_id, data.executable);
     if (!known) {
       if (!this.elicit) throw new CuaError('approval_unavailable', 'app approval required but no approval channel is configured');
       let decision;
@@ -211,8 +237,8 @@ export class HostApi {
       if (!['turn', 'session', 'always'].includes(decision)) {
         throw new CuaError('approval_denied', `the user did not approve app ${data.app_id} (${decision})`, { app_id: data.app_id });
       }
-      this.approvedApps.add(data.app_id);
-      if (decision !== 'turn') this.sessionApps.add(data.app_id);
+      this.approvedApps.add(key);
+      if (decision !== 'turn') this.sessionApps.add(key);
       if (decision === 'always') {
         try {
           this.store.add(data.app_id, data.executable);
@@ -226,7 +252,8 @@ export class HostApi {
   }
 
   approvals() {
-    return { approved: [...this.approvedApps], session: [...this.sessionApps], always: this.store.list(), denied: [...this.deniedApps] };
+    const ids = (set) => [...set].map((k) => JSON.parse(k)[0]);
+    return { approved: ids(this.approvedApps), session: ids(this.sessionApps), always: this.store.list(), denied: [...this.deniedApps] };
   }
 
   // Accessibility text of an observation for the model: the full tree, or

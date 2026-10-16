@@ -323,7 +323,14 @@ impl Engine {
         if matches!(method, "list_windows" | "list_apps") {
             let wins = self.desktop.list_windows()?;
             self.remember(&wins);
-            return Ok(serde_json::to_value(wins)?);
+            let focused = self.desktop.focused_of(&wins);
+            let mut v = serde_json::to_value(&wins)?;
+            for w in v.as_array_mut().expect("window list") {
+                if focused.is_some_and(|f| w["window_id"] == json!(f)) {
+                    w["focused"] = json!(true);
+                }
+            }
+            return Ok(v);
         }
         let id: u32 = p
             .get("window_id")

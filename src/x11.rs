@@ -1243,26 +1243,8 @@ impl Desktop {
     /// else `preferred`, else its topmost window. `wins` comes from
     /// `app_windows` (stacking order).
     pub fn active_window(&self, wins: &[WindowInfo], preferred: u32) -> Option<WindowInfo> {
-        let ids: HashSet<Window> = wins.iter().map(|w| w.window_id).collect();
-        if let Ok(f) = self
-            .conn
-            .get_input_focus()
-            .map_err(anyhow::Error::from)
-            .and_then(|c| c.reply().map_err(anyhow::Error::from))
-        {
-            let mut cur = f.focus;
-            for _ in 0..16 {
-                if cur == NONE || cur == self.root || cur == 1 {
-                    break;
-                }
-                if ids.contains(&cur) {
-                    return wins.iter().find(|w| w.window_id == cur).cloned();
-                }
-                match self.conn.query_tree(cur).ok().and_then(|c| c.reply().ok()) {
-                    Some(t) => cur = t.parent,
-                    None => break,
-                }
-            }
+        if let Some(f) = self.focused_of(wins) {
+            return wins.iter().find(|w| w.window_id == f).cloned();
         }
         wins.iter()
             .rev()
@@ -1270,6 +1252,23 @@ impl Desktop {
             .or_else(|| wins.iter().find(|w| w.window_id == preferred))
             .or_else(|| wins.last())
             .cloned()
+    }
+
+    /// The window among `wins` that holds (or contains) the input focus.
+    pub fn focused_of(&self, wins: &[WindowInfo]) -> Option<Window> {
+        let ids: HashSet<Window> = wins.iter().map(|w| w.window_id).collect();
+        let f = self.conn.get_input_focus().ok()?.reply().ok()?;
+        let mut cur = f.focus;
+        for _ in 0..16 {
+            if cur == NONE || cur == self.root || cur == 1 {
+                return None;
+            }
+            if ids.contains(&cur) {
+                return Some(cur);
+            }
+            cur = self.conn.query_tree(cur).ok()?.reply().ok()?.parent;
+        }
+        None
     }
 
     // ----- composite tracking ----------------------------------------------
