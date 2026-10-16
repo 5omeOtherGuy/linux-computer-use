@@ -43,6 +43,7 @@ x11rb::atom_manager! {
     Atoms: AtomsCookie {
         _NET_CLIENT_LIST,
         _NET_WM_NAME,
+        _NET_CLIENT_LIST_STACKING,
         UTF8_STRING,
         WM_STATE,
         _LINUX_CUA_TIME,
@@ -52,7 +53,7 @@ x11rb::atom_manager! {
 /// Window description shared with the daemon and policy layer. `pid` is the
 /// X-Resource-verified PID of the client that created the window, or 0 when
 /// the server cannot report it (remote client, missing extension support).
-#[derive(Serialize, Clone, Debug)]
+#[derive(Serialize, Clone, Debug, Default)]
 pub struct WindowInfo {
     pub window_id: u32,
     pub title: String,
@@ -60,22 +61,37 @@ pub struct WindowInfo {
     pub pid: u32,
     pub width: u16,
     pub height: u16,
+    /// WM_TRANSIENT_FOR: the window this dialog belongs to, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transient_for: Option<u32>,
+    /// Root coordinates of the window's origin (converts screen coordinates
+    /// into the window-local ones of the protocol).
+    #[serde(skip)]
+    pub origin: (i32, i32),
 }
 
 /// Explicit live-desktop opt-in (daemon command line only). The display is
-/// not checked against :0, but only windows of allow-listed apps, optionally
-/// restricted to the given server-verified PIDs, are ever listed.
+/// not checked against :0, but only windows of allow-listed apps (WM_CLASS,
+/// which any client can set) whose server-verified process is one of `pids`
+/// or runs one of the executables in `exes` are ever listed.
 #[derive(Clone, Debug, Default)]
 pub struct LiveScope {
     pub apps: HashSet<String>,
     pub pids: HashSet<u32>,
+    pub exes: HashSet<std::path::PathBuf>,
 }
 
 impl LiveScope {
     fn admits(&self, w: &WindowInfo) -> bool {
-        w.pid != 0
-            && self.apps.contains(&w.app_id.to_lowercase())
-            && (self.pids.is_empty() || self.pids.contains(&w.pid))
+        if w.pid == 0 || !self.apps.contains(&w.app_id.to_lowercase()) {
+            return false;
+        }
+        if self.pids.contains(&w.pid) {
+            return true;
+        }
+        !self.exes.is_empty()
+            && std::fs::read_link(format!("/proc/{}/exe", w.pid))
+                .is_ok_and(|exe| self.exes.contains(&exe))
     }
 }
 
@@ -340,11 +356,12 @@ fn named_keysym(name: &str) -> Option<u32> {
         "end" => 0xff57,
         "page_up" | "pageup" | "prior" | "pgup" => 0xff55,
         "page_down" | "pagedown" | "next" | "pgdn" => 0xff56,
-        "left" => 0xff51,
-        "up" => 0xff52,
-        "right" => 0xff53,
-        "down" => 0xff54,
-        "space" => 0x20,
+        "left" | "arrowleft" | "arrow_left" => 0xff51,
+        "up" | "arrowup" | "arrow_up" => 0xff52,
+        "right" | "arrowright" | "arrow_right" => 0xff53,
+        "down" | "arrowdown" | "arrow_down" => 0xff54,
+        "space" | "spacebar" => 0x20,
+        "capslock" | "caps_lock" => 0xffe5,
         "menu" => 0xff67,
         "print" | "printscreen" => 0xff61,
         "pause" => 0xff13,
@@ -429,7 +446,13 @@ fn parse_key_combo(spec: &str) -> Result<(Vec<Modifier>, u32)> {
         if first.is_control() {
             return Err(invalid(format!("unsupported key {key:?}")));
         }
-        let c = first.to_ascii_lowercase();
+        // "A" alone types a capital A; with modifiers ("ctrl+A") the letter
+        // names the key and Shift is only pressed when listed.
+        let c = if mods.is_empty() {
+            first
+        } else {
+            first.to_ascii_lowercase()
+        };
         char_keysym(c).ok_or_else(|| invalid(format!("unsupported key {key:?}")))?
     } else {
         named_keysym(key).ok_or_else(|| invalid(format!("unsupported key name {key:?}")))?
@@ -690,6 +713,8 @@ pub struct Desktop {
     hover: HashMap<Window, Window>,
     settle_target: Option<Window>,
     live: Option<LiveScope>,
+    /// Coordinate input limited to the window area (see `hit_test`).
+    clip_input: bool,
 }
 
 impl Desktop {
@@ -703,9 +728,9 @@ impl Desktop {
     /// server-verified PID is known (and in `scope.pids` when given).
     pub fn connect_live(display: &str, scope: LiveScope) -> Result<Self> {
         display_number(display)?;
-        if scope.apps.is_empty() {
+        if scope.apps.is_empty() || (scope.pids.is_empty() && scope.exes.is_empty()) {
             return Err(invalid(
-                "live desktop mode requires at least one --allow-app",
+                "live desktop mode requires --allow-app and at least one --pid or --allow-exe",
             ));
         }
         Self::connect_inner(display, Some(scope))
@@ -836,6 +861,7 @@ impl Desktop {
             hover: HashMap::new(),
             settle_target: None,
             live,
+            clip_input: true,
         };
         desktop.scan_popups()?;
         Ok(desktop)
@@ -995,11 +1021,31 @@ impl Desktop {
                     .get_property(false, w, a._NET_WM_NAME, a.UTF8_STRING, 0, 4096)?,
                 self.conn
                     .get_property(false, w, AtomEnum::WM_NAME, AtomEnum::ANY, 0, 4096)?,
+                self.conn.get_property(
+                    false,
+                    w,
+                    AtomEnum::WM_TRANSIENT_FOR,
+                    AtomEnum::WINDOW,
+                    0,
+                    1,
+                )?,
+                self.conn.translate_coordinates(w, self.root, 0, 0)?,
             ));
         }
         let owners = self.owners(wins)?;
         let mut out = Vec::new();
-        for ((w, attrs, geom, class, net_name, name), owner) in pending.into_iter().zip(owners) {
+        for ((w, attrs, geom, class, net_name, name, transient, origin), owner) in
+            pending.into_iter().zip(owners)
+        {
+            let origin = origin
+                .reply()
+                .map(|o| (o.dst_x as i32, o.dst_y as i32))
+                .unwrap_or_default();
+            let transient_for = transient
+                .reply()
+                .ok()
+                .and_then(|r| r.value32().and_then(|mut v| v.next()))
+                .filter(|&t| t != NONE && t != w && t != self.root);
             let (Ok(attrs), Ok(geom)) = (attrs.reply(), geom.reply()) else {
                 let _ = (class.reply(), net_name.reply(), name.reply());
                 continue;
@@ -1047,6 +1093,8 @@ impl Desktop {
                 pid: owner.map(|o| o.1).unwrap_or(0),
                 width: geom.width,
                 height: geom.height,
+                transient_for,
+                origin,
             };
             if self.live.as_ref().is_some_and(|l| !l.admits(&info)) {
                 continue;
@@ -1088,6 +1136,76 @@ impl Desktop {
             .ok_or_else(|| xerr("window_not_found", format!("window {id} is not viewable")))
     }
 
+    /// Listed windows of one app: the same server-verified process and app ID
+    /// (main windows, dialogs, other top-levels), in stacking order bottom to
+    /// top when the window manager publishes it.
+    pub fn app_windows(&self, pid: u32, app_id: &str) -> Result<Vec<WindowInfo>> {
+        if pid == 0 {
+            return Ok(Vec::new());
+        }
+        let wins = self.candidates()?;
+        let mut out: Vec<WindowInfo> = self
+            .describe(&wins)?
+            .into_iter()
+            .filter(|w| w.pid == pid && w.app_id == app_id)
+            .collect();
+        let order = self.stacking().unwrap_or(wins);
+        out.sort_by_key(|w| order.iter().position(|&o| o == w.window_id));
+        Ok(out)
+    }
+
+    fn stacking(&self) -> Option<Vec<Window>> {
+        let r = self
+            .conn
+            .get_property(
+                false,
+                self.root,
+                self.atoms._NET_CLIENT_LIST_STACKING,
+                AtomEnum::WINDOW,
+                0,
+                8192,
+            )
+            .ok()?
+            .reply()
+            .ok()?;
+        let v: Vec<Window> = r.value32()?.collect();
+        (!v.is_empty()).then_some(v)
+    }
+
+    /// The window of an app that keys, text and observations go to: the one
+    /// holding the X input focus, else its topmost dialog (WM_TRANSIENT_FOR),
+    /// else `preferred`, else its topmost window. `wins` comes from
+    /// `app_windows` (stacking order).
+    pub fn active_window(&self, wins: &[WindowInfo], preferred: u32) -> Option<WindowInfo> {
+        let ids: HashSet<Window> = wins.iter().map(|w| w.window_id).collect();
+        if let Ok(f) = self
+            .conn
+            .get_input_focus()
+            .map_err(anyhow::Error::from)
+            .and_then(|c| c.reply().map_err(anyhow::Error::from))
+        {
+            let mut cur = f.focus;
+            for _ in 0..16 {
+                if cur == NONE || cur == self.root || cur == 1 {
+                    break;
+                }
+                if ids.contains(&cur) {
+                    return wins.iter().find(|w| w.window_id == cur).cloned();
+                }
+                match self.conn.query_tree(cur).ok().and_then(|c| c.reply().ok()) {
+                    Some(t) => cur = t.parent,
+                    None => break,
+                }
+            }
+        }
+        wins.iter()
+            .rev()
+            .find(|w| w.transient_for.is_some())
+            .or_else(|| wins.iter().find(|w| w.window_id == preferred))
+            .or_else(|| wins.last())
+            .cloned()
+    }
+
     // ----- composite tracking ----------------------------------------------
 
     /// Eagerly redirects and damage-tracks an authorized window, so its
@@ -1117,16 +1235,24 @@ impl Desktop {
         // then already has a backing pixmap. Errors arrive asynchronously.
         self.conn
             .composite_redirect_window(win, composite::Redirect::AUTOMATIC)?;
+        // Empty the damage region before the repaint is requested: with
+        // NON_EMPTY reporting, pending damage would swallow the repaint's notify.
+        self.conn.damage_subtract(damage, NONE, NONE)?;
         // A fresh backing pixmap is initialised from the parent, including
         // pixels of overlapping windows. Exposures make the client repaint
-        // all of it (the redirected window counts as fully visible).
-        self.conn.clear_area(true, win, 0, 0, 0, 0)?;
-        // Empty the damage region now: with NON_EMPTY reporting, damage that
-        // stays pending until the next pump would swallow the repaint's notify.
-        self.conn.damage_subtract(damage, NONE, NONE)?;
-        let geom = self.conn.get_geometry(win)?.reply()?;
-        // Damage at or after this sequence number is the client's repaint.
-        let fence = self.conn.get_input_focus()?.sequence_number();
+        // all of it (the redirected window counts as fully visible). Damage
+        // reported at or after this request's sequence number is that repaint.
+        let fence = self.conn.clear_area(true, win, 0, 0, 0, 0)?.sequence_number();
+        let geom = match self.conn.get_geometry(win)?.reply() {
+            Ok(g) => g,
+            Err(e) => {
+                // Vanished (e.g. a tooltip unmapped and destroyed before we
+                // got here). The server frees the damage with the drawable;
+                // destroying it ourselves is harmless if it already went.
+                let _ = self.conn.damage_destroy(damage);
+                return Err(xerr("window_gone", format!("window {win:#x} is gone: {e}")));
+            }
+        };
         self.tracked.insert(
             win,
             Tracked {
@@ -1352,10 +1478,9 @@ impl Desktop {
     fn capture(&mut self, w: &WindowInfo) -> Result<(u16, u16, Vec<u8>)> {
         let win = w.window_id;
         self.track_window(win, w.pid)?;
-        let popups = self.client_popups(win)?;
-        for &(p, pid) in &popups {
-            self.track_window(p, pid)?;
-        }
+        let mut popups = self.client_popups(win)?;
+        // Popups that vanished since they were mapped are skipped.
+        popups.retain(|&(p, pid)| self.track_window(p, pid).is_ok());
         let mut all: Vec<Window> = popups.iter().map(|p| p.0).collect();
         all.push(win);
         self.await_repaint(&all)?;
@@ -1446,12 +1571,19 @@ impl Desktop {
             }
             Event::MapNotify(e) if e.event == self.root => {
                 if e.override_redirect && e.window != self.helper {
-                    if let Some(owner) = self.owners(&[e.window])?[0] {
+                    // A popup can be unmapped and destroyed before we get
+                    // here; it is then simply gone. Popup tracking never
+                    // fails the pump (input may already have been sent).
+                    if let Some(Some(owner)) =
+                        self.owners(&[e.window]).ok().and_then(|o| o.first().copied())
+                    {
                         self.popups.insert(e.window, owner);
                         // Popups of clients we read are redirected right away.
                         let base = owner.0;
-                        if self.tracked.keys().any(|&w| self.client_base(w) == base) {
-                            self.track_window(e.window, owner.1)?;
+                        if self.tracked.keys().any(|&w| self.client_base(w) == base)
+                            && self.track_window(e.window, owner.1).is_err()
+                        {
+                            self.popups.remove(&e.window);
                         }
                     }
                 }
@@ -1643,8 +1775,10 @@ impl Desktop {
 
     /// Finds the deepest mapped subwindow at a window-local point, looking at
     /// the client's popups (topmost first) before the window itself. Points
-    /// outside both, and subwindows owned by another X client (XEmbed or
-    /// reparented foreign windows), are refused.
+    /// outside the window (the captured area), and subwindows owned by
+    /// another X client (XEmbed or reparented foreign windows), are refused.
+    /// Only `click_element_point` lifts the window clip, for an accessible
+    /// element of a popup that extends beyond the window.
     fn hit_test(&self, info: &WindowInfo, x: i32, y: i32) -> Result<Target> {
         let client = info.window_id;
         let (x16, y16) = (clamp16(x), clamp16(y));
@@ -1653,6 +1787,11 @@ impl Desktop {
             .translate_coordinates(client, self.root, x16, y16)?
             .reply()?;
         let (rdx, rdy) = (r.dst_x as i32 - x, r.dst_y as i32 - y);
+        // Captures show the window area only (popups clipped to it), so
+        // input is limited to the same area.
+        if self.clip_input {
+            check_in_window(x, y, info)?;
+        }
         let mut start = None;
         for (p, _) in self.client_popups(client)?.into_iter().rev() {
             let (Ok(g), Ok(t)) = (
@@ -1964,6 +2103,60 @@ impl Desktop {
         res
     }
 
+    /// Pointer click at the window-local centre of an accessible element,
+    /// which may lie on a popup beyond the window. Used instead of AT-SPI
+    /// DoAction where the toolkit would run a nested main loop inside the
+    /// accessibility call (GTK menu items opening modal dialogs).
+    pub fn click_element_point(&mut self, info: &WindowInfo, x: i32, y: i32) -> Result<()> {
+        self.clip_input = false;
+        let r = self.action(info, "click", &json!({"x": x, "y": y}));
+        self.clip_input = true;
+        r
+    }
+
+    /// Root coordinates of a window's origin.
+    pub fn origin(&self, win: Window) -> Result<(i32, i32)> {
+        let r = self
+            .conn
+            .translate_coordinates(win, self.root, 0, 0)?
+            .reply()?;
+        Ok((r.dst_x as i32, r.dst_y as i32))
+    }
+
+    /// Types text as synthesized key events to the window (fallback when no
+    /// accessible editable text has focus). Every character must be on the
+    /// display's keyboard map; nothing is sent otherwise.
+    pub fn type_keys(&mut self, info: &WindowInfo, text: &str) -> Result<()> {
+        let mut syms = Vec::new();
+        let mut missing = Vec::new();
+        for c in text.chars() {
+            match char_keysym(c).filter(|&s| self.resolve_keysym(s).is_some()) {
+                Some(s) => syms.push(s),
+                None => {
+                    if !missing.contains(&c) {
+                        missing.push(c)
+                    }
+                }
+            }
+        }
+        if !missing.is_empty() {
+            return Err(xerr(
+                "unsupported",
+                format!(
+                    "cannot type {:?} as key events (not on the keyboard map) and no accessible text field has focus",
+                    missing.iter().take(10).collect::<String>()
+                ),
+            ));
+        }
+        let mut time = self.server_time()?;
+        for sym in syms {
+            time = time.wrapping_add(2);
+            self.send_combo(info.window_id, &[], sym, &mut time)?;
+        }
+        self.conn.flush()?;
+        Ok(())
+    }
+
     fn do_click(&mut self, info: &WindowInfo, p: &Value, time: &mut u32) -> Result<()> {
         let (x, y) = point(p, "x", "y")?;
         let button = match p.get("button") {
@@ -2258,6 +2451,8 @@ mod tests {
             pid: 0,
             width: 100,
             height: 50,
+            transient_for: None,
+            origin: (0, 0),
         };
         assert_eq!(
             point(&json!({"x": 10, "y": 49}), "x", "y").unwrap(),

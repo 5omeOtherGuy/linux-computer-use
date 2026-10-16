@@ -24,7 +24,7 @@
 //!   descendant of the mapped frame, not removed by an event after the
 //!   observation). Nothing ever falls back to synthesized input.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -45,7 +45,16 @@ const CALL_TIMEOUT: Duration = Duration::from_millis(1500);
 const BULK_TIMEOUT: Duration = Duration::from_secs(4);
 const ACTION_TIMEOUT: Duration = Duration::from_secs(3);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const SNAPSHOT_BUDGET: Duration = Duration::from_secs(6);
+/// Time budget of one observation; larger trees are returned partially
+/// with a warning.
+const SNAPSHOT_BUDGET: Duration = Duration::from_millis(500);
+/// First call to an application in an observation. An app that does not
+/// answer within it is treated as unresponsive (busy, or blocked in a nested
+/// main loop inside an accessibility call) and skipped for a while.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(300);
+const UNRESPONSIVE_RETRY: Duration = Duration::from_secs(3);
+/// Probe of an app's accessibility connection before key input.
+const KEY_PROBE_TIMEOUT: Duration = Duration::from_millis(150);
 const CACHE_MAX_AGE: Duration = Duration::from_secs(5);
 const TOGGLE_VERIFY: Duration = Duration::from_millis(1000);
 const MAX_TREE_NODES: usize = 4000;
@@ -57,7 +66,6 @@ const MAX_TEXT_CHARS: i32 = 240;
 const MAX_NAME_CHARS: usize = 160;
 const MAX_CHILDREN_LIVE: i32 = 1000;
 const MAX_TOPLEVELS: usize = 64;
-const MAX_DIFF_LINES: usize = 300;
 const MAX_ACTIONS_SHOWN: usize = 8;
 const MAX_INSERT_BYTES: usize = 1 << 20;
 const CONCURRENCY: usize = 24;
@@ -83,7 +91,6 @@ const I_CACHE: &str = "org.a11y.atspi.Cache";
 const I_REGISTRY: &str = "org.a11y.atspi.Registry";
 
 const COORD_SCREEN: u32 = 0;
-const COORD_WINDOW: u32 = 1;
 const SCROLL_ANYWHERE: u32 = 6;
 
 // AtspiStateType bit numbers.
@@ -123,6 +130,7 @@ const R_GLASS_PANE: u32 = 24;
 const R_LAYERED_PANE: u32 = 30;
 const R_LIST: u32 = 31;
 const R_MENU: u32 = 33;
+const R_MENU_ITEM: u32 = 35;
 const R_PANEL: u32 = 39;
 const R_PASSWORD_TEXT: u32 = 40;
 const R_POPUP_MENU: u32 = 41;
@@ -338,10 +346,17 @@ fn is_toggle_role(role: u32) -> bool {
 pub struct AxSnapshot {
     /// Pruned, indented element tree. Each element line starts with `[id]`.
     pub text: String,
-    /// Element-keyed diff against the previous observation of the same window.
-    pub diff: String,
     /// Explicit degradations and failures. Empty `text` always has a warning.
     pub warnings: Vec<String>,
+}
+
+/// Outcome of a semantic text input (`type_text`, `paste`).
+pub enum TextInput {
+    /// Inserted through EditableText; warnings such as a verification mismatch.
+    Inserted(Vec<String>),
+    /// No accessible editable text has focus (the reason); the caller may
+    /// fall back to key events.
+    NoTarget(String),
 }
 
 pub struct Accessibility {
@@ -349,8 +364,12 @@ pub struct Accessibility {
     events: Arc<Mutex<EventLog>>,
     listener: Option<tokio::task::JoinHandle<()>>,
     events_registered: bool,
+    /// Reported with the first observation of the session only.
     setup_warnings: Vec<String>,
     pids: HashMap<String, u32>,
+    /// Application buses that recently failed to answer, until when they
+    /// are skipped.
+    unresponsive: HashMap<String, Instant>,
     caches: HashMap<String, Arc<AppCache>>,
     obs: Observations,
 }
@@ -479,6 +498,8 @@ struct EventLog {
     /// Observations older than this sequence lost removal records to the
     /// hard size bound and must be repeated before acting.
     lost_before: u64,
+    /// Last object of each application that reported gaining focus.
+    focused: HashMap<String, ObjRef>,
 }
 
 const LOG_PRUNE_AT: usize = 20_000;
@@ -540,7 +561,6 @@ struct WindowState {
     elements: HashMap<u32, Elem>,
     valid: bool,
     snap_seq: u64,
-    prev: Option<BTreeMap<u32, String>>,
 }
 
 impl WindowState {
@@ -552,7 +572,6 @@ impl WindowState {
             elements: HashMap::new(),
             valid: false,
             snap_seq: 0,
-            prev: None,
         }
     }
     fn id_for(&mut self, r: &ObjRef, role: u32, next_id: &mut u32) -> u32 {
@@ -620,6 +639,20 @@ impl Observations {
 
     fn reset(&mut self) {
         self.windows.clear();
+    }
+
+    /// The window whose observations issued element `idx` (whether or not
+    /// its latest observation still shows it).
+    fn window_of(&self, idx: u32) -> Option<u32> {
+        self.windows
+            .iter()
+            .find(|(_, ws)| ws.elements.contains_key(&idx))
+            .or_else(|| {
+                self.windows
+                    .iter()
+                    .find(|(_, ws)| ws.ids.values().any(|&(id, _)| id == idx))
+            })
+            .map(|(&w, _)| w)
     }
 
     /// Oldest snapshot sequence a still-usable observation depends on.
@@ -1023,6 +1056,13 @@ fn handle_event(log: &Mutex<EventLog>, msg: &Message) {
             if let Ok((detail, d1, _d2, v)) = parsed {
                 if member == "StateChanged" && detail == "defunct" && d1 == 1 {
                     log.removed.insert(ObjRef::new(&sender, &path), seq);
+                } else if member == "StateChanged" && detail == "focused" {
+                    let r = ObjRef::new(&sender, &path);
+                    if d1 == 1 {
+                        log.focused.insert(sender.clone(), r);
+                    } else if log.focused.get(&sender) == Some(&r) {
+                        log.focused.remove(&sender);
+                    }
                 } else if member == "ChildrenChanged" && detail.starts_with("remove") {
                     if let Ok(w) = <(String, OwnedObjectPath)>::try_from(v) {
                         let r = ObjRef::from_wire(&w);
@@ -1048,7 +1088,10 @@ fn handle_event(log: &Mutex<EventLog>, msg: &Message) {
 impl Accessibility {
     /// Connect to the private accessibility bus, subscribe to invalidation
     /// signals and register for application events.
-    pub async fn connect() -> Result<Self> {
+    /// `first_id` is the first element ID this session issues; the host
+    /// passes one above every ID an earlier daemon issued, so IDs stay unique
+    /// across daemon restarts.
+    pub async fn connect(first_id: u32) -> Result<Self> {
         let mut setup_warnings = Vec::new();
         let addr = resolve_bus_address(&mut setup_warnings).await?;
         let conn = tokio::time::timeout(CONNECT_TIMEOUT, async {
@@ -1167,9 +1210,23 @@ impl Accessibility {
             events_registered: registered,
             setup_warnings,
             pids: HashMap::new(),
+            unresponsive: HashMap::new(),
             caches: HashMap::new(),
-            obs: Observations::default(),
+            obs: Observations {
+                last_id: first_id.saturating_sub(1),
+                windows: HashMap::new(),
+            },
         })
+    }
+
+    /// Highest element ID issued so far in this session.
+    pub fn last_element_id(&self) -> u32 {
+        self.obs.last_id
+    }
+
+    /// Window (among `wins`) holding element `idx`, for app-scoped actions.
+    pub fn window_of_element(&self, idx: u32) -> Option<u32> {
+        self.obs.window_of(idx)
     }
 
     /// Clear observation state (element bindings, diffs and cached trees).
@@ -1235,13 +1292,22 @@ impl Accessibility {
     /// they are returned as warnings with empty `text`.
     pub async fn snapshot(&mut self, window: &WindowInfo) -> Result<AxSnapshot> {
         let deadline = Instant::now() + SNAPSHOT_BUDGET;
-        let mut warnings = self.setup_warnings.clone();
-        match self.snapshot_inner(window, deadline, &mut warnings).await {
-            Ok((text, diff)) => Ok(AxSnapshot {
-                text,
-                diff,
-                warnings,
-            }),
+        let mut warnings = std::mem::take(&mut self.setup_warnings);
+        // The deadline bounds every phase; this is the backstop for calls
+        // that do not take it into account.
+        let r = tokio::time::timeout(
+            SNAPSHOT_BUDGET + PROBE_TIMEOUT,
+            self.snapshot_inner(window, deadline, &mut warnings),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            Err(anyhow!(
+                "observation exceeded its {} ms budget",
+                SNAPSHOT_BUDGET.as_millis()
+            ))
+        });
+        match r {
+            Ok(text) => Ok(AxSnapshot { text, warnings }),
             Err(e) => {
                 if let Some(ws) = self.obs.windows.get_mut(&window.window_id) {
                     ws.valid = false;
@@ -1250,7 +1316,6 @@ impl Accessibility {
                 warnings.push(format!("accessibility tree unavailable: {e:#}"));
                 Ok(AxSnapshot {
                     text: String::new(),
-                    diff: String::new(),
                     warnings,
                 })
             }
@@ -1316,17 +1381,54 @@ impl Accessibility {
                 w.app_id
             );
         }
-        let conn = &self.conn;
         let mut tops: Vec<ObjRef> = Vec::new();
+        let mut blocked = 0;
         for app in &mine {
-            match live_children(conn, app).await {
-                Ok(k) => tops.extend(k.into_iter().take(MAX_TOPLEVELS)),
+            if self
+                .unresponsive
+                .get(&app.bus)
+                .is_some_and(|until| Instant::now() < *until)
+            {
+                blocked += 1;
+                continue;
+            }
+            let kids: Result<Vec<WireRef>> = call_t(
+                &self.conn,
+                app,
+                I_ACC,
+                "GetChildren",
+                &(),
+                PROBE_TIMEOUT,
+            )
+            .await;
+            match kids {
+                Ok(k) => {
+                    self.unresponsive.remove(&app.bus);
+                    tops.extend(
+                        k.iter()
+                            .map(ObjRef::from_wire)
+                            .filter(|k| !k.is_null())
+                            .take(MAX_TOPLEVELS),
+                    )
+                }
+                Err(e) if format!("{e:#}").contains("timed out") => {
+                    self.unresponsive
+                        .insert(app.bus.clone(), Instant::now() + UNRESPONSIVE_RETRY);
+                    blocked += 1;
+                }
                 Err(e) => warnings.push(format!(
                     "could not list top-level objects of {}: {e:#}",
                     app.bus
                 )),
             }
         }
+        if tops.is_empty() && blocked > 0 {
+            bail!(
+                "the app's accessibility interface is not responding (it is busy, or blocked in a modal dialog started from inside an accessibility call); skipped for {} s; pointer input still works, and keys work once the app responds",
+                UNRESPONSIVE_RETRY.as_secs()
+            );
+        }
+        let conn = &self.conn;
         let fetched: Vec<(ObjRef, Result<Node>, Option<Rect>)> = stream::iter(tops)
             .map(|r| async move {
                 let n = fetch_node_live(conn, &r).await;
@@ -1721,7 +1823,7 @@ impl Accessibility {
         w: &WindowInfo,
         deadline: Instant,
         warnings: &mut Vec<String>,
-    ) -> Result<(String, String)> {
+    ) -> Result<String> {
         let snap_seq = self.event_seq();
         self.obs.begin(w);
 
@@ -1744,9 +1846,19 @@ impl Accessibility {
             .filter(|(_, n)| n.has_iface(I_COMPONENT) && has(n.states, S_SHOWING))
             .map(|(r, _)| r.clone())
             .collect();
+        // Screen coordinates relative to the X window's origin: unlike
+        // COORD_WINDOW (relative to each object's own toplevel), this is also
+        // right for menus and other popups.
+        let (ox, oy) = w.origin;
         let rects: HashMap<ObjRef, Rect> = stream::iter(comp)
             .map(|r| async move {
-                let e = extents(conn, &r, COORD_WINDOW).await;
+                let e = extents(conn, &r, COORD_SCREEN).await.map(|e| {
+                    e.map(|e| Rect {
+                        x: e.x - ox,
+                        y: e.y - oy,
+                        ..e
+                    })
+                });
                 (r, e)
             })
             .buffer_unordered(CONCURRENCY)
@@ -1868,57 +1980,147 @@ impl Accessibility {
         }
         warnings.extend(tree.truncated.iter().cloned());
 
-        let current: BTreeMap<u32, String> =
-            lines.iter().map(|(_, id, b)| (*id, b.clone())).collect();
         let ws = obs.windows.get_mut(&w.window_id).expect("window state");
-        let diff = match &ws.prev {
-            None => String::new(),
-            Some(prev) => make_diff(prev, &current),
-        };
-        ws.prev = Some(current);
         ws.elements = elements;
         ws.snap_seq = snap_seq;
         ws.valid = true;
         self.publish_floor();
-        Ok((text, diff))
+        Ok(text)
     }
 
     // -----------------------------------------------------------------------
     // Actions
     // -----------------------------------------------------------------------
 
-    /// Perform a semantic accessibility action. Errors are never converted
-    /// into synthesized input.
+    /// Perform a semantic accessibility action (click, set_value,
+    /// perform_secondary_action). Errors are never converted into
+    /// synthesized input. A window without a current observation, or an
+    /// element issued by an earlier observation of it, is observed first.
     pub async fn action(&mut self, window: &WindowInfo, method: &str, p: &Value) -> Result<()> {
+        let idx = Self::element_index(p).ok();
+        self.ensure_observed(window, idx).await;
         match method {
             "click" => self.do_click(window, p).await,
             "set_value" => self.do_set_value(window, p).await,
-            "type_text" => {
-                let text = p
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow!("type_text requires string `text`"))?;
-                let el = self.focused_editable(window, p).await?;
-                insert_text(&self.conn, &el, text).await
-            }
-            "paste" => {
-                // Inserts the given text; never the display's clipboard, whose
-                // content the model has not seen.
-                let text = p
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow!("paste requires string `text`"))?;
-                let el = self.focused_editable(window, p).await?;
-                insert_text(&self.conn, &el, text).await
-            }
             "perform_secondary_action" => self.do_secondary(window, p).await,
-            "scroll" => {
-                if p.get("element_index").is_some() {
-                    bail!("AT-SPI has no directional scroll; resolve the element with Accessibility::element_point and scroll at that window-local point")
-                }
-                bail!("coordinate scroll is not an accessibility action")
-            }
             other => bail!("accessibility backend does not implement `{other}`"),
+        }
+    }
+
+    /// Inserts `text` at the focused editable text of the window (or the
+    /// given element). `NoTarget` when nothing editable has focus.
+    pub async fn text_input(
+        &mut self,
+        window: &WindowInfo,
+        text: &str,
+        element_index: Option<u32>,
+    ) -> Result<TextInput> {
+        self.ensure_observed(window, element_index).await;
+        let el = match element_index {
+            Some(_) => self.focused_editable(window, element_index).await?,
+            None => match self.focused_editable(window, None).await {
+                Ok(el) => el,
+                Err(e) => return Ok(TextInput::NoTarget(format!("{e:#}"))),
+            },
+        };
+        let mut warnings = Vec::new();
+        if let Some(w) = insert_text(&self.conn, &el, text).await? {
+            warnings.push(w);
+            if let Some(hint) = locale_hint(window.pid, text) {
+                warnings.push(hint);
+            }
+        }
+        Ok(TextInput::Inserted(warnings))
+    }
+
+    /// Screen point to click instead of AT-SPI DoAction, for elements whose
+    /// toolkit action runs inside the accessibility call: GTK menu items
+    /// activate synchronously there, and an item that opens a modal dialog
+    /// (gtk_dialog_run) then blocks the app's accessibility connection, and
+    /// with it all key input, until the dialog closes. A pointer click takes
+    /// the toolkit's normal event path instead. None for other elements.
+    pub async fn pointer_click_point(
+        &mut self,
+        window: &WindowInfo,
+        idx: u32,
+    ) -> Result<Option<(i32, i32)>> {
+        self.ensure_observed(window, Some(idx)).await;
+        let el = self.resolve(window, idx).await?;
+        if !matches!(el.role, R_MENU_ITEM | R_CHECK_MENU_ITEM | R_RADIO_MENU_ITEM)
+            || !el.has_iface(I_COMPONENT)
+        {
+            return Ok(None);
+        }
+        require_enabled(&el, idx)?;
+        let Some(r) = extents(&self.conn, &el.r, COORD_SCREEN).await? else {
+            return Ok(None);
+        };
+        if r.w <= 0 || r.h <= 0 {
+            return Ok(None);
+        }
+        Ok(Some((r.x + r.w / 2, r.y + r.h / 2)))
+    }
+
+    /// Reason not to send key events to the window's app, if any. GTK's
+    /// accessibility bridge makes a synchronous call to the accessibility bus
+    /// for every key event; while the app's connection is blocked inside an
+    /// earlier accessibility call (a modal dialog run from within DoAction),
+    /// that call never returns and the app hangs for good. So an app that
+    /// does not answer a quick probe gets no key events.
+    pub async fn key_input_blocked(&mut self, w: &WindowInfo) -> Option<String> {
+        let bus = self
+            .obs
+            .windows
+            .get(&w.window_id)
+            .filter(|ws| ws.pid == w.pid)
+            .or_else(|| self.obs.windows.values().find(|ws| ws.pid == w.pid && ws.frame.is_some()))
+            .and_then(|ws| ws.frame.as_ref())
+            .map(|f| f.bus.clone())?;
+        let app = ObjRef::new(&bus, REGISTRY_ROOT);
+        let probe: Result<Vec<u32>> =
+            call_t(&self.conn, &app, I_ACC, "GetState", &(), KEY_PROBE_TIMEOUT).await;
+        match probe {
+            Ok(_) => {
+                self.unresponsive.remove(&bus);
+                None
+            }
+            Err(e) if format!("{e:#}").contains("timed out") => {
+                self.unresponsive
+                    .insert(bus, Instant::now() + UNRESPONSIVE_RETRY);
+                Some("the app's accessibility connection is blocked (typically a modal dialog started from inside an accessibility call); key events would deadlock it, so none were sent. Close or answer the dialog with a pointer click on its buttons (coordinates from a screenshot) first".into())
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// Observes the window implicitly when it has no current observation, or
+    /// when `idx` came from an earlier observation of it (its object may
+    /// still be there and keeps its ID).
+    async fn ensure_observed(&mut self, w: &WindowInfo, idx: Option<u32>) {
+        let need = match self.obs.windows.get(&w.window_id) {
+            None => true,
+            Some(ws) => {
+                !ws.valid
+                    || ws.pid != w.pid
+                    || idx.is_some_and(|i| {
+                        !ws.elements.contains_key(&i) && ws.ids.values().any(|&(id, _)| id == i)
+                    })
+            }
+        };
+        if need {
+            let deadline = Instant::now() + SNAPSHOT_BUDGET;
+            let mut ignored = Vec::new();
+            let r = tokio::time::timeout(
+                SNAPSHOT_BUDGET + PROBE_TIMEOUT,
+                self.snapshot_inner(w, deadline, &mut ignored),
+            )
+            .await;
+            if !matches!(r, Ok(Ok(_))) {
+                if let Some(ws) = self.obs.windows.get_mut(&w.window_id) {
+                    ws.valid = false;
+                    ws.elements.clear();
+                }
+            }
         }
     }
 
@@ -1929,13 +2131,19 @@ impl Accessibility {
         window: &WindowInfo,
         element_index: u32,
     ) -> Result<(i32, i32)> {
+        self.ensure_observed(window, Some(element_index)).await;
         let el = self.resolve(window, element_index).await?;
         if !el.has_iface(I_COMPONENT) {
             bail!("element {element_index} has no geometry (no Component interface)");
         }
-        let r = extents(&self.conn, &el.r, COORD_WINDOW)
+        let r = extents(&self.conn, &el.r, COORD_SCREEN)
             .await?
             .ok_or_else(|| anyhow!("element {element_index} reports no geometry"))?;
+        let r = Rect {
+            x: r.x - window.origin.0,
+            y: r.y - window.origin.1,
+            ..r
+        };
         let (ww, wh) = (window.width as i32, window.height as i32);
         if r.w <= 0 || r.h <= 0 {
             bail!("element {element_index} has zero size");
@@ -2009,6 +2217,13 @@ impl Accessibility {
                     bail!("element {idx} was removed after the last observation; observe again");
                 }
             }
+        }
+        if self
+            .unresponsive
+            .get(&el.r.bus)
+            .is_some_and(|until| Instant::now() < *until)
+        {
+            bail!("the app's accessibility interface is not responding; element {idx} cannot be used until it does (pointer input still works)");
         }
         let conn = &self.conn;
         let node = fetch_node_live(conn, &el.r)
@@ -2409,11 +2624,12 @@ impl Accessibility {
         )
     }
 
-    /// Target for text insertion: explicit `element_index`, or the single
-    /// focused editable element of the latest observation (state checked live).
-    async fn focused_editable(&mut self, w: &WindowInfo, p: &Value) -> Result<Elem> {
-        if p.get("element_index").is_some() {
-            let idx = Self::element_index(p)?;
+    /// Target for text insertion: explicit `element_index`; else the object
+    /// that last reported gaining focus, if it is editable text inside the
+    /// window; else the single focused editable element of the latest
+    /// observation (state checked live).
+    async fn focused_editable(&mut self, w: &WindowInfo, element_index: Option<u32>) -> Result<Elem> {
+        if let Some(idx) = element_index {
             let el = self.resolve(w, idx).await?;
             if !el.has_iface(I_EDIT) {
                 bail!(
@@ -2425,17 +2641,42 @@ impl Accessibility {
             require_editable(&el, idx)?;
             return Ok(el);
         }
+        let known = {
+            let ws = self
+                .obs
+                .windows
+                .get(&w.window_id)
+                .filter(|ws| ws.valid && ws.pid == w.pid)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "the accessibility tree of window {} is unavailable",
+                        w.window_id
+                    )
+                })?;
+            let focus_event = ws.frame.as_ref().and_then(|f| {
+                self.events
+                    .lock()
+                    .ok()
+                    .and_then(|l| l.focused.get(&f.bus).cloned())
+            });
+            focus_event.and_then(|r| ws.elements.iter().find(|(_, e)| e.r == r).map(|(i, _)| *i))
+        };
+        if let Some(idx) = known {
+            if let Ok(el) = self.resolve(w, idx).await {
+                if el.has_iface(I_EDIT)
+                    && has(el.states, S_FOCUSED)
+                    && has(el.states, S_EDITABLE)
+                    && !has(el.states, S_READ_ONLY)
+                {
+                    return Ok(el);
+                }
+            }
+        }
         let ws = self
             .obs
             .windows
             .get(&w.window_id)
-            .filter(|ws| ws.valid && ws.pid == w.pid)
-            .ok_or_else(|| {
-                anyhow!(
-                    "no current accessibility observation of window {}",
-                    w.window_id
-                )
-            })?;
+            .expect("checked above");
         let editable: Vec<(u32, ObjRef)> = ws
             .elements
             .iter()
@@ -2465,7 +2706,7 @@ impl Accessibility {
                 require_editable(&el, idx)?;
                 Ok(el)
             }
-            [] => bail!("no focused editable text element in the latest observation; semantic text input unavailable"),
+            [] => bail!("no focused editable text element in the latest observation"),
             many => bail!("{} editable elements report focus; pass element_index", many.len()),
         }
     }
@@ -2694,43 +2935,6 @@ fn render_line(n: &Node, d: Option<&Details>, rect: Option<&Rect>, ww: i32, wh: 
     s
 }
 
-fn make_diff(prev: &BTreeMap<u32, String>, cur: &BTreeMap<u32, String>) -> String {
-    let mut out: Vec<String> = Vec::new();
-    let mut total = 0usize;
-    for (id, line) in cur {
-        match prev.get(id) {
-            None => {
-                total += 1;
-                if out.len() < MAX_DIFF_LINES {
-                    out.push(format!("+ [{id}] {line}"));
-                }
-            }
-            Some(old) if old != line => {
-                total += 1;
-                if out.len() < MAX_DIFF_LINES {
-                    out.push(format!("~ [{id}] {old}\n  -> {line}"));
-                }
-            }
-            _ => {}
-        }
-    }
-    for (id, line) in prev {
-        if !cur.contains_key(id) {
-            total += 1;
-            if out.len() < MAX_DIFF_LINES {
-                out.push(format!("- [{id}] {line}"));
-            }
-        }
-    }
-    if total == 0 {
-        return "(no accessibility changes)".into();
-    }
-    if total > out.len() {
-        out.push(format!("… {} more changes", total - out.len()));
-    }
-    out.join("\n")
-}
-
 // ---------------------------------------------------------------------------
 // Action helpers
 // ---------------------------------------------------------------------------
@@ -2845,12 +3049,15 @@ fn parse_bool(v: &Value) -> Option<bool> {
     }
 }
 
-async fn insert_text(conn: &Connection, el: &Elem, text: &str) -> Result<()> {
+/// Inserts at the caret (replacing a selection). Returns a warning when the
+/// field afterwards does not contain the text as given (the application
+/// reformatted or rejected part of it).
+async fn insert_text(conn: &Connection, el: &Elem, text: &str) -> Result<Option<String>> {
     if !el.has_iface(I_EDIT) || !el.has_iface(I_TEXT) {
         bail!("target is not editable text");
     }
     if text.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     if text.len() > MAX_INSERT_BYTES {
         bail!("text too large ({} bytes)", text.len());
@@ -2901,10 +3108,21 @@ async fn insert_text(conn: &Connection, el: &Elem, text: &str) -> Result<()> {
     )
     .await?;
     if got != text {
-        bail!(
-            "inserted text could not be verified at offset {pos} (found {}); the field may have been modified",
-            quote(&got, 80)
-        );
+        let count: i32 = get_prop(conn, &el.r, I_TEXT, "CharacterCount")
+            .await
+            .unwrap_or(-1);
+        let all: String = if count >= 0 {
+            call(conn, &el.r, I_TEXT, "GetText", &(0i32, count.min(400)))
+                .await
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        return Ok(Some(format!(
+            "the application changed the inserted text: typed {}, the field now contains {}",
+            quote(text, 80),
+            quote(&all, 120)
+        )));
     }
     let _: Result<bool> = call(
         conn,
@@ -2914,7 +3132,52 @@ async fn insert_text(conn: &Connection, el: &Elem, text: &str) -> Result<()> {
         &(pos.saturating_add(n),),
     )
     .await;
-    Ok(())
+    Ok(None)
+}
+
+/// Locales whose decimal separator is a comma (LC_NUMERIC language part).
+const COMMA_DECIMAL: [&str; 30] = [
+    "de", "fr", "es", "it", "nl", "pt", "ru", "pl", "cs", "sk", "da", "fi", "sv", "nb", "nn", "no",
+    "tr", "el", "hu", "ro", "bg", "uk", "hr", "sl", "sr", "lt", "lv", "et", "id", "vi",
+];
+
+/// Hint for a reformatted insertion of a number with '.' decimals in an app
+/// whose locale (from its environment) uses a decimal comma.
+fn locale_hint(pid: u32, text: &str) -> Option<String> {
+    if pid == 0 {
+        return None;
+    }
+    let env = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    let var = |k: &str| {
+        env.split(|&b| b == 0).find_map(|e| {
+            let e = String::from_utf8_lossy(e);
+            e.strip_prefix(&format!("{k}="))
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        })
+    };
+    let locale = var("LC_ALL")
+        .or_else(|| var("LC_NUMERIC"))
+        .or_else(|| var("LANG"))?;
+    decimal_hint(&locale, text)
+}
+
+fn decimal_hint(locale: &str, text: &str) -> Option<String> {
+    let lang = locale.split(['_', '.', '@']).next()?.to_ascii_lowercase();
+    if !COMMA_DECIMAL.contains(&lang.as_str()) {
+        return None;
+    }
+    // The first number with '.' decimals in the text, as an example.
+    let b = text.as_bytes();
+    let dot = (1..b.len().saturating_sub(1))
+        .find(|&i| b[i] == b'.' && b[i - 1].is_ascii_digit() && b[i + 1].is_ascii_digit())?;
+    let start = (0..dot).rev().take_while(|&i| b[i].is_ascii_digit()).last()?;
+    let end = (dot + 1..b.len()).take_while(|&i| b[i].is_ascii_digit()).last()? + 1;
+    let number = &text[start..end];
+    Some(format!(
+        "the app formats numbers for locale {locale}, whose decimal separator is a comma: type {} rather than {number}",
+        number.replace('.', ",")
+    ))
 }
 
 #[cfg(test)]
@@ -2953,7 +3216,7 @@ mod tests {
     #[allow(dead_code)]
     fn futures_are_send(a: &mut Accessibility, w: &WindowInfo, p: &Value) {
         fn is_send<T: Send>(_: T) {}
-        is_send(Accessibility::connect());
+        is_send(Accessibility::connect(1));
         is_send(a.snapshot(w));
         is_send(a.action(w, "click", p));
     }
@@ -2990,6 +3253,8 @@ mod tests {
             pid,
             width: 100,
             height: 100,
+            transient_for: None,
+            origin: (0, 0),
         }
     }
 
@@ -3049,6 +3314,15 @@ mod tests {
     }
 
     #[test]
+    fn decimal_comma_hint() {
+        let h = decimal_hint("de_DE.UTF-8", "125.50+78.25").unwrap();
+        assert!(h.contains("type 125,50 rather than 125.50"), "{h}");
+        assert!(decimal_hint("en_US.UTF-8", "125.50").is_none());
+        assert!(decimal_hint("de_DE.UTF-8", "v1.x and 3.").is_none());
+        assert!(decimal_hint("fr_FR", "x=0.5").unwrap().contains("0,5"));
+    }
+
+    #[test]
     fn removal_log_prunes_only_records_no_observation_needs() {
         let mut log = EventLog::default();
         for i in 0..(LOG_PRUNE_AT as u64 + 10) {
@@ -3061,23 +3335,6 @@ mod tests {
         assert!(log.removed.values().all(|&s| s > 100));
         assert_eq!(log.removed.len(), LOG_PRUNE_AT + 10 - 100);
         assert_eq!(log.lost_before, 0);
-    }
-
-    #[test]
-    fn diff_reports_changes() {
-        let prev: BTreeMap<u32, String> = [(1, "a".to_string()), (2, "b".to_string())].into();
-        let cur: BTreeMap<u32, String> = [
-            (1, "a".to_string()),
-            (2, "c".to_string()),
-            (3, "d".to_string()),
-        ]
-        .into();
-        let d = make_diff(&prev, &cur);
-        assert!(d.contains("~ [2] b\n  -> c"));
-        assert!(d.contains("+ [3] d"));
-        assert_eq!(make_diff(&cur, &cur), "(no accessibility changes)");
-        let d2 = make_diff(&cur, &prev);
-        assert!(d2.contains("- [3] d"));
     }
 
     #[test]

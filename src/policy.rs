@@ -13,7 +13,9 @@ pub enum Decision {
 pub struct Policy {
     allow: HashSet<String>,
     deny: HashSet<String>,
-    approved: HashSet<(u32, u32, String)>,
+    /// User-approved apps for this turn: (server-verified PID, app ID). An
+    /// approval covers every window of that process and app (dialogs too).
+    approved: HashSet<(u32, String)>,
 }
 
 impl Policy {
@@ -66,9 +68,7 @@ impl Policy {
             return Decision::Denied(reason);
         }
         if self.allow.contains(&w.app_id.to_lowercase())
-            || self
-                .approved
-                .contains(&(w.window_id, w.pid, w.app_id.clone()))
+            || self.approved.contains(&(w.pid, w.app_id.clone()))
         {
             Decision::Allowed
         } else {
@@ -77,12 +77,23 @@ impl Policy {
     }
 
     pub fn approve(&mut self, w: &WindowInfo) {
-        self.approved.insert((w.window_id, w.pid, w.app_id.clone()));
+        self.approved.insert((w.pid, w.app_id.clone()));
     }
 
     pub fn reset(&mut self) {
         self.approved.clear();
     }
+}
+
+/// Executable path of a server-verified PID, for approval records that bind
+/// an app ID to the program behind it.
+pub fn executable(pid: u32) -> Option<String> {
+    if pid == 0 {
+        return None;
+    }
+    std::fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
 }
 
 fn forbidden(s: &str) -> bool {
@@ -139,6 +150,8 @@ mod tests {
             title: "Test".into(),
             width: 300,
             height: 200,
+            transient_for: None,
+            origin: (0, 0),
         }
     }
     fn allowed(p: &Policy, w: &WindowInfo) -> bool {
@@ -171,6 +184,11 @@ mod tests {
         let mut replacement = w.clone();
         replacement.pid = 1;
         assert!(!allowed(&p, &replacement));
+        // A dialog of the same process and app is covered by the approval.
+        let mut dialog = w.clone();
+        dialog.window_id = 16;
+        dialog.transient_for = Some(15);
+        assert!(allowed(&p, &dialog));
         p.reset();
         assert!(!allowed(&p, &w));
     }
