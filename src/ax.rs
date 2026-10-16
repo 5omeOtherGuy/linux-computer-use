@@ -167,6 +167,11 @@ const R_SWITCH: u32 = 130;
 const R_ENTRY: u32 = 79;
 const R_SPIN_BUTTON: u32 = 52;
 const R_EDITBAR: u32 = 77;
+const R_DIRECTORY_PANE: u32 = 17;
+const R_ICON: u32 = 26;
+const R_LIST_ITEM: u32 = 32;
+const R_TABLE_CELL: u32 = 56;
+const R_TREE_ITEM: u32 = 91;
 const R_MENU_BAR: u32 = 34;
 const R_PUSH_BUTTON: u32 = 43;
 
@@ -412,6 +417,8 @@ pub struct Accessibility {
     blocked: std::collections::HashSet<String>,
     /// Warnings of the last semantic action (reported, not errors).
     pub action_warnings: Vec<String>,
+    /// Windows already told that their item view exposes no items.
+    view_hinted: std::collections::HashSet<u32>,
     /// Processes already told about their decimal-comma number format.
     numeric_hinted: std::collections::HashSet<u32>,
     caches: HashMap<String, Arc<AppCache>>,
@@ -1333,6 +1340,7 @@ impl Accessibility {
             unresponsive: HashMap::new(),
             blocked: Default::default(),
             numeric_hinted: Default::default(),
+            view_hinted: Default::default(),
             action_warnings: Vec::new(),
             caches: HashMap::new(),
             obs: Observations {
@@ -2222,6 +2230,11 @@ impl Accessibility {
             ));
         }
         warnings.extend(tree.truncated.iter().cloned());
+        if let Some(h) = empty_item_view_hint(&tree) {
+            if self.view_hinted.insert(w.window_id) {
+                warnings.push(h);
+            }
+        }
 
         // Number fields of an app with a decimal-comma locale: say so up
         // front (once per process) rather than after a reformatted input.
@@ -3368,6 +3381,33 @@ fn list_actions(acts: &[(String, String)]) -> String {
         .join(", ")
 }
 
+/// Hint for a showing directory pane without any item objects (icon views
+/// of GTK file managers draw files without accessible children).
+fn empty_item_view_hint(tree: &Tree) -> Option<String> {
+    let item = |n: &Node| matches!(n.role, R_TABLE_CELL | R_LIST_ITEM | R_ICON | R_TREE_ITEM);
+    let pane = tree
+        .nodes
+        .iter()
+        .find(|(_, n)| n.role == R_DIRECTORY_PANE && has(n.states, S_SHOWING))?;
+    let inside = |n: &Node| {
+        let mut cur = n.parent.clone();
+        for _ in 0..MAX_DEPTH {
+            match cur {
+                Some(r) if &r == pane.0 => return true,
+                Some(r) => cur = tree.nodes.get(&r).and_then(|n| n.parent.clone()),
+                None => return false,
+            }
+        }
+        false
+    };
+    let has_items = tree.nodes.values().any(|n| item(n) && inside(n));
+    (!has_items).then(|| format!(
+        "the {} {} exposes no file items to accessibility (an icon view); a list view (in Thunar and Nautilus: Ctrl+2) lists each file as an element you can click, rename (F2) and cut/paste",
+        role_name(pane.1.role),
+        quote(&pane.1.name, 40)
+    ))
+}
+
 /// Screen centre of the part of an element that its ancestors leave
 /// visible (scroll panes and viewports clip their children), up to its
 /// top-level. Menu items are not clipped by their parent menu, whose
@@ -3744,6 +3784,28 @@ mod tests {
         assert!(ws.valid && ws.elements.contains_key(&id));
         obs.begin(&window(9, 2)); // a new owner still starts over
         assert!(obs.windows[&9].elements.is_empty());
+    }
+
+    #[test]
+    fn hint_for_item_views_without_accessible_items() {
+        let node = |role: u32, parent: Option<&ObjRef>| Node {
+            parent: parent.cloned(),
+            child_count: 0,
+            ifaces: vec![],
+            name: "Icon view".into(),
+            role,
+            desc: String::new(),
+            states: 1 << S_SHOWING,
+        };
+        let (frame, pane, cell) = (ObjRef::new(":1.2", "/f"), ObjRef::new(":1.2", "/p"), ObjRef::new(":1.2", "/c"));
+        let mut tree = Tree::default();
+        tree.nodes.insert(frame.clone(), node(R_FRAME, None));
+        tree.nodes.insert(pane.clone(), node(R_DIRECTORY_PANE, Some(&frame)));
+        // A sidebar cell outside the pane does not count.
+        tree.nodes.insert(ObjRef::new(":1.2", "/side"), node(R_TABLE_CELL, Some(&frame)));
+        assert!(empty_item_view_hint(&tree).unwrap().contains("Ctrl+2"));
+        tree.nodes.insert(cell, node(R_TABLE_CELL, Some(&pane)));
+        assert!(empty_item_view_hint(&tree).is_none());
     }
 
     #[test]
