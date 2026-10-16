@@ -61,7 +61,10 @@ describe('real apps', { skip }, () => {
     const { text } = await run(`await x.getScreenshot({emit: false}); await x.pressKey("ctrl+o");
       try { await x.click([300, 200]); "clicked" } catch (e) { e.code }`);
     assert.match(text, /=> input_refused/);
-    await run('await x.pressKey("Escape")');
+    // The cell's final state showed the dialog; after it closed, coordinates
+    // work again once the model has looked at the window.
+    const back = await run(`await x.pressKey("Escape"); await x.getScreenshot({emit: false}); await x.click([300, 200]); await x.scroll([300, 200], "down"); "clicked"`);
+    assert.match(back.text, /=> clicked/, back.text);
   });
 
   test('confirm keys in a dialog that stays open do not wait for it to close; closes still land', async () => {

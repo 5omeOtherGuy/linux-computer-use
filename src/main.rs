@@ -539,13 +539,17 @@ impl Engine {
                 let o = params.as_object_mut().unwrap();
                 o.remove("element_index");
                 o.remove("app");
+                o.remove("frame_window");
                 params["x"] = json!(x);
                 params["y"] = json!(y);
                 self.desktop.action(&w, method, &params)?;
             }
             _ => {
+                // `app` and `frame_window` were resolved into `w` above.
                 let mut params = r.params.clone();
-                params.as_object_mut().unwrap().remove("app");
+                let o = params.as_object_mut().unwrap();
+                o.remove("app");
+                o.remove("frame_window");
                 params["window_id"] = json!(w.window_id);
                 self.desktop.action(&w, method, &params)?;
             }
