@@ -327,7 +327,7 @@ impl Engine {
                 let ax = self.ax.as_mut().context(
                     "Accessibility unavailable: element actions require an isolated AT-SPI bus",
                 )?;
-                let key_entry = match (method, element, p["value"].as_str()) {
+                let key_entry = match (method, element, p.get("value").and_then(Value::as_str)) {
                     ("set_value", Some(idx), Some(text)) => ax
                         .key_entry_point(&w, idx)
                         .await?
