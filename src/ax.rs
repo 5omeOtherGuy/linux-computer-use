@@ -417,10 +417,6 @@ pub struct Accessibility {
     blocked: std::collections::HashSet<String>,
     /// Warnings of the last semantic action (reported, not errors).
     pub action_warnings: Vec<String>,
-    /// Windows already told that their item view exposes no items.
-    view_hinted: std::collections::HashSet<u32>,
-    /// Processes already told about their decimal-comma number format.
-    numeric_hinted: std::collections::HashSet<u32>,
     caches: HashMap<String, Arc<AppCache>>,
     obs: Observations,
 }
@@ -1339,8 +1335,6 @@ impl Accessibility {
             pids: HashMap::new(),
             unresponsive: HashMap::new(),
             blocked: Default::default(),
-            numeric_hinted: Default::default(),
-            view_hinted: Default::default(),
             action_warnings: Vec::new(),
             caches: HashMap::new(),
             obs: Observations {
@@ -2230,19 +2224,17 @@ impl Accessibility {
             ));
         }
         warnings.extend(tree.truncated.iter().cloned());
+        // Hints ("hint: " prefix) are repeated on every observation; the
+        // host shows each one once, when the model actually receives it.
         if let Some(h) = empty_item_view_hint(&tree) {
-            if self.view_hinted.insert(w.window_id) {
-                warnings.push(h);
-            }
+            warnings.push(format!("hint: {h}"));
         }
 
         // Number fields of an app with a decimal-comma locale: say so up
         // front (once per process) rather than after a reformatted input.
-        if elements.values().any(|e| matches!(e.role, R_SPIN_BUTTON | R_EDITBAR))
-            && self.numeric_hinted.insert(w.pid)
-        {
+        if elements.values().any(|e| matches!(e.role, R_SPIN_BUTTON | R_EDITBAR)) {
             if let Some(h) = numeric_locale(w.pid).and_then(|l| decimal_hint(&l, "125.50")) {
-                warnings.push(format!("number input: {}", h.replace("type 125,50 rather than 125.50", "type numbers like 125,50, not 125.50")));
+                warnings.push(format!("hint: number input: {}", h.replace("type 125,50 rather than 125.50", "type numbers like 125,50, not 125.50")));
             }
         }
         let obs = &mut self.obs;

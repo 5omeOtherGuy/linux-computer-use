@@ -56,6 +56,20 @@ export class SandboxRunner {
     // implicit post-action observation showed. appKey -> window id.
     this.frames = new Map();
     this.windowApp = new Map(); // window id -> appKey
+    this.hintsShown = new Set();
+  }
+
+  // An observation as the model receives it: engine hints ("hint: ...",
+  // repeated on every observation) are shown once per session.
+  #visible(obs) {
+    if (!Array.isArray(obs?.warnings)) return obs;
+    const warnings = obs.warnings.map(String).filter((w) => {
+      if (!w.startsWith('hint: ')) return true;
+      if (this.hintsShown.has(w)) return false;
+      this.hintsShown.add(w);
+      return true;
+    });
+    return { ...obs, warnings };
   }
 
   #noteWindows(windows) {
@@ -242,7 +256,7 @@ export class SandboxRunner {
           this.#observed(obs);
           this.#sawWindow(obs?.window?.window_id, window.window_id);
           const text = this.host.axView(obs, { diff: true, shortest: true, commit: true });
-          this.#emitText(cell, observationHeader(obs));
+          this.#emitText(cell, observationHeader(this.#visible(obs)));
           this.#emitText(cell, fenceUntrusted('accessibility', text));
           cell.emitted.add(text);
           cell.shown.add(obs.window.window_id);
@@ -265,7 +279,7 @@ export class SandboxRunner {
         // state): not repeated.
         if (emit && !query && cell.shown.has(obs.window?.window_id)) return text;
         if (emit) {
-          this.#emitText(cell, observationHeader(obs));
+          this.#emitText(cell, observationHeader(this.#visible(obs)));
           this.#emitText(cell, fenceUntrusted('accessibility', text));
           cell.emitted.add(text);
           if (!query) cell.shown.add(obs.window?.window_id);
@@ -298,8 +312,9 @@ export class SandboxRunner {
           cell.pending = obs;
           cell.pendingTarget = params.app ? { window_id: params.window_id, app: true } : { window_id: obs.window.window_id };
         }
-        if (Array.isArray(obs?.warnings) && obs.warnings.length) {
-          this.#emitText(cell, `warnings after ${method}: ${fenceUntrusted('warnings', obs.warnings.map(String).join('\n'))}`);
+        const shown = this.#visible(obs)?.warnings;
+        if (Array.isArray(shown) && shown.length) {
+          this.#emitText(cell, `warnings after ${method}: ${fenceUntrusted('warnings', shown.join('\n'))}`);
         }
         return undefined;
       }
@@ -377,7 +392,7 @@ export class SandboxRunner {
     let observation;
     if (cell.pending) {
       const obs = cell.pending;
-      observation = { header: observationHeader(obs), accessibility: this.host.axView(obs, { diff: true, shortest: true, commit: true }) };
+      observation = { header: observationHeader(this.#visible(obs)), accessibility: this.host.axView(obs, { diff: true, shortest: true, commit: true }) };
       // The end-of-cell state is what the model sees next.
       this.#observed(obs);
       this.#sawWindow(obs.window?.window_id, obs.window?.window_id);
