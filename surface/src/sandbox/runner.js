@@ -28,7 +28,7 @@ const MAX_HELD_IMAGE_CHARS = 64_000_000;
 const MAX_CELL_IMAGES = 16;
 const STDERR_TAIL = 4000;
 const MAX_EMITTED_IMAGE_CHARS = 16_000_000;
-const VIEWS = ['windows', 'apps', 'state', 'getApp', 'ax', 'screenshot', 'action', 'launch', 'clipboard'];
+const VIEWS = ['windows', 'apps', 'state', 'getApp', 'ax', 'elements', 'screenshot', 'action', 'launch', 'clipboard'];
 // Actions whose target window depends on what the model last saw.
 const FRAMED = ['click', 'drag', 'scroll', 'type_text', 'paste', 'mouse_move'];
 const ACTIONS = ['click', 'drag', 'scroll', 'type_text', 'press_key', 'paste', 'set_value', 'perform_secondary_action', 'mouse_move'];
@@ -303,6 +303,16 @@ export class SandboxRunner {
         }
         return value;
       }
+      case 'elements': {
+        // The app's current elements for locators and app.find(), parsed from
+        // a fresh observation. The model does not see it, so it neither sets
+        // the coordinate frame nor becomes the base of the next diff.
+        if (method !== 'get_ax_state') throw new CuaError('invalid_params', 'method does not match view');
+        const obs = await this.#call(cell, method, params);
+        this.#observed(obs);
+        const partial = (obs.warnings || []).map(String).some((w) => /truncat|not traversed|not fetched|showing \d|budget|unavailable/i.test(w));
+        return { window_id: obs.window?.window_id, partial, elements: parseTree(obs.accessibility) };
+      }
       case 'launch': {
         if (method !== 'launch_app') throw new CuaError('invalid_params', 'method does not match view');
         const r = await this.#call(cell, method, params);
@@ -564,6 +574,58 @@ function mainWindow(raw, appId) {
     ? mains.find((m) => m.window_id === focused.transient_for) || mains.find((m) => m.pid === focused.pid)
     : focused)) || mains[0] || mine[0];
   return { window: pick, others: mains.filter((m) => m !== pick) };
+}
+
+// The elements of an accessibility tree as the engine renders them:
+// `[id] role "name" (states) desc="…" value=… text="…" @x,y wxh actions=[…]`.
+export function parseTree(text) {
+  const out = [];
+  for (const line of String(text ?? '').split('\n')) {
+    const m = /^(\s*)\[(\d+)\] (.*)$/.exec(line);
+    if (!m) continue;
+    const rest = m[3];
+    const r = /^(.*?)(?= "| \(| desc=| value=| text=| @-?\d| actions=\[|$)/.exec(rest);
+    const el = { id: Number(m[2]), role: r[1].trim(), name: '', states: [], depth: m[1].length / 2 };
+    let i = r[1].length;
+    const str = () => {
+      // A JSON string starting at i.
+      let j = i + 1;
+      while (j < rest.length && rest[j] !== '"') j += rest[j] === '\\' ? 2 : 1;
+      let v;
+      try { v = JSON.parse(rest.slice(i, j + 1)); } catch { v = rest.slice(i + 1, j); }
+      i = j + 1;
+      return v;
+    };
+    let keyed = false;
+    while (i < rest.length) {
+      if (rest[i] === ' ') { i++; continue; }
+      const s = rest.slice(i);
+      if (s[0] === '"' && !keyed && !el.name) el.name = str();
+      else if (s[0] === '(') {
+        const j = rest.indexOf(')', i);
+        const inner = rest.slice(i + 1, j < 0 ? rest.length : j);
+        if (!keyed && el.states.length === 0) el.states = inner.split(', ').filter(Boolean);
+        else if (inner === 'outside window') el.outside = true;
+        i = j < 0 ? rest.length : j + 1;
+      } else if (s.startsWith('desc="')) { i += 5; el.desc = str(); keyed = true; }
+      else if (s.startsWith('text="')) { i += 5; el.text = str(); keyed = true; }
+      else if (s.startsWith('actions=[')) {
+        const j = rest.indexOf(']', i);
+        el.actions = rest.slice(i + 9, j < 0 ? rest.length : j).split(', ').filter(Boolean);
+        i = j < 0 ? rest.length : j + 1;
+        keyed = true;
+      } else {
+        const p = /^@(-?\d+),(-?\d+) (\d+)x(\d+)/.exec(s);
+        const j = rest.indexOf(' ', i);
+        const word = rest.slice(i, j < 0 ? rest.length : j);
+        if (p) { el.rect = [+p[1], +p[2], +p[3], +p[4]]; i += p[0].length; }
+        else { if (word.startsWith('value=')) el.value = word.slice(6); i = j < 0 ? rest.length : j; }
+        keyed = true;
+      }
+    }
+    out.push(el);
+  }
+  return out;
 }
 
 // Subtrees of an accessibility tree whose lines match `query` (case-

@@ -128,6 +128,24 @@ describe('MCP surface', () => {
       ['set_value', { window_id: 11, app: true, element_index: 3, value: '5', observe: false }],
       ['scroll', { window_id: 11, app: true, x: 1, y: 2, direction: 'up', pixels: 300, frame_window: 11, observe: false }],
     ]);
+    // Locators: role spellings, exact names before partial ones, regexes,
+    // text across name/description/value, the object forms.
+    r = await t.js(`const loc = await cua.getApp({windowId: 11}, {emit: false});
+      await loc.click({role: "push button", name: "ok"}); await loc.setValue({role: "text", name: /^ignore/i}, "v");
+      await loc.setValue({text: "previous instructions", value: "w"}); await loc.performSecondaryAction({role: "button", name: "OK", action: "activate"});
+      JSON.stringify((await loc.find({role: "textbox"})).map((e) => [e.id, e.role]))`);
+    assert.equal(r.isError, false, t.text(r));
+    assert.match(t.text(r), /=> \[\[2,"text"\],\[3,"entry"\]\]/);
+    assert.deepEqual(t.performed().slice(-4).map((e) => [e.method, e.params.element_index, e.params.frame_window]), [
+      ['click', 1, undefined], ['set_value', 2, undefined], ['set_value', 2, undefined], ['perform_secondary_action', 1, undefined],
+    ]);
+    // No match or several matches: nothing reaches the engine; the error lists the candidates.
+    const before = t.performed().length;
+    r = await t.js('await loc.click({role: "button", name: "Cancel"})');
+    assert.match(t.text(r), /no element matches \{ "role": "button", "name": "Cancel" \}.*\[element_not_found\]/s);
+    r = await t.js('await loc.click({role: "text"})');
+    assert.match(t.text(r), /2 elements match .*\[2\] text .*\[3\] entry.*\[ambiguous_element\]/s);
+    assert.equal(t.performed().length, before);
     // A returned observation that was emitted is not repeated as the value.
     r = await t.js(`const n2 = await cua.getApp({windowId: 11}, {emit: false}); await n2.getAXState({disableDiffing: true})`);
     assert.equal(t.text(r).split('[1] button "OK"').length - 1, 1, t.text(r));

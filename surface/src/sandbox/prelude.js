@@ -133,7 +133,10 @@ export function preludeSource() {
   const ELEMENT_KEYS = ['element', 'elementId', 'elementIndex', 'element_index', 'index'];
   const elementOf = (o) => { for (const k of ELEMENT_KEYS) if (o[k] !== undefined) return o[k]; return undefined; };
   const pointOf = (o) => (o.x !== undefined || o.y !== undefined) ? [o.x, o.y] : undefined;
-  // Element ID, [x, y], {x, y} or {element}.
+  // A locator names an element instead of numbering it: {role, name, text, states}.
+  const LOCATOR_KEYS = ['role', 'name', 'text', 'states'];
+  const isLocator = (t) => isObj(t) && elementOf(t) === undefined && pointOf(t) === undefined && LOCATOR_KEYS.some((k) => t[k] !== undefined);
+  // Element ID, [x, y], {x, y}, {element} or a locator.
   const at = (t, what) => {
     if (Number.isInteger(t)) return { element_index: t };
     if (typeof t === 'string' && /^\\d+$/.test(t)) return { element_index: Number(t) };
@@ -143,9 +146,55 @@ export function preludeSource() {
       if (e !== undefined) return at(e, what);
       const p = pointOf(t);
       if (p) return { x: p[0], y: p[1] };
+      if (isLocator(t)) return { locator: pick(t, LOCATOR_KEYS) };
     }
-    throw new CuaError('invalid_params', what + ': target must be an element ID, [x, y], {x, y} or {element}');
+    throw new CuaError('invalid_params', what + ': target must be an element ID, [x, y], {x, y}, {element} or {role, name}');
   };
+  const elementRef = (e) => isLocator(e) ? { locator: pick(e, LOCATOR_KEYS) } : { element_index: e };
+
+  // Role spellings models use for the engine's AT-SPI role names.
+  const ROLE_GROUPS = [
+    ['button', 'push button', 'pushbutton', 'toggle button', 'push button menu'],
+    ['text', 'entry', 'password text', 'textbox', 'text box', 'textfield', 'text field', 'edit', 'input', 'textarea', 'searchbox', 'search box'],
+    ['check box', 'checkbox', 'switch'],
+    ['radio button', 'radio', 'radiobutton'],
+    ['menu item', 'menuitem', 'check menu item', 'radio menu item'],
+    ['combo box', 'combobox', 'dropdown', 'select'],
+    ['list item', 'listitem', 'option'],
+    ['page tab', 'tab'],
+    ['table cell', 'cell', 'gridcell'],
+    ['tree item', 'treeitem'],
+  ];
+  const roleKey = (r) => {
+    const s = String(r).toLowerCase().replace(/[_-]/g, ' ').replace(/\\s+/g, ' ').trim();
+    const g = ROLE_GROUPS.findIndex((grp) => grp.includes(s));
+    return g < 0 ? s : 'group' + g;
+  };
+  const norm = (s) => String(s ?? '').replace(/\\s+/g, ' ').trim().toLowerCase();
+  const LOCATOR_FIELDS = (el) => [el.name, el.desc, el.text, el.value];
+  // Matching elements, exact name matches before partial ones.
+  const matchElements = (elements, loc) => {
+    for (const k of Object.keys(loc)) if (!LOCATOR_KEYS.includes(k)) throw new CuaError('invalid_params', 'locator: unknown key ' + k + ' (use role, name, text, states)');
+    const test = (pattern, value, exact) => pattern instanceof RegExp
+      ? (pattern.lastIndex = 0, pattern.test(String(value ?? '')))
+      : exact ? norm(value) === norm(pattern) : norm(value).includes(norm(pattern));
+    let found = elements;
+    if (loc.role !== undefined) { const r = roleKey(loc.role); found = found.filter((el) => roleKey(el.role) === r); }
+    if (loc.states !== undefined) {
+      const want = (Array.isArray(loc.states) ? loc.states : [loc.states]).map(norm);
+      found = found.filter((el) => want.every((s) => el.states.includes(s)));
+    }
+    if (loc.text !== undefined) found = found.filter((el) => LOCATOR_FIELDS(el).some((v) => v !== undefined && test(loc.text, v, false)));
+    if (loc.name !== undefined) {
+      const exact = found.filter((el) => test(loc.name, el.name, true));
+      found = exact.length || loc.name instanceof RegExp ? exact : found.filter((el) => test(loc.name, el.name, false));
+    }
+    return found;
+  };
+  const describeLocator = (loc) => fmt(Object.fromEntries(Object.entries(loc).map(([k, v]) => [k, v instanceof RegExp ? String(v) : v]))).replace(/\\s+/g, ' ');
+  const describeElement = (el) => '[' + el.id + '] ' + el.role + (el.name ? ' ' + JSON.stringify(el.name.slice(0, 60)) : '') + (el.states.length ? ' (' + el.states.join(', ') + ')' : '');
+  // Locators wait this long for their element (a dialog still being built).
+  const LOCATOR_WAIT_MS = 1000;
   const pick = (o, keys) => { const out = {}; for (const k of keys) if (o[k] !== undefined) out[k] = o[k]; return out; };
   const keyName = (k) => {
     if (Array.isArray(k)) k = k.join('+');
@@ -172,7 +221,32 @@ export function preludeSource() {
   // An App object for a window the host resolved ({window, app}).
   const makeApp = (info) => {
     const window_id = info.window.id;
-    const act = (method, params) => call(method, Object.assign({ window_id, app: true }, params), 'action').then(() => undefined);
+    // Matches of a locator in the app's current window, waiting up to waitMs
+    // for at least one.
+    const findAll = async (loc, waitMs) => {
+      const until = Date.now() + waitMs;
+      for (;;) {
+        const r = await call('get_ax_state', { window_id, app: true }, 'elements');
+        const found = matchElements(r.elements, loc);
+        if (found.length || Date.now() >= until) return { found, partial: r.partial };
+        await nativeSleep(150);
+      }
+    };
+    const resolve = async (loc, what) => {
+      const { found, partial } = await findAll(loc, LOCATOR_WAIT_MS);
+      if (found.length === 1) return found[0].id;
+      if (found.length === 0) {
+        throw new CuaError('element_not_found', what + ': no element matches ' + describeLocator(loc) + ' in the app\\'s active window' + (partial ? ' (the observation was partial)' : ''));
+      }
+      throw new CuaError('ambiguous_element', what + ': ' + found.length + ' elements match ' + describeLocator(loc) + ': ' + found.slice(0, 8).map(describeElement).join('; ') + (found.length > 8 ? '; …' : '') + '. Add role, name or text, or use an ID');
+    };
+    const act = async (method, params) => {
+      if (params.locator !== undefined) {
+        const { locator, ...rest } = params;
+        params = Object.assign(rest, { element_index: await resolve(locator, method) });
+      }
+      await call(method, Object.assign({ window_id, app: true }, params), 'action');
+    };
     const obs = (method, view, opts) => call(method, { window_id, app: true }, view, opts);
     const axOptions = (o, what) => {
       o = options(o, ['emit', 'disableDiffing', 'query'], what);
@@ -195,6 +269,13 @@ export function preludeSource() {
       getScreenshot(o = {}) {
         o = options(o, ['emit'], 'getScreenshot');
         return obs('get_screenshot', 'screenshot', emitOpt(o));
+      },
+      // find({role, name, text, states}): matching elements of the app's active
+      // window as [{id, role, name, states, ...}], without showing them.
+      async find(loc, o = {}) {
+        if (!isObj(loc) || !LOCATOR_KEYS.some((k) => loc[k] !== undefined)) throw new CuaError('invalid_params', 'find expects a locator such as {role: "button", name: "Save"}');
+        o = options(o, ['timeoutMs'], 'find');
+        return (await findAll(loc, Math.max(0, Number(o.timeoutMs) || 0))).found;
       },
       // One engine request for the tree and the screenshot: {state, screenshot}.
       getAXStateAndScreenshot(o = {}) {
@@ -296,14 +377,22 @@ export function preludeSource() {
         if (o.format && o.format !== 'text') throw new CuaError('unsupported', 'Only plain-text paste is supported');
         return act('paste', { text });
       },
-      // setValue(element, value) or setValue({element, value})
+      // setValue(element | locator, value), setValue({element, value}) or setValue({role, name, value})
       setValue(element, value) {
-        if (isObj(element) && value === undefined) { value = element.value; element = elementOf(element); }
-        return act('set_value', { element_index: element, value: typeof value === 'number' || typeof value === 'boolean' ? String(value) : value });
+        if (isObj(element) && value === undefined) {
+          value = element.value;
+          if (elementOf(element) !== undefined) element = elementOf(element);
+          else { const { value: _, ...loc } = element; element = loc; }
+        }
+        return act('set_value', Object.assign(elementRef(element), { value: typeof value === 'number' || typeof value === 'boolean' ? String(value) : value }));
       },
+      // performSecondaryAction(element | locator, action), ({element, action}) or ({role, name, action})
       performSecondaryAction(element, action) {
-        if (isObj(element) && action === undefined) { action = element.action ?? element.name; element = elementOf(element); }
-        return act('perform_secondary_action', { element_index: element, action });
+        if (isObj(element) && action === undefined) {
+          if (elementOf(element) !== undefined) { action = element.action ?? element.name; element = elementOf(element); }
+          else { const { action: a, ...loc } = element; action = a; element = loc; }
+        }
+        return act('perform_secondary_action', Object.assign(elementRef(element), { action }));
       },
     });
     return app;

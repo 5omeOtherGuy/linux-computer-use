@@ -69,6 +69,19 @@ describe('real apps', { skip }, () => {
     assert.match(back.text, /=> clicked/, back.text);
   });
 
+  // Regression: the shortcut returned after ~50 ms (the main window's own
+  // redraw counted as the reaction) while the Save dialog showed after
+  // ~300 ms, so the next action of the cell reached the main window.
+  test('a locator right after a shortcut acts in the dialog the shortcut opened', async () => {
+    const { r, text } = await run(`await x.pressKey("ctrl+shift+s");
+      const [f] = await x.find({role: "text", states: ["focused"]});
+      const top = (await x.getAXState({emit: false, disableDiffing: true})).split("\\n")[1];
+      await x.click({role: "button", name: "Cancel"});
+      [f && f.text, /file chooser/.test(top), (await cua.listWindows({emit: false})).filter((w) => w.title === "Save As…").length].join()`);
+    assert.equal(r.isError, false, text);
+    assert.match(text, /=> note\.txt,true,0/);
+  });
+
   test('confirm keys in a dialog that stays open do not wait for it to close; closes still land', async () => {
     let { text } = await run(`await x.pressKey("ctrl+o"); await x.pressKey("ctrl+l"); await x.typeText(${JSON.stringify(dir + '/')});
       const t0 = Date.now(); await x.pressKey("Return");
