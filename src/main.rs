@@ -322,7 +322,7 @@ impl Engine {
                     "button",
                     "click_count",
                 ],
-                "drag" => &["window_id", "app", "frame_window", "observe", "from", "to"],
+                "drag" => &["window_id", "app", "frame_window", "observe", "from", "to", "path"],
                 "scroll" => &[
                     "window_id",
                     "app",

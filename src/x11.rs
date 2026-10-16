@@ -2292,7 +2292,7 @@ impl Desktop {
     pub fn action(&mut self, info: &WindowInfo, method: &str, p: &Value) -> Result<()> {
         let allowed: &[&str] = match method {
             "click" => &["window_id", "x", "y", "button", "click_count"],
-            "drag" => &["window_id", "from", "to"],
+            "drag" => &["window_id", "from", "to", "path"],
             "scroll" => &["window_id", "x", "y", "direction", "pixels"],
             "press_key" => &["window_id", "key"],
             other => {
@@ -2413,13 +2413,24 @@ impl Desktop {
     }
 
     fn do_drag(&mut self, info: &WindowInfo, p: &Value, time: &mut u32) -> Result<()> {
-        let (x0, y0) = pair(p, "from")?;
-        let (x1, y1) = pair(p, "to")?;
-        // The end point must lie on the window or one of its popups too.
-        self.hit_test(info, x1, y1, HitArea::Window)?;
+        let points = drag_points(p)?;
+        // Validate the entire path before pressing, including intermediate
+        // segment samples: refuse points covered by another client before input.
+        let mut motions = Vec::new();
+        for segment in points.windows(2) {
+            let (x0, y0) = segment[0];
+            let (x1, y1) = segment[1];
+            for i in 1..=DRAG_STEPS {
+                let point = (x0 + (x1 - x0) * i / DRAG_STEPS,
+                             y0 + (y1 - y0) * i / DRAG_STEPS);
+                self.hit_test(info, point.0, point.1, HitArea::Window)?;
+                motions.push((point.0, point.1, i == DRAG_STEPS));
+            }
+        }
+        let (x0, y0) = points[0];
         const B1: u16 = 0x100;
         let t = self.move_to(info, x0, y0, *time, 0, HitArea::Window)?;
-        *time = time.wrapping_add(10);
+        *time = time.wrapping_add(1);
         self.send(
             t.win,
             self.pointer_event(xproto::BUTTON_PRESS_EVENT, 1, *time, &t, x0, y0, 0),
@@ -2428,21 +2439,35 @@ impl Desktop {
         // Implicit grab semantics: motion and release go to the press window.
         let (mut cx, mut cy) = (x0, y0);
         let mut aborted = None;
-        for i in 1..=DRAG_STEPS {
-            cx = x0 + (x1 - x0) * i / DRAG_STEPS;
-            cy = y0 + (y1 - y0) * i / DRAG_STEPS;
-            *time = time.wrapping_add(16);
-            self.send(
-                t.win,
-                self.pointer_event(xproto::MOTION_NOTIFY_EVENT, 0, *time, &t, cx, cy, B1),
-            )?;
-            self.conn.flush()?;
-            if let Err(e) = self.check_user_input() {
+        // These samples are sent in a burst, not 16 ms apart. Fabricating a
+        // frame per sample put a long stroke seconds ahead of server time;
+        // the next request then went backwards in time. Twelve 1 ms ticks
+        // per segment fit within the vertex's real 20 ms delivery interval.
+        for (x, y, vertex) in motions {
+            cx = x;
+            cy = y;
+            *time = time.wrapping_add(1);
+            let step = (|| -> Result<()> {
+                self.send(
+                    t.win,
+                    self.pointer_event(xproto::MOTION_NOTIFY_EVENT, 0, *time, &t, cx, cy, B1),
+                )?;
+                self.conn.flush()?;
+                // GTK coalesces queued motion events to the last position.
+                // Give each requested vertex one frame to be consumed; without
+                // this a closed pencil stroke collapses to a dot, and a
+                // two-point line may release before its motion is consumed.
+                if vertex {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                self.check_user_input()
+            })();
+            if let Err(e) = step {
                 aborted = Some(e);
                 break;
             }
         }
-        *time = time.wrapping_add(10);
+        *time = time.wrapping_add(1);
         self.send(
             t.win,
             self.pointer_event(xproto::BUTTON_RELEASE_EVENT, 1, *time, &t, cx, cy, B1),
@@ -2560,9 +2585,37 @@ fn pair(p: &Value, key: &str) -> Result<(i32, i32)> {
     Ok((coord(arr.first(), key)?, coord(arr.get(1), key)?))
 }
 
+/// A bounded continuous stroke, or the original two-point drag. Reject the
+/// whole request before input when any point or the combination is invalid.
+fn drag_points(p: &Value) -> Result<Vec<(i32, i32)>> {
+    if let Some(path) = p.get("path") {
+        if p.get("from").is_some() || p.get("to").is_some() {
+            return Err(invalid("provide path or from/to, not both"));
+        }
+        let path = path.as_array().filter(|v| (2..=256).contains(&v.len()))
+            .ok_or_else(|| invalid("path must contain 2..=256 [x, y] points"))?;
+        path.iter().map(|v| pair(&json!({"point": v}), "point")).collect()
+    } else {
+        Ok(vec![pair(p, "from")?, pair(p, "to")?])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn continuous_drag_validation() {
+        assert_eq!(drag_points(&json!({"path": [[1,2], [9,2], [9,8], [1,2]]})).unwrap(),
+                   vec![(1,2), (9,2), (9,8), (1,2)]);
+        assert_eq!(drag_points(&json!({"from": [1,2], "to": [3,4]})).unwrap(), vec![(1,2), (3,4)]);
+        for p in [json!({"path": []}), json!({"path": [[1,2]]}),
+                  json!({"path": [[1,2], [3,4,5]]}), json!({"path": [[1,2], [3.5,4]]}),
+                  json!({"path": [[1,2], [3,4]], "from": [1,2]}),
+                  json!({"path": vec![[1,2]; 257]})] {
+            assert!(drag_points(&p).is_err(), "{p}");
+        }
+    }
 
     #[test]
     fn display_zero_denied() {

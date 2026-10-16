@@ -167,3 +167,7 @@ The tests use `test/fake-engine.js`, an NDJSON test double with daemon-side appr
 - Adapters treat one window as the screen. Each coordinate is mapped against the most recent screenshot, so if the window is resized between screenshots, coordinates follow the latest one.
 - Elicitation waiting time counts toward the `js` cell timeout and the discrete tool timeout.
 - Unit/contract tests use the fake daemon; `../bench/integration.mjs` exercises the real Rust engine and GTK fixture on an explicitly owned private display. Neither adapter has been tested with live model inference yet.
+
+### Continuous canvas strokes
+
+`await app.drag({path: [[100,100], [180,100], [180,180], [100,100]]})` sends every segment with the left button held, then releases and settles once. Paths contain 2–256 integer window-local points; `{x,y}` points also work in the JS API. Use a pencil/brush for arbitrary outlines, and inspect a screenshot after a group of strokes. `drag(from, to)` is unchanged. Discrete `drag` accepts `path` instead of `from`/`to`; the OpenAI adapter retains its separate path-simplification policy.

@@ -206,13 +206,16 @@ export function preludeSource() {
         return act('click', p);
       },
       doubleClick(target) { return app.click(target, { clickCount: 2 }); },
-      // drag([x, y], [x, y]) or drag({from, to}) / drag({path: [{x, y}, ...]})
+      // drag(from, to), drag({from, to}), or a continuous drag({path}).
       drag(from, to) {
-        if (isObj(from) && to === undefined) {
-          if (Array.isArray(from.path) && from.path.length >= 2) { to = from.path[from.path.length - 1]; from = from.path[0]; }
-          else { to = from.to; from = from.from; }
-        }
         const pt = (v) => Array.isArray(v) ? v : isObj(v) ? [v.x, v.y] : v;
+        if (isObj(from) && to === undefined) {
+          if (from.path !== undefined) {
+            if (from.from !== undefined || from.to !== undefined) throw new CuaError('invalid_params', 'drag: provide path or from/to, not both');
+            return act('drag', { path: Array.isArray(from.path) ? from.path.map(pt) : from.path });
+          }
+          to = from.to; from = from.from;
+        }
         return act('drag', { from: pt(from), to: pt(to) });
       },
       // scroll(target, direction, distance = 1 page-ish unit) or

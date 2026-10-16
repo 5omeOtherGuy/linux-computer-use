@@ -131,6 +131,24 @@ describe('MCP surface', () => {
     assert.equal(t.text(r).split('[1] button "OK"').length - 1, 1, t.text(r));
   });
 
+  test('continuous drags preserve every point; invalid paths send no input', async () => {
+    const r = await t.js(`${APP} await app.drag({path: [[10,20], {x:30,y:20}, [30,40], [10,20]]});`);
+    assert.equal(r.isError, false, t.text(r));
+    assert.deepEqual(t.performed().at(-1).params.path, [[10,20], [30,20], [30,40], [10,20]]);
+    for (const code of [
+      'await app.drag({path: [[1,2]]})',
+      'await app.drag({path: [[1,2], [3.5,4]]})',
+      'await app.drag({path: [[1,2], [3,4]], from: [1,2]})',
+      'await app.drag({path: Array.from({length: 257}, () => [1,2])})',
+    ]) {
+      const before = t.performed().length;
+      const bad = await t.js(code);
+      assert.equal(bad.isError, true, t.text(bad));
+      assert.match(t.text(bad), /invalid_params/);
+      assert.equal(t.performed().length, before);
+    }
+  });
+
   test('getApp emits the app state once; prefers the focused main window and names the others', async () => {
     let r = await t.js(`const two = await cua.getApp("org.example.two"); await two.getAXState(); two.windowId`);
     assert.equal(r.isError, false, t.text(r));

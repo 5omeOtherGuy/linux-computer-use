@@ -115,10 +115,18 @@ const METHODS = {
   },
   drag: {
     kind: 'action',
-    keys: ['window_id', 'from', 'to'],
+    keys: ['window_id', 'from', 'to', 'path'],
     ext: { modifiers: 'modifiers' },
     build(m, p) {
-      const out = { window_id: checks.windowId(m, p.window_id), from: checks.point(m, 'from', p.from), to: checks.point(m, 'to', p.to) };
+      const out = { window_id: checks.windowId(m, p.window_id) };
+      if (p.path !== undefined) {
+        if (p.from !== undefined || p.to !== undefined) fail(m, 'provide path or from/to, not both');
+        if (!Array.isArray(p.path) || p.path.length < 2 || p.path.length > 256) fail(m, 'path must contain 2..256 [x, y] points');
+        out.path = p.path.map((v) => checks.point(m, 'path point', v));
+      } else {
+        out.from = checks.point(m, 'from', p.from);
+        out.to = checks.point(m, 'to', p.to);
+      }
       if (p.modifiers !== undefined) out.modifiers = checks.modifiers(m, p.modifiers);
       return out;
     },
@@ -253,7 +261,8 @@ export function toolInputSchema(method, extensions = new Set()) {
       case 'window_id': add(k, int(0, 0xffffffff, 'Window id from list_windows'), true); break;
       case 'element_index': add(k, int(0, MAX_ELEMENT_INDEX, 'Element index from the accessibility tree'), method === 'set_value' || method === 'perform_secondary_action'); break;
       case 'x': case 'y': add(k, int(0, MAX_COORD, 'Window-local pixel coordinate'), method === 'mouse_move'); break;
-      case 'from': case 'to': add(k, point, true); break;
+      case 'from': case 'to': add(k, point); break;
+      case 'path': add(k, { type: 'array', items: point, minItems: 2, maxItems: 256, description: 'Continuous stroke through every point with the left button held; use instead of from/to' }); break;
       case 'direction': add(k, { type: 'string', enum: ['up', 'down', 'left', 'right'] }, true); break;
       case 'pixels': add(k, int(1, 100_000), true); break;
       case 'text': add(k, { type: 'string', minLength: 1, maxLength: MAX_TEXT }, true); break;

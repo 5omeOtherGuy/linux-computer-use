@@ -3123,7 +3123,10 @@ impl Accessibility {
             }
         }
 
-        if el.has_iface(I_EDIT) {
+        // GTK spin buttons expose both EditableText and Value. Editing their
+        // text only changes a pending string; CurrentValue commits the number
+        // and notifies the application immediately, without focus/Return.
+        if el.has_iface(I_EDIT) && !(el.role == R_SPIN_BUTTON && el.has_iface(I_VALUE)) {
             let text = match &value {
                 Value::String(s) => s.clone(),
                 Value::Number(n) => n.to_string(),
