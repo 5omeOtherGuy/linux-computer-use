@@ -16,8 +16,9 @@
 //!   signatures), invalidated by any event from that application, by cache
 //!   signals and by a maximum age. Holes and cache-less applications are filled
 //!   with a bounded live traversal (node, depth, fan-out and time limits).
-//! * IDs: per window, stable while the same accessible object (bus name, path,
-//!   role) exists, never reused until `reset`.
+//! * IDs: stable per window while the same accessible object (bus name, path,
+//!   role) exists. One counter serves the whole daemon session and is never
+//!   reset, so an old ID can never come to mean a different element.
 //! * Actions: only semantic AT-SPI operations. Every action revalidates the
 //!   element live (not defunct, same role and name, still showing, still a
 //!   descendant of the mapped frame, not removed by an event after the
@@ -351,7 +352,7 @@ pub struct Accessibility {
     setup_warnings: Vec<String>,
     pids: HashMap<String, u32>,
     caches: HashMap<String, Arc<AppCache>>,
-    windows: HashMap<u32, WindowState>,
+    obs: Observations,
 }
 
 impl Drop for Accessibility {
@@ -472,13 +473,39 @@ struct EventLog {
     /// Unique names that left the bus, with the sequence.
     gone: HashMap<String, u64>,
     listening: bool,
+    /// Oldest snapshot sequence any window state still relies on; entries at
+    /// or below it can no longer invalidate anything and may be pruned.
+    floor: u64,
+    /// Observations older than this sequence lost removal records to the
+    /// hard size bound and must be repeated before acting.
+    lost_before: u64,
 }
+
+const LOG_PRUNE_AT: usize = 20_000;
+const LOG_HARD_MAX: usize = 200_000;
 
 impl EventLog {
     fn bump(&mut self, sender: &str) -> u64 {
         self.seq += 1;
         self.last.insert(sender.to_string(), self.seq);
         self.seq
+    }
+
+    /// Bounds the removal records by dropping those no snapshot depends on;
+    /// only if that is not enough, drop everything and invalidate older
+    /// observations instead of silently forgetting removals.
+    fn prune(&mut self) {
+        if self.removed.len() + self.gone.len() <= LOG_PRUNE_AT {
+            return;
+        }
+        let floor = self.floor;
+        self.removed.retain(|_, s| *s > floor);
+        self.gone.retain(|_, s| *s > floor);
+        if self.removed.len() + self.gone.len() > LOG_HARD_MAX {
+            self.removed.clear();
+            self.gone.clear();
+            self.lost_before = self.seq + 1;
+        }
     }
 }
 
@@ -510,7 +537,6 @@ struct WindowState {
     pid: u32,
     frame: Option<ObjRef>,
     ids: HashMap<ObjRef, (u32, u32)>,
-    next_id: u32,
     elements: HashMap<u32, Elem>,
     valid: bool,
     snap_seq: u64,
@@ -523,23 +549,87 @@ impl WindowState {
             pid,
             frame: None,
             ids: HashMap::new(),
-            next_id: 1,
             elements: HashMap::new(),
             valid: false,
             snap_seq: 0,
             prev: None,
         }
     }
-    fn id_for(&mut self, r: &ObjRef, role: u32) -> u32 {
+    fn id_for(&mut self, r: &ObjRef, role: u32, next_id: &mut u32) -> u32 {
         if let Some(&(id, old_role)) = self.ids.get(r) {
             if old_role == role {
                 return id;
             }
         }
-        let id = self.next_id;
-        self.next_id += 1;
-        self.ids.insert(r.clone(), (id, role));
-        id
+        *next_id += 1;
+        self.ids.insert(r.clone(), (*next_id, role));
+        *next_id
+    }
+}
+
+/// Per-window observation state plus the session-wide element ID counter.
+/// Window states are replaced on owner change, frame remap and turn reset;
+/// the counter never is, so IDs are unique for the daemon's lifetime.
+#[derive(Default)]
+struct Observations {
+    last_id: u32,
+    windows: HashMap<u32, WindowState>,
+}
+
+impl Observations {
+    /// State for a new snapshot of `w`, invalidated until the snapshot
+    /// completes; a window that changed owner starts over.
+    fn begin(&mut self, w: &WindowInfo) -> &mut WindowState {
+        if self
+            .windows
+            .get(&w.window_id)
+            .is_some_and(|ws| ws.pid != w.pid)
+        {
+            self.windows.remove(&w.window_id);
+        }
+        let ws = self
+            .windows
+            .entry(w.window_id)
+            .or_insert_with(|| WindowState::new(w.pid));
+        ws.valid = false;
+        ws.elements.clear();
+        ws
+    }
+
+    /// Binds the window to its accessible frame. Returns true when the frame
+    /// changed, which discards the window's earlier IDs and diff baseline.
+    fn bind_frame(&mut self, window_id: u32, frame: &ObjRef) -> bool {
+        let Some(ws) = self.windows.get_mut(&window_id) else {
+            return false;
+        };
+        let changed = ws.frame.as_ref().is_some_and(|f| f != frame);
+        if changed {
+            *ws = WindowState::new(ws.pid);
+        }
+        ws.frame = Some(frame.clone());
+        changed
+    }
+
+    fn id_for(&mut self, window_id: u32, r: &ObjRef, role: u32) -> u32 {
+        let ws = self
+            .windows
+            .get_mut(&window_id)
+            .expect("begin() precedes id assignment");
+        ws.id_for(r, role, &mut self.last_id)
+    }
+
+    fn reset(&mut self) {
+        self.windows.clear();
+    }
+
+    /// Oldest snapshot sequence a still-usable observation depends on.
+    fn floor(&self) -> u64 {
+        self.windows
+            .values()
+            .filter(|ws| ws.valid)
+            .map(|ws| ws.snap_seq)
+            .min()
+            .unwrap_or(u64::MAX)
     }
 }
 
@@ -719,43 +809,140 @@ fn fmt_num(v: f64) -> String {
     }
 }
 
-/// Refuse implicit or owner-default buses. Daemons are bound to a private bus.
-fn check_private_address(addr: &str, what: &str) -> Result<()> {
+/// Refuse implicit or owner-default buses; daemons are bound to a private
+/// bus. Every `;`-separated address must be `unix:path=...` whose
+/// percent-decoded, canonicalized path is not the owner's per-user session
+/// or accessibility bus under `/run/user/<uid>/`. Abstract sockets have no
+/// filesystem identity to check and are refused unless `allow_abstract`.
+fn check_private_address(addr: &str, what: &str, allow_abstract: bool) -> Result<()> {
     let a = addr.trim();
     if a.is_empty() {
         bail!("{what} is empty");
     }
-    if a.starts_with("autolaunch:") || a.contains(";autolaunch:") {
-        bail!("{what} uses autolaunch; an explicit private bus address is required");
-    }
-    // Owner defaults live under /run/user/<uid>/ (session `bus`, a11y `at-spi/bus*`).
-    for part in a.split(';') {
-        for kv in part.split([':', ',']) {
-            let Some(path) = kv.strip_prefix("path=") else {
-                continue;
-            };
-            if let Some(rest) = path.strip_prefix("/run/user/") {
-                let mut it = rest.splitn(2, '/');
-                let uid = it.next().unwrap_or("");
-                let tail = it.next().unwrap_or("");
-                if !uid.is_empty()
-                    && uid.chars().all(|c| c.is_ascii_digit())
-                    && (tail == "bus" || tail.starts_with("at-spi/bus"))
-                {
+    for part in a.split(';').filter(|p| !p.is_empty()) {
+        let (transport, rest) = part
+            .split_once(':')
+            .ok_or_else(|| anyhow!("{what}: malformed D-Bus address {part:?}"))?;
+        if transport != "unix" {
+            bail!("{what} uses the {transport:?} transport; an explicit unix:path= private bus is required");
+        }
+        let mut path = None;
+        let mut is_abstract = false;
+        for kv in rest.split(',').filter(|kv| !kv.is_empty()) {
+            let (k, v) = kv
+                .split_once('=')
+                .ok_or_else(|| anyhow!("{what}: malformed D-Bus address entry {kv:?}"))?;
+            let v = unescape_address_value(v)
+                .ok_or_else(|| anyhow!("{what}: malformed escape in {kv:?}"))?;
+            match k {
+                "path" if path.is_none() => path = Some(v),
+                "abstract" => is_abstract = true,
+                "guid" => {}
+                _ => bail!("{what}: unsupported unix address key {k:?} (runtime=, dir= and tmpdir= select implicit locations)"),
+            }
+        }
+        match (path, is_abstract) {
+            (Some(p), false) => {
+                let c = canonical_path(&p)
+                    .with_context(|| format!("{what}: cannot interpret bus path {p:?}"))?;
+                if is_owner_default_bus(&c) {
                     bail!(
-                        "{what} {a:?} is the owner's default per-user bus; refusing (use a private bus for the daemon session)"
+                        "{what} {a:?} is the owner's default per-user bus ({}); refusing (use a private bus for the daemon session)",
+                        c.display()
                     );
                 }
             }
+            (None, true) if allow_abstract => {}
+            (None, true) => bail!("{what} {a:?} is an abstract socket, whose owner cannot be verified; set CUA_ALLOW_ABSTRACT_BUS=1 to accept it"),
+            _ => bail!("{what}: a unix address needs exactly one of path= or abstract="),
         }
     }
     Ok(())
 }
 
+/// D-Bus address values escape bytes as `%XX`.
+fn unescape_address_value(v: &str) -> Option<String> {
+    let b = v.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            let hex = std::str::from_utf8(b.get(i + 1..i + 3)?).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// Resolves symlinks, `.`/`..` and repeated separators. A path that does
+/// not exist (yet) is normalized lexically and its longest existing prefix
+/// is resolved.
+fn canonical_path(p: &str) -> Result<std::path::PathBuf> {
+    use std::path::{Component, Path, PathBuf};
+    let path = Path::new(p);
+    if !path.is_absolute() {
+        bail!("bus path is not absolute");
+    }
+    if let Ok(c) = std::fs::canonicalize(path) {
+        return Ok(c);
+    }
+    let mut norm = PathBuf::from("/");
+    for c in path.components() {
+        match c {
+            Component::ParentDir => {
+                norm.pop();
+            }
+            Component::Normal(n) => norm.push(n),
+            _ => {}
+        }
+    }
+    let mut tail = Vec::new();
+    let mut existing = norm;
+    while !existing.exists() {
+        match existing.file_name() {
+            Some(n) => {
+                tail.push(n.to_owned());
+                existing.pop();
+            }
+            None => break,
+        }
+    }
+    let mut out = std::fs::canonicalize(&existing).unwrap_or(existing);
+    out.extend(tail.iter().rev());
+    Ok(out)
+}
+
+/// The owner's defaults: `/run/user/<uid>/bus` (session) and
+/// `/run/user/<uid>/at-spi/bus*` (accessibility).
+fn is_owner_default_bus(c: &std::path::Path) -> bool {
+    let Ok(rest) = c.strip_prefix("/run/user") else {
+        return false;
+    };
+    let mut parts = rest.iter().map(|p| p.to_string_lossy());
+    let uid_ok = parts
+        .next()
+        .is_some_and(|u| !u.is_empty() && u.chars().all(|c| c.is_ascii_digit()));
+    let tail: Vec<_> = parts.collect();
+    uid_ok
+        && match tail.as_slice() {
+            [bus] => bus == "bus",
+            [dir, bus] => dir == "at-spi" && bus.starts_with("bus"),
+            _ => false,
+        }
+}
+
+fn allow_abstract_bus() -> bool {
+    std::env::var("CUA_ALLOW_ABSTRACT_BUS").is_ok_and(|v| v == "1")
+}
+
 async fn resolve_bus_address(warnings: &mut Vec<String>) -> Result<String> {
     if let Ok(a) = std::env::var("AT_SPI_BUS_ADDRESS") {
         if !a.trim().is_empty() {
-            check_private_address(&a, "AT_SPI_BUS_ADDRESS")?;
+            check_private_address(&a, "AT_SPI_BUS_ADDRESS", allow_abstract_bus())?;
             return Ok(a);
         }
     }
@@ -763,7 +950,7 @@ async fn resolve_bus_address(warnings: &mut Vec<String>) -> Result<String> {
     if session.trim().is_empty() {
         bail!("neither AT_SPI_BUS_ADDRESS nor an explicit DBUS_SESSION_BUS_ADDRESS is set; refusing implicit bus discovery");
     }
-    check_private_address(&session, "DBUS_SESSION_BUS_ADDRESS")?;
+    check_private_address(&session, "DBUS_SESSION_BUS_ADDRESS", allow_abstract_bus())?;
     let conn = tokio::time::timeout(CONNECT_TIMEOUT, async {
         zbus::connection::Builder::address(session.as_str())?
             .method_timeout(CALL_TIMEOUT * 2)
@@ -777,7 +964,11 @@ async fn resolve_bus_address(warnings: &mut Vec<String>) -> Result<String> {
     let addr: String = call(&conn, &bus, "org.a11y.Bus", "GetAddress", &())
         .await
         .context("org.a11y.Bus.GetAddress on the session bus (is at-spi-bus-launcher running?)")?;
-    check_private_address(&addr, "accessibility bus address from org.a11y.Bus")?;
+    check_private_address(
+        &addr,
+        "accessibility bus address from org.a11y.Bus",
+        allow_abstract_bus(),
+    )?;
     match get_prop::<bool>(&conn, &bus, "org.a11y.Status", "IsEnabled").await {
         Ok(true) => {}
         Ok(false) => warnings.push(
@@ -847,12 +1038,7 @@ fn handle_event(log: &Mutex<EventLog>, msg: &Message) {
         }
         _ => {}
     }
-    if log.removed.len() > 50_000 {
-        log.removed.clear();
-    }
-    if log.gone.len() > 10_000 {
-        log.gone.clear();
-    }
+    log.prune();
 }
 
 // ---------------------------------------------------------------------------
@@ -982,14 +1168,53 @@ impl Accessibility {
             setup_warnings,
             pids: HashMap::new(),
             caches: HashMap::new(),
-            windows: HashMap::new(),
+            obs: Observations::default(),
         })
     }
 
-    /// Clear all observation state: element IDs, diffs and cached trees.
+    /// Clear observation state (element bindings, diffs and cached trees).
+    /// The element ID counter continues, so earlier IDs never resolve again.
     pub fn reset(&mut self) {
-        self.windows.clear();
+        self.obs.reset();
         self.caches.clear();
+        self.publish_floor();
+    }
+
+    fn publish_floor(&self) {
+        if let Ok(mut l) = self.events.lock() {
+            l.floor = self.obs.floor().min(l.seq);
+        }
+    }
+
+    /// A probe for the settle loop: reports whether the window's application
+    /// emitted accessibility events since the previous call (the baseline is
+    /// taken now, before the action). Always false until the window has been
+    /// mapped to an accessible frame.
+    pub fn activity_probe(&self, w: &WindowInfo) -> impl FnMut() -> bool + 'static {
+        let bus = self
+            .obs
+            .windows
+            .get(&w.window_id)
+            .filter(|ws| ws.pid == w.pid)
+            .and_then(|ws| ws.frame.as_ref())
+            .map(|f| f.bus.clone());
+        let log = self.events.clone();
+        let read = move || -> u64 {
+            match &bus {
+                Some(b) => log
+                    .lock()
+                    .map(|l| l.last.get(b).copied().unwrap_or(0))
+                    .unwrap_or(0),
+                None => 0,
+            }
+        };
+        let mut seen = read();
+        move || {
+            let now = read();
+            let changed = now != seen;
+            seen = now;
+            changed
+        }
     }
 
     fn event_seq(&self) -> u64 {
@@ -1018,7 +1243,7 @@ impl Accessibility {
                 warnings,
             }),
             Err(e) => {
-                if let Some(ws) = self.windows.get_mut(&window.window_id) {
+                if let Some(ws) = self.obs.windows.get_mut(&window.window_id) {
                     ws.valid = false;
                     ws.elements.clear();
                 }
@@ -1498,30 +1723,11 @@ impl Accessibility {
         warnings: &mut Vec<String>,
     ) -> Result<(String, String)> {
         let snap_seq = self.event_seq();
-        if self
-            .windows
-            .get(&w.window_id)
-            .map(|ws| ws.pid != w.pid)
-            .unwrap_or(false)
-        {
-            self.windows.remove(&w.window_id);
-        }
-        self.windows
-            .entry(w.window_id)
-            .or_insert_with(|| WindowState::new(w.pid));
-        if let Some(ws) = self.windows.get_mut(&w.window_id) {
-            ws.valid = false;
-            ws.elements.clear();
-        }
+        self.obs.begin(w);
 
         let (frame, frame_node) = self.map_window(w, warnings).await?;
-        {
-            let ws = self.windows.get_mut(&w.window_id).expect("window state");
-            if ws.frame.as_ref().map(|f| f != &frame).unwrap_or(false) {
-                warnings.push("window maps to a different accessible frame than before; element IDs were reset".into());
-                *ws = WindowState::new(w.pid);
-            }
-            ws.frame = Some(frame.clone());
+        if self.obs.bind_frame(w.window_id, &frame) {
+            warnings.push("window maps to a different accessible frame than before; earlier element IDs are no longer valid".into());
         }
 
         let cache = self.ensure_cache(&frame.bus, warnings).await;
@@ -1588,7 +1794,7 @@ impl Accessibility {
         .await;
 
         // Pass 2: render.
-        let ws = self.windows.get_mut(&w.window_id).expect("window state");
+        let obs = &mut self.obs;
         let mut lines: Vec<(usize, u32, String)> = Vec::new();
         let mut elements: HashMap<u32, Elem> = HashMap::new();
         let mut line_truncated = false;
@@ -1610,7 +1816,7 @@ impl Accessibility {
                     line_truncated = true;
                     return false;
                 }
-                let id = ws.id_for(r, n.role);
+                let id = obs.id_for(w.window_id, r, n.role);
                 lines.push((depth, id, render_line(n, d, rects.get(r), ww, wh)));
                 elements.insert(
                     id,
@@ -1664,6 +1870,7 @@ impl Accessibility {
 
         let current: BTreeMap<u32, String> =
             lines.iter().map(|(_, id, b)| (*id, b.clone())).collect();
+        let ws = obs.windows.get_mut(&w.window_id).expect("window state");
         let diff = match &ws.prev {
             None => String::new(),
             Some(prev) => make_diff(prev, &current),
@@ -1672,6 +1879,7 @@ impl Accessibility {
         ws.elements = elements;
         ws.snap_seq = snap_seq;
         ws.valid = true;
+        self.publish_floor();
         Ok((text, diff))
     }
 
@@ -1694,11 +1902,14 @@ impl Accessibility {
                 insert_text(&self.conn, &el, text).await
             }
             "paste" => {
+                // Inserts the given text; never the display's clipboard, whose
+                // content the model has not seen.
+                let text = p
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("paste requires string `text`"))?;
                 let el = self.focused_editable(window, p).await?;
-                match p.get("text").and_then(Value::as_str) {
-                    Some(text) => insert_text(&self.conn, &el, text).await,
-                    None => paste_clipboard(&self.conn, &el).await,
-                }
+                insert_text(&self.conn, &el, text).await
             }
             "perform_secondary_action" => self.do_secondary(window, p).await,
             "scroll" => {
@@ -1753,7 +1964,7 @@ impl Accessibility {
     /// Resolve an element ID against the latest observation of this window and
     /// revalidate it live. Rejects anything stale.
     async fn resolve(&mut self, w: &WindowInfo, idx: u32) -> Result<Elem> {
-        let ws = self.windows.get(&w.window_id).ok_or_else(|| {
+        let ws = self.obs.windows.get(&w.window_id).ok_or_else(|| {
             anyhow!(
                 "no accessibility observation of window {}; observe it first",
                 w.window_id
@@ -1787,6 +1998,9 @@ impl Accessibility {
                 .events
                 .lock()
                 .map_err(|_| anyhow!("event log poisoned"))?;
+            if snap_seq < log.lost_before {
+                bail!("too many accessibility changes since the last observation; observe again");
+            }
             if log.gone.contains_key(&el.r.bus) {
                 bail!("the application owning element {idx} has disconnected from the accessibility bus");
             }
@@ -1894,19 +2108,11 @@ impl Accessibility {
             }
             other => bail!("semantic click does not support button {other:?}"),
         }
-        if el.has_iface(I_ACTION) {
-            let acts = action_names(conn, &el).await?;
-            if !acts.is_empty() {
-                const PREFERRED: [&str; 7] = [
-                    "click", "press", "activate", "toggle", "jump", "open", "select",
-                ];
-                let i = PREFERRED
-                    .iter()
-                    .find_map(|want| acts.iter().position(|(n, _)| n.eq_ignore_ascii_case(want)))
-                    .unwrap_or(0);
-                return do_action(conn, &el, i as i32).await;
-            }
+        let acts = action_names(conn, &el).await?;
+        if let Some(i) = preferred_action(&acts, &CLICK_ACTIONS) {
+            return do_action(conn, &el, i as i32).await;
         }
+        // Never fall back to an arbitrary action: index 0 may be "delete".
         if has(el.states, S_SELECTABLE) {
             if let Ok(()) = select_in_parent(conn, &el).await {
                 return Ok(());
@@ -1921,8 +2127,9 @@ impl Accessibility {
             return Ok(());
         }
         bail!(
-            "element {idx} ({}) has no semantic click action; use window coordinates instead",
-            role_name(el.role)
+            "element {idx} ({}) has no click/press/activate action (available actions: {}); use perform_secondary_action with one of them, or window coordinates",
+            role_name(el.role),
+            list_actions(&acts)
         )
     }
 
@@ -2010,13 +2217,12 @@ impl Accessibility {
                 bail!("a radio button cannot be unchecked directly; select another option");
             }
             let acts = action_names(conn, &el).await?;
-            if acts.is_empty() {
-                bail!("element {idx} exposes no toggle action");
-            }
-            let i = ["toggle", "click", "press", "activate"]
-                .iter()
-                .find_map(|x| acts.iter().position(|(n, _)| n.eq_ignore_ascii_case(x)))
-                .unwrap_or(0);
+            let i = preferred_action(&acts, &TOGGLE_ACTIONS).ok_or_else(|| {
+                    anyhow!(
+                        "element {idx} exposes no toggle/click/press/activate action (available actions: {})",
+                        list_actions(&acts)
+                    )
+                })?;
             do_action(conn, &el, i as i32).await?;
             let until = Instant::now() + TOGGLE_VERIFY;
             loop {
@@ -2220,6 +2426,7 @@ impl Accessibility {
             return Ok(el);
         }
         let ws = self
+            .obs
             .windows
             .get(&w.window_id)
             .filter(|ws| ws.valid && ws.pid == w.pid)
@@ -2559,6 +2766,19 @@ async fn action_names(conn: &Connection, el: &Elem) -> Result<Vec<(String, Strin
     Ok(out)
 }
 
+const CLICK_ACTIONS: [&str; 7] = [
+    "click", "press", "activate", "toggle", "jump", "open", "select",
+];
+const TOGGLE_ACTIONS: [&str; 4] = ["toggle", "click", "press", "activate"];
+
+/// Index of the first action named like one of `wanted` (in preference
+/// order). Never an arbitrary other action.
+fn preferred_action(acts: &[(String, String)], wanted: &[&str]) -> Option<usize> {
+    wanted
+        .iter()
+        .find_map(|want| acts.iter().position(|(n, _)| n.eq_ignore_ascii_case(want)))
+}
+
 fn list_actions(acts: &[(String, String)]) -> String {
     if acts.is_empty() {
         return "none".into();
@@ -2697,36 +2917,37 @@ async fn insert_text(conn: &Connection, el: &Elem, text: &str) -> Result<()> {
     Ok(())
 }
 
-async fn paste_clipboard(conn: &Connection, el: &Elem) -> Result<()> {
-    if !el.has_iface(I_EDIT) || !el.has_iface(I_TEXT) {
-        bail!("target is not editable text");
-    }
-    let caret: i32 = get_prop(conn, &el.r, I_TEXT, "CaretOffset").await?;
-    let pos = if caret >= 0 {
-        caret
-    } else {
-        get_prop::<i32>(conn, &el.r, I_TEXT, "CharacterCount").await?
-    };
-    let ok: bool = call_t(conn, &el.r, I_EDIT, "PasteText", &(pos,), ACTION_TIMEOUT).await?;
-    if !ok {
-        bail!("application rejected PasteText");
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn refuses_owner_default_buses() {
-        assert!(check_private_address("unix:path=/run/user/1000/bus", "x").is_err());
-        assert!(check_private_address("unix:path=/run/user/1000/at-spi/bus_0", "x").is_err());
-        assert!(check_private_address("unix:path=/run/user/1000/at-spi/bus", "x").is_err());
-        assert!(check_private_address("autolaunch:", "x").is_err());
-        assert!(check_private_address("", "x").is_err());
-        assert!(check_private_address("unix:path=/tmp/cua-7/bus", "x").is_ok());
-        assert!(check_private_address("unix:path=/tmp/cua/at-spi/bus_9,guid=abc", "x").is_ok());
+        let chk = |a: &str| check_private_address(a, "x", false);
+        assert!(chk("unix:path=/run/user/1000/bus").is_err());
+        assert!(chk("unix:path=/run/user/1000/at-spi/bus_0").is_err());
+        assert!(chk("unix:path=/run/user/1000/at-spi/bus").is_err());
+        assert!(chk("autolaunch:").is_err());
+        assert!(chk("").is_err());
+        assert!(chk("unix:path=/tmp/cua-7/bus").is_ok());
+        assert!(chk("unix:path=/tmp/cua/at-spi/bus_9,guid=abc").is_ok());
+        // Literal-string comparison used to miss these spellings.
+        assert!(chk("unix:path=/run/user/1000//bus").is_err());
+        assert!(chk("unix:path=/run/user/1000/./at-spi/../bus").is_err());
+        assert!(chk("unix:path=/tmp/../run/user/1000/bus").is_err());
+        assert!(chk("unix:path=%2frun%2fuser/1000/bus").is_err());
+        assert!(
+            chk("unix:path=/var/run/user/1000/bus").is_err()
+                || !std::path::Path::new("/var/run").exists()
+        );
+        assert!(chk("unix:path=/tmp/private/bus;unix:path=/run/user/1000/bus").is_err());
+        // Implicit locations and unverifiable sockets.
+        assert!(chk("unix:runtime=yes").is_err());
+        assert!(chk("unix:tmpdir=/tmp").is_err());
+        assert!(chk("tcp:host=localhost,port=4000").is_err());
+        assert!(chk("unix:abstract=/tmp/dbus-x").is_err());
+        assert!(check_private_address("unix:abstract=/tmp/dbus-x", "x", true).is_ok());
+        assert!(chk("unix:path=%zz").is_err());
     }
 
     #[allow(dead_code)]
@@ -2749,15 +2970,97 @@ mod tests {
 
     #[test]
     fn ids_are_stable_and_role_bound() {
-        let mut ws = WindowState::new(1);
+        let mut obs = Observations::default();
+        obs.begin(&window(9, 1));
         let a = ObjRef::new(":1.5", "/a");
         let b = ObjRef::new(":1.5", "/b");
-        let ia = ws.id_for(&a, 43);
-        let ib = ws.id_for(&b, 43);
+        let ia = obs.id_for(9, &a, 43);
+        let ib = obs.id_for(9, &b, 43);
         assert_ne!(ia, ib);
-        assert_eq!(ws.id_for(&a, 43), ia);
-        let ia2 = ws.id_for(&a, 29);
+        assert_eq!(obs.id_for(9, &a, 43), ia);
+        let ia2 = obs.id_for(9, &a, 29);
         assert!(ia2 != ia && ia2 != ib);
+    }
+
+    fn window(window_id: u32, pid: u32) -> WindowInfo {
+        WindowInfo {
+            window_id,
+            title: "W".into(),
+            app_id: "app".into(),
+            pid,
+            width: 100,
+            height: 100,
+        }
+    }
+
+    /// Regression: window state is replaced on turn reset, owner change and
+    /// frame remap; IDs issued earlier (e.g. 7 = Cancel) must never be issued
+    /// again for another element (e.g. Delete), or a stale ID would pass
+    /// revalidation against the new element.
+    #[test]
+    fn element_ids_are_never_reused_after_state_replacement() {
+        let mut obs = Observations::default();
+        let w = window(9, 1);
+        let mut issued = Vec::new();
+        let mut next = |obs: &mut Observations, path: &str| {
+            let id = obs.id_for(9, &ObjRef::new(":1.5", path), 43);
+            issued.push(id);
+        };
+        obs.begin(&w);
+        obs.bind_frame(9, &ObjRef::new(":1.5", "/frame"));
+        next(&mut obs, "/cancel");
+        obs.reset(); // turn_ended
+        obs.begin(&w);
+        next(&mut obs, "/delete");
+        obs.begin(&window(9, 2)); // same XID, new owner
+        next(&mut obs, "/other");
+        obs.begin(&window(9, 2));
+        obs.bind_frame(9, &ObjRef::new(":1.5", "/frame"));
+        assert!(obs.bind_frame(9, &ObjRef::new(":1.5", "/frame2"))); // remap
+        next(&mut obs, "/remapped");
+        obs.begin(&window(10, 3)); // another window
+        let other = obs.id_for(10, &ObjRef::new(":1.6", "/x"), 43);
+        issued.push(other);
+        let unique: std::collections::HashSet<_> = issued.iter().collect();
+        assert_eq!(unique.len(), issued.len(), "IDs reused: {issued:?}");
+    }
+
+    #[test]
+    fn click_never_falls_back_to_an_arbitrary_action() {
+        let acts = |names: &[&str]| -> Vec<(String, String)> {
+            names
+                .iter()
+                .map(|n| (n.to_string(), n.to_string()))
+                .collect()
+        };
+        assert_eq!(
+            preferred_action(&acts(&["delete", "edit"]), &CLICK_ACTIONS),
+            None
+        );
+        assert_eq!(
+            preferred_action(&acts(&["delete", "Press"]), &CLICK_ACTIONS),
+            Some(1)
+        );
+        assert_eq!(
+            preferred_action(&acts(&["press", "toggle"]), &TOGGLE_ACTIONS),
+            Some(1)
+        );
+        assert_eq!(preferred_action(&acts(&["remove"]), &TOGGLE_ACTIONS), None);
+    }
+
+    #[test]
+    fn removal_log_prunes_only_records_no_observation_needs() {
+        let mut log = EventLog::default();
+        for i in 0..(LOG_PRUNE_AT as u64 + 10) {
+            log.seq = i + 1;
+            log.removed
+                .insert(ObjRef::new(":1.1", &format!("/{i}")), i + 1);
+        }
+        log.floor = 100;
+        log.prune();
+        assert!(log.removed.values().all(|&s| s > 100));
+        assert_eq!(log.removed.len(), LOG_PRUNE_AT + 10 - 100);
+        assert_eq!(log.lost_before, 0);
     }
 
     #[test]
