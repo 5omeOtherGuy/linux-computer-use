@@ -129,6 +129,9 @@ Measured on 2026-10-16 with the standard defaults, three fresh private desktops 
 | Width/palette guidance / `speed4-final` | 3/3 | 75.4, 52.6, 57.8 | 57.8 s | 10 | 13.4 s |
 | Numeric spin values / `speed4` | 3/3 | 101.5, 52.4, 62.4 | 62.4 s | 11 | 12.8 s |
 | Delivered changes / `speed4-paced` | 3/3 | 70.7, 50.0, 34.0 | **50.0 s** | **10** | **8.2 s** |
+| Modifiers, hover, launch, clipboard, table hit test (`cb3a5ac`) / `gaps` | 3/3 | 37.5, 45.9, 49.4 | 45.9 s | 9 | 8.2 s |
+
+The `gaps` row is the same prompt and verifier after the round that added held modifiers, hover, `launchApp`, the clipboard, the table hit test and the one-request tree-plus-screenshot: no regression (the model used none of the new calls in those three runs, which drew with the shape and line tools as before; the pictures were checked visually).
 
 The delivered combination reduced median wall time by **53.6%** (2.16× speedup). All three delivered runs had zero tool errors, passed the disk PNG verifier, and their saved images were visually checked for a house, roof, door, sun and multiple colours. The spread is wide: this is a three-run median on a shared workstation. The 70.7 s run repaired strokes near a newly visible scrollbar. Earlier path-only trials failed the colour-area check because their second-colour outlines were too thin; those failures remain in the results.
 
