@@ -112,7 +112,7 @@ node bench/model.mjs --provider openai --model gpt-6.1-sol \
 # Remove --dry-run only when intending to run paid inference.
 ```
 
-To establish the requested speed target, run equivalent task suites through Claude, GPT, and an authorized Codex installation, recording model/tool time and completion rates separately. No such reference or live inference measurements were available in this implementation run; performance parity remains unproven.
+**The standard benchmark** is `benchmarks/run.mjs` with its defaults: GPT-6.1-sol at medium effort in Codex (`codex exec`) draws a house in GNOME Drawing (apt package `drawing`) on a fresh private desktop and saves it; the saved PNG is verified for a non-trivial drawing in at least two colours. Run `node benchmarks/run.mjs --label <change> --iterations N` (add `--record` for a screen recording), then `node benchmarks/report.mjs` for pass rate and median wall, tool-call and tool time per label. The earlier tasks (`reimburse`, `xed-note`) and Claude (`--agent claude --model claude-opus-5-5`) stay available for cross-checks. Results append to `/data/scratch/linux-cua-bench/results.jsonl`. Wall time includes model inference, which dominates; compare tool time and tool calls for engine changes, and several iterations, because single runs vary by seconds.
 
 ## Remaining compatibility limits
 

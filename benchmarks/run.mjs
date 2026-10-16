@@ -4,10 +4,15 @@
 // through the linux-cua MCP server. Wall time covers model inference, tool
 // round trips, settling and recovery; the outcome is verified from disk.
 //
+// The standard benchmark (the defaults): GPT-6.1-sol at medium effort in
+// Codex draws and saves a picture in GNOME Drawing (task `paint`).
+//
+//   node benchmarks/run.mjs --label <change> [--iterations N] [--record]
 //   node benchmarks/run.mjs --task reimburse --agent codex --model gpt-6.1-sol --effort low
 //   node benchmarks/run.mjs --task xed-note --agent claude --model claude-opus-5-5 --record
 //
-// Results append to $BENCH_ROOT/results.jsonl (default /data/scratch/linux-cua-bench).
+// Results append to $BENCH_ROOT/results.jsonl (default /data/scratch/linux-cua-bench);
+// `node benchmarks/report.mjs` summarises them per label.
 import { spawn, execFileSync } from 'node:child_process';
 import { mkdir, writeFile, appendFile } from 'node:fs/promises';
 import { join, resolve, dirname } from 'node:path';
@@ -18,10 +23,10 @@ import { TASKS } from './tasks.mjs';
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const { values: o } = parseArgs({
   options: {
-    task: { type: 'string' },
-    agent: { type: 'string' },
-    model: { type: 'string' },
-    effort: { type: 'string' },
+    task: { type: 'string', default: 'paint' },
+    agent: { type: 'string', default: 'codex' },
+    model: { type: 'string', default: 'gpt-6.1-sol' },
+    effort: { type: 'string', default: 'medium' },
     tier: { type: 'string' },
     surface: { type: 'string', default: 'js' },
     iterations: { type: 'string', default: '1' },

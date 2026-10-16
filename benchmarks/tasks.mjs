@@ -68,4 +68,40 @@ Save it as handoff.txt in ${out} and close the document. Reopen ${out}/handoff.t
   },
 };
 
-export const TASKS = Object.fromEntries([reimburse, xedNote].map((t) => [t.id, t]));
+// A canvas app: pointer drags draw, the toolbar and colour choice are
+// widgets, saving goes through a file chooser. Verified from the saved PNG:
+// something non-trivial in at least two colours.
+const paint = {
+  id: 'paint',
+  description: 'Drawing: draw a house with a roof, a door and a sun in at least two colours; save as PNG',
+  apps: [{ cmd: ['drawing'], waitClass: 'drawing' }],
+  allowApps: ['drawing'],
+  prompt: (out) => `In the open Drawing application, draw a simple picture of a house: a square body, a triangular roof, a door, and a sun in the sky. Use at least two different colours. Then save the picture as house.png in ${out} and report what you drew and which tools you used.`,
+  async verify(out) {
+    const file = join(out, 'house.png');
+    const checks = { file: await exists(file), decodes: false, drawn: false, two_colours: false };
+    if (checks.file) {
+      try {
+        const { PNG } = await import('../surface/node_modules/pngjs/lib/png.js');
+        const png = PNG.sync.read(await readFile(file));
+        checks.decodes = png.width > 0 && png.height > 0;
+        const colours = new Map();
+        for (let i = 0; i < png.data.length; i += 4) {
+          const key = `${png.data[i] >> 5},${png.data[i + 1] >> 5},${png.data[i + 2] >> 5}`;
+          colours.set(key, (colours.get(key) ?? 0) + 1);
+        }
+        const total = png.width * png.height;
+        const sorted = [...colours.values()].sort((a, b) => b - a);
+        // The background is the largest colour; the drawing is the rest.
+        const drawn = total - (sorted[0] ?? total);
+        checks.drawn = drawn >= total * 0.01;
+        checks.two_colours = sorted.filter((n) => n >= total * 0.002).length >= 3;
+      } catch {
+        // not a PNG
+      }
+    }
+    return { success: Object.values(checks).every(Boolean), checks };
+  },
+};
+
+export const TASKS = Object.fromEntries([reimburse, xedNote, paint].map((t) => [t.id, t]));
