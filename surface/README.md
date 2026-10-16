@@ -31,6 +31,7 @@ MCP client configuration (stdio):
 | `CUA_DISPLAY` | Required. Explicit X display (e.g. `:99`). `:0` is refused; the server exits with status 2. Passed to the daemon. |
 | `CUA_ENGINE` | Daemon executable. Default `../target/debug/linux-cua` relative to `surface/`. With `CARGO_TARGET_DIR=/data/scratch/linux-cua-build/target`, point it there. |
 | `CUA_ALLOW_APPS`, `CUA_DENY_APPS` | Inherited by the daemon, which enforces them. |
+| `CUA_APPROVALS_FILE` | "Always allow" decisions, `{"always_allowed_app_ids": [...]}`. Default `$XDG_CONFIG_HOME/linux-cua/approvals.json` (or `~/.config/...`). Written only by this host after the user picks "Always allow"; the operator may edit or delete it. Without a location, only turn and session approval are offered. |
 | `CUA_ENGINE_EXTENSIONS` | Comma list of optional engine features beyond CONTRACT.md: `click_button`, `click_count`, `modifiers`, `mouse_move`. Off by default. Enable only if the daemon implements them. |
 | `CUA_CONFIRMATION_POLICY` | Replaces the default confirmation-policy text shown in tool descriptions, server instructions and approval prompts. |
 | `CUA_TOOL_TIMEOUT_MS` | Timeout for discrete tools (default 30000). |
@@ -40,33 +41,39 @@ The daemon's stderr is forwarded to the server's stderr. stdout carries only MCP
 
 ## Tools
 
-- `js {title?, code, timeout_ms?}` runs a cell in the persistent REPL. Top-level `await` works. Top-level `let/const/var/function/class` bindings persist across cells as mutable globals, and redeclaring them is allowed. The value of the last expression (also inside a trailing block, `if` or `try`) is shown. The result contains the logs and value, the fenced accessibility text and diff of the last observation, and images: `display()`ed handles, the last observation's screenshot and the last `get_screenshot`. `timeout_ms` defaults to 30000 (maximum 600000). Time spent waiting for app approval counts toward it.
+- `js {title?, code, timeout_ms?}` runs a cell in the persistent REPL. Top-level `await` works. Top-level `let/const/var/function/class` bindings persist across cells as mutable globals, and redeclaring them is allowed. The result contains, in order, everything the cell emitted (auto-emitted observations, `nodeRepl.write`, `nodeRepl.emitImage`, `console.log`), the value of the last expression (also inside a trailing block, `if` or `try`), and, if the cell acted after its last emitted observation of that window, the state after the last action. `timeout_ms` defaults to 30000 (maximum 600000). Time spent waiting for app approval counts toward it.
 - `js_reset` discards all REPL state by restarting the sandbox process.
-- `turn_ended` cancels an active JS cell and old-turn queued requests, clears host approvals and denials, and resets the daemon. If the daemon has a pending request or cannot confirm the reset, it is killed. Idle REPL bindings survive.
+- `turn_ended` cancels an active JS cell and old-turn queued requests, clears this turn's approvals and denials (session and always approvals stay), and resets the daemon. If the daemon has a pending request or cannot confirm the reset, it is killed. Idle REPL bindings survive.
 - Discrete tools, one per engine method: `list_apps`, `list_windows`, `get_app_state`, `get_ax_state`, `get_screenshot`, `click`, `drag`, `scroll`, `type_text`, `press_key`, `paste`, `set_value`, `perform_secondary_action`, plus `mouse_move` with that extension. Their JSON Schemas come from the same table the host uses for validation (`src/protocol.js`).
 
 ### JS API (inside the VM)
 
+The names and shapes follow OpenAI's computer-use JavaScript API, which GPT models are trained on.
+
 ```js
-const app = await cua.getApp({windowId: 11});
-await app.getAXState({disableDiffing: true});
+const windows = await cua.listWindows();                  // WindowInfo[] {id, app, title?}; emitted
+const apps = await cua.listApps({emit: false});           // AppInfo[] {id, displayName, isRunning, windows}
+const { apps: running } = await cua.getState();           // {apps, browsers: []}
+const app = await cua.getApp({windowId: windows[0].id});  // or {appId}; App {id, displayName, isRunning, windows, window, windowId, ...methods}
+await app.getAXState();                     // full tree first, then changes since the tree you last received; emitted
+await app.getAXState({disableDiffing: true, emit: false});
 await app.setValue(observedFieldId, 'Hello');
-await app.click(observedButtonId);
-const wins = await cua.list_windows();          // or cua.listWindows()
-const obs = await cua.click({ window_id: wins[0].window_id, element_index: 3 });
-obs.accessibility; obs.ax_diff; obs.screenshot;  // screenshot is a handle {$image, mimeType, width, height}
-display(await cua.get_screenshot({ window_id: 11 }));
-try { await cua.click({ window_id: 13, x: 5, y: 5 }) } catch (e) { e.code /* approval_denied, invalid_params, timeout, ... */ }
-console.log(...); await sleep(250);
+await app.click(observedButtonId);          // or app.click([x, y]); resolves when the UI settled
+const png = await app.getScreenshot();      // Uint8Array PNG bytes; emitted
+const { state, screenshot } = await app.getAXStateAndScreenshot({emit: false});
+nodeRepl.write({ any: 'value' });           // text output (strings as-is, other values as JSON)
+await nodeRepl.emitImage(png);              // also {bytes, mimeType} or a data:image/png;base64 URL
+try { await app.click(13) } catch (e) { e.code /* approval_denied, invalid_params, timeout, ... */ }
+console.log(...); display(png); await sleep(250);   // aliases and helpers
 ```
 
-The VM has no `require`, `process`, `fetch`, `import()`, `WebAssembly`, timers or filesystem. `cua` and the helpers are frozen, non-writable globals. Screenshot data stays on the host, and the VM only gets opaque handles.
+Observation and discovery calls (`getAXState`, `getScreenshot`, `getAXStateAndScreenshot`, `cua.getState`, `getApp`, `listApps`, `listWindows`) add their result to the cell output; pass `{emit: false}` to suppress it. Accessibility diffs are always relative to the last tree the model actually received for that window (the last emitted one, including the post-action state shown at the end of a cell), never to an internal observation inside a cell. Actions resolve to `undefined`; their warnings are emitted. The VM has no `require`, `process`, `fetch`, `import()`, `WebAssembly`, timers or filesystem. `cua`, `nodeRepl` and the helpers are frozen, non-writable globals. Raw `window_id` methods are not exposed to model code.
 
 ## Security model
 
 - Isolation. Model code runs in QuickJS compiled to WebAssembly (`quickjs-emscripten`), not in Node and not in Node's `vm` module, which is not a security boundary. The only capabilities are three native functions: host call, output and sleep. The prelude captures them and then deletes them from the global object. As a second layer, the VM runs in a separate Node process started with `--permission`, read access only to `surface/`, no write, child process, worker, addon or WASI permission, `--disallow-code-generation-from-strings`, a 256 MB V8 heap and an empty environment. The process holds no credentials and no daemon handle. It only talks to the trusted host over IPC.
 - Revalidation. Every `cua.*` call, discrete tool call and adapter call goes through `HostApi.call`, which checks it against the method table. The checks cover the method name, exact parameter keys, integer ranges, enums and string limits. The host then builds a fresh params object. `approve_app` and `turn_ended` cannot be requested by any caller. Unknown arguments to MCP tools are rejected.
-- Authorization. The daemon decides when approval is needed and answers `approval_required {app_id, window_id, title}`. The host then sends an MCP form elicitation, at most once per app per turn. Only an explicit accept with `approve: true` leads to `approve_app {window_id, app_id}`. A decline is remembered until `turn_ended`, while a dismissal is not remembered. A client without elicitation support gets `approval_unavailable`, so approval fails closed. Approval prompts show the window title sanitized and labelled as untrusted. Deny lists stay with the daemon.
+- Authorization. The daemon decides when approval is needed and answers `approval_required {app_id, window_id, title}`. The host then sends an MCP form elicitation with a `decision` field: allow for this turn, allow for this session, always allow (only when an approvals file location exists), or deny. Only an explicit allow leads to `approve_app {window_id, app_id}`. Session and always approvals are re-granted to the daemon after `turn_ended` without asking again; "always" is written to `CUA_APPROVALS_FILE`. A decline is remembered until `turn_ended`, while a dismissal is not remembered. Daemon deny lists and hard denies win over every approval. A client without elicitation support gets `approval_unavailable`, so approval fails closed. Approval prompts show the window title sanitized and labelled as untrusted. Deny lists stay with the daemon.
 - Cancellation and timeouts. Engine requests are serialized. Cancellation kills the issuing daemon to stop further dispatch, but cannot recall events already delivered to an app: outcomes may be partial or unknown. The next request restarts the daemon with current-turn approvals; it does not replay the interrupted action. Unawaited calls are cancelled at cell end. Calls from finished cells are rejected. QuickJS interrupts overdue cells, with a hard process-kill backstop that reports lost REPL state.
 - Untrusted content. Accessibility text, diffs, window titles and other daemon data are wrapped in `<<<UNTRUSTED label nonce=…>>> … <<<END_UNTRUSTED nonce=…>>>`. Each fence gets a fresh random nonce, and fence-like sequences inside the content are neutralized.
 - Confirmation policy. The policy text is surfaced in the server instructions, the tool descriptions and the approval prompts. It is advisory: the server does not try to classify actions as consequential.
@@ -132,7 +139,7 @@ The surface relies on these daemon behaviours:
 5. The surface never sends parameters outside CONTRACT.md unless `CUA_ENGINE_EXTENSIONS` enables them. If the parent adds `button`, `click_count`, `modifiers` or a `mouse_move` method, the daemon must implement them, or reject unsupported values with an error rather than ignore them.
 6. `turn_ended` is sent only by the host. A daemon error on `turn_ended` causes a kill and respawn, which leaves no approvals.
 
-Smoke check against the real daemon (no GUI is launched by the surface): start the server with `CUA_DISPLAY` set to the private display, then call `list_windows` and `js` with `await cua.get_ax_state({window_id})` from any MCP client that supports form elicitation.
+Smoke check against the real daemon (no GUI is launched by the surface): start the server with `CUA_DISPLAY` set to the private display, then call `list_windows` and `js` with `await (await cua.getApp({windowId})).getAXState()` from any MCP client that supports form elicitation.
 
 ## Tests
 
@@ -143,7 +150,8 @@ npm test
 The tests use `test/fake-engine.js`, an NDJSON test double with daemon-side approval, a deny list, a slow action and a log of completed actions. They cover:
 
 - REPL persistence, completion values and `js_reset`.
-- Approval once per app per turn, denial memory and reset on `turn_ended`, and failing closed without elicitation.
+- The OpenAI-compatible shapes, `nodeRepl` output, auto-emit and `{emit: false}`, PNG bytes, and diffs relative to the last emitted tree.
+- Approval once per app per turn, session and always scopes (the approvals file, deny lists winning), denial memory and reset on `turn_ended`, and failing closed without elicitation.
 - The daemon deny list.
 - Injection boundaries: host-only methods, Node globals, `import()`, strict parameters, `__proto__`, fence escapes in AX text and titles, and calls from finished cells.
 - Timeout and MCP cancellation, proving via the engine log that the pending action never completed. Approval replay after a restart.
