@@ -26,7 +26,7 @@ export async function startClient({ env = {}, decide = () => 'accept', elicitati
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [BIN],
-    env: { PATH: process.env.PATH, CUA_ENGINE: FAKE_ENGINE, CUA_DISPLAY: ':99', FAKE_ENGINE_LOG: log, ...env },
+    env: { PATH: process.env.PATH, CUA_ENGINE: FAKE_ENGINE, CUA_DISPLAY: ':99', FAKE_ENGINE_LOG: log, CUA_APPROVALS_FILE: path.join(dir, 'approvals.json'), ...env },
     stderr: 'pipe',
   });
   let stderr = '';
@@ -36,14 +36,16 @@ export async function startClient({ env = {}, decide = () => 'accept', elicitati
     client.setRequestHandler(ElicitRequestSchema, async (req) => {
       elicitations.push(req.params);
       const d = await decide(req.params);
-      if (d === 'accept') return { action: 'accept', content: { approve: true } };
-      if (d === 'accept-false') return { action: 'accept', content: { approve: false } };
+      // accept = this turn; session/always widen the scope; deny-choice picks "Deny" in the form.
+      const choice = { accept: 'allow_turn', session: 'allow_session', always: 'allow_always', 'deny-choice': 'deny' }[d];
+      if (choice) return { action: 'accept', content: { decision: choice } };
       return { action: d };
     });
   }
   await client.connect(transport);
   return {
     client,
+    dir,
     elicitations,
     log,
     events: () => engineLog(log),

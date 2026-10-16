@@ -31,8 +31,52 @@ export function imageContent(shot) {
   return { type: 'image', data: shot.data, mimeType: shot.mimeType };
 }
 
-// Text block(s) describing an observation (without the image).
-export function observationText(obs) {
+// OpenAI-compatible shapes for model code. Raw daemon fields (window_id,
+// app_id, pid) stay on the NDJSON side.
+export function windowInfo(w) {
+  const out = { id: w.window_id, app: String(w.app_id ?? '') };
+  if (typeof w.title === 'string' && w.title) out.title = w.title;
+  return out;
+}
+
+export function appInfos(windows) {
+  const apps = new Map();
+  for (const w of windows) {
+    if (!apps.has(w.app)) apps.set(w.app, { id: w.app, displayName: w.app, isRunning: true, windows: [] });
+    apps.get(w.app).windows.push(w);
+  }
+  return [...apps.values()];
+}
+
+// Element-keyed diff of two accessibility trees ("[id] line" per element),
+// in the daemon's diff notation.
+export function treeDiff(prev, cur, maxLines = 300) {
+  const parse = (text) => {
+    const m = new Map();
+    for (const line of String(text).split('\n')) {
+      const hit = /^\s*\[(\d+)\] (.*)$/.exec(line);
+      if (hit) m.set(Number(hit[1]), hit[2]);
+    }
+    return m;
+  };
+  const a = parse(prev);
+  const b = parse(cur);
+  const out = [];
+  let total = 0;
+  const push = (s) => { total++; if (out.length < maxLines) out.push(s); };
+  for (const [id, line] of [...b].sort((x, y) => x[0] - y[0])) {
+    if (!a.has(id)) push(`+ [${id}] ${line}`);
+    else if (a.get(id) !== line) push(`~ [${id}] ${a.get(id)}\n  -> ${line}`);
+  }
+  for (const [id, line] of [...a].sort((x, y) => x[0] - y[0])) if (!b.has(id)) push(`- [${id}] ${line}`);
+  if (total === 0) return '(no accessibility changes)';
+  if (total > out.length) out.push(`… ${total - out.length} more changes`);
+  return out.join('\n');
+}
+
+// Text block(s) describing an observation (without the image). `ax` is the
+// accessibility text to show (full tree or a diff from HostApi.axView).
+export function observationText(obs, ax = obs.accessibility) {
   const lines = [];
   const w = obs.window || {};
   lines.push(`window_id=${w.window_id} app_id=${JSON.stringify(String(w.app_id ?? ''))} size=${w.width}x${w.height}`);
@@ -40,18 +84,18 @@ export function observationText(obs) {
   if (Array.isArray(obs.warnings) && obs.warnings.length) lines.push(`warnings: ${obs.warnings.map(String).join('; ')}`);
   const parts = [lines.join('\n')];
   if (obs.window) parts.push(fenceUntrusted('window', JSON.stringify({ title: obs.window.title })));
-  const diff = obs.ax_diff && !obs.ax_diff.includes('more changes') && obs.ax_diff.length < (obs.accessibility?.length || 0);
-  if (obs.accessibility !== undefined) parts.push(fenceUntrusted('accessibility', diff ? obs.ax_diff : obs.accessibility));
+  if (ax !== undefined) parts.push(fenceUntrusted('accessibility', ax));
   return parts.join('\n');
 }
 
-// MCP content blocks for an arbitrary daemon result.
-export function resultContent(method, result) {
+// MCP content blocks for an arbitrary daemon result. `axView` renders an
+// observation's tree relative to what the model last received.
+export function resultContent(method, result, axView = (obs) => obs.accessibility) {
   if (method === 'get_screenshot' && isScreenshot(result)) {
     return [{ type: 'text', text: `screenshot ${result.width}x${result.height}` }, imageContent(result)];
   }
   if (isObservation(result)) {
-    const content = [{ type: 'text', text: observationText(result) }];
+    const content = [{ type: 'text', text: observationText(result, axView(result)) }];
     if (isScreenshot(result.screenshot)) content.push(imageContent(result.screenshot));
     return content;
   }

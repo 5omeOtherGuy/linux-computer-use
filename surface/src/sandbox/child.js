@@ -13,6 +13,7 @@ import { preludeSource } from './prelude.js';
 const MAX_PARAMS_CHARS = 2_000_000;
 const MAX_LOG_CHARS = 200_000;
 const MAX_EMITS = 2_000;
+const MAX_IMAGE_CHARS = 32_000_000;
 
 let rt = null;
 let vm = null;
@@ -77,7 +78,7 @@ function failPending(evalId, code, message) {
   }
 }
 
-function init({ methods, memoryLimitMb = 128, stackKb = 1024 }) {
+function init({ memoryLimitMb = 128, stackKb = 1024 }) {
   return getQuickJS().then((QuickJS) => {
     rt = QuickJS.newRuntime();
     rt.setMemoryLimit(memoryLimitMb * 1024 * 1024);
@@ -85,22 +86,23 @@ function init({ methods, memoryLimitMb = 128, stackKb = 1024 }) {
     rt.setInterruptHandler(() => interruptAt !== null && Date.now() > interruptAt);
     vm = rt.newContext();
 
-    const hostCall = vm.newFunction('__cua_host_call', (methodH, paramsH) => {
+    const hostCall = vm.newFunction('__cua_host_call', (methodH, paramsH, optsH) => {
       const deferred = vm.newPromise();
       const method = vm.typeof(methodH) === 'string' ? vm.getString(methodH) : '';
       const params = paramsH && vm.typeof(paramsH) === 'string' ? vm.getString(paramsH) : '{}';
+      const opts = optsH && vm.typeof(optsH) === 'string' ? vm.getString(optsH) : '{}';
       const callId = ++callSeq;
       if (!current || current.abortReason) {
         const h = vm.newString(JSON.stringify({ ok: false, error: { code: 'no_active_cell', message: 'host calls are only allowed while a cell is running' } }));
         deferred.resolve(h);
         h.dispose();
-      } else if (params.length > MAX_PARAMS_CHARS) {
+      } else if (params.length > MAX_PARAMS_CHARS || opts.length > 1000) {
         const h = vm.newString(JSON.stringify({ ok: false, error: { code: 'invalid_params', message: 'params too large' } }));
         deferred.resolve(h);
         h.dispose();
       } else {
         pending.set(callId, { deferred, evalId: current.id, kind: 'host' });
-        send({ type: 'host_call', evalId: current.id, callId, method, params });
+        send({ type: 'host_call', evalId: current.id, callId, method, params, opts });
       }
       deferred.settled.then(() => pump());
       return deferred.handle;
@@ -111,15 +113,16 @@ function init({ methods, memoryLimitMb = 128, stackKb = 1024 }) {
       const kind = vm.getString(kindH);
       const payload = vm.getString(payloadH);
       current.emits++;
-      current.chars += payload.length;
-      if (current.emits > MAX_EMITS || current.chars > MAX_LOG_CHARS) {
+      if (kind === 'image') current.imageChars += payload.length;
+      else current.chars += payload.length;
+      if (current.emits > MAX_EMITS || current.chars > MAX_LOG_CHARS || current.imageChars > MAX_IMAGE_CHARS) {
         if (!current.truncated) {
           current.truncated = true;
-          send({ type: 'emit', evalId: current.id, kind: 'log', payload: JSON.stringify({ level: 'warn', text: '[output truncated]' }) });
+          send({ type: 'emit', evalId: current.id, kind: 'text', payload: JSON.stringify({ level: 'warn', text: '[output truncated]' }) });
         }
         return vm.undefined;
       }
-      if (kind === 'log' || kind === 'image') send({ type: 'emit', evalId: current.id, kind, payload });
+      if (kind === 'text' || kind === 'image') send({ type: 'emit', evalId: current.id, kind, payload });
       return vm.undefined;
     });
 
@@ -142,7 +145,7 @@ function init({ methods, memoryLimitMb = 128, stackKb = 1024 }) {
       vm.setProp(vm.global, fn === hostCall ? '__cua_host_call' : fn === emit ? '__cua_emit' : '__cua_sleep', fn);
       fn.dispose();
     }
-    const r = vm.evalCode(preludeSource(methods), 'prelude.js');
+    const r = vm.evalCode(preludeSource(), 'prelude.js');
     if (r.error) {
       const msg = JSON.stringify(vm.dump(r.error));
       r.error.dispose();
@@ -189,7 +192,7 @@ function startEval({ id, code, timeoutMs }) {
     send({ type: 'done', id, ok: false, error: `SyntaxError: ${err.message}` });
     return;
   }
-  current = { id, deadline: Date.now() + timeoutMs, emits: 0, chars: 0, truncated: false, abortReason: null, timer: null };
+  current = { id, deadline: Date.now() + timeoutMs, emits: 0, chars: 0, imageChars: 0, truncated: false, abortReason: null, timer: null };
   interruptAt = current.deadline;
   current.timer = setTimeout(() => abort(id, 'timeout'), timeoutMs);
   const res = vm.evalCode(wrapped, `cell-${id}.js`);

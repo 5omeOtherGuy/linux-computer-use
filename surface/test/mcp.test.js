@@ -2,7 +2,11 @@
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { readFileSync, writeFileSync } from 'node:fs';
+import path from 'node:path';
 import { startClient, sleep, BIN, FAKE_ENGINE } from './helpers.js';
+
+const APP = 'const app = await cua.getApp({windowId: 11}, {emit: false});';
 
 describe('MCP surface', () => {
   let t;
@@ -22,11 +26,12 @@ describe('MCP surface', () => {
     const js = tools.find((x) => x.name === 'js');
     assert.deepEqual(Object.keys(js.inputSchema.properties).sort(), ['code', 'timeout_ms', 'title']);
     assert.match(js.description, /Confirmation policy/);
+    assert.match(js.description, /nodeRepl\.emitImage/);
     assert.match(tools.find((x) => x.name === 'click').description, /Confirmation policy/);
   });
 
   test('REPL persistence across cells, top-level await, js_reset', async () => {
-    let r = await t.js('let n = 2; const f = (x) => x * n; class P { v() { return n } } function g() { return "g" + n }\nconst [w] = await cua.list_windows(); w.window_id', { title: 'setup' });
+    let r = await t.js('let n = 2; const f = (x) => x * n; class P { v() { return n } } function g() { return "g" + n }\nconst [w] = await cua.listWindows({emit: false}); w.id', { title: 'setup' });
     assert.equal(r.isError, false, t.text(r));
     assert.match(t.text(r), /\[setup\] ok/);
     assert.match(t.text(r), /=> 11/);
@@ -42,24 +47,84 @@ describe('MCP surface', () => {
     assert.match(t.text(r), /=> undefined undefined/);
   });
 
-  test('approval via elicitation once per app per turn, automatic AX output and images', async () => {
+  test('OpenAI-compatible discovery shapes; window_id stays on the raw side', async () => {
+    let r = await t.js(`const ws = await cua.listWindows({emit: false});
+      const apps = await cua.listApps({emit: false});
+      const state = await cua.getState({emit: false});
+      const calc = await cua.getApp({appId: 'org.example.Calc'}, {emit: false});
+      JSON.stringify([ws.map((w) => Object.keys(w).sort().join('|')), Object.keys(apps[0]).sort(), Object.keys(state).sort(),
+        apps[0].windows[0].id, calc.id, calc.windowId, calc.windows[0].app])`);
+    assert.equal(r.isError, false, t.text(r));
+    assert.match(t.text(r), /=> \[\["app\|id\|title","app\|id\|title","app\|id\|title"\],\["displayName","id","isRunning","windows"\],\["apps","browsers"\],11,"org.example.Calc",12,"org.example.Calc"\]/);
+    assert.doesNotMatch(t.text(r), /window_id/);
+    // Discovery calls emit their (untrusted) result by default.
+    r = await t.js('await cua.listWindows(); await cua.getApp({windowId: 12}); "x"');
+    assert.match(t.text(r), /<<<UNTRUSTED windows nonce=[^>]*>>>[^]*"id":11/);
+    assert.match(t.text(r), /<<<UNTRUSTED app nonce=[^>]*>>>[^]*"displayName":"org.example.Calc"/);
+    r = await t.js('try { await cua.getApp({windowId: 999}) } catch (e) { e.code }');
+    assert.match(t.text(r), /=> window_not_found/);
+  });
+
+  test('approval via elicitation once per app per turn; final state after the last action', async () => {
     const before = t.elicitations.length;
-    const r = await t.js('const o = await cua.click({window_id: 11, element_index: 1}); console.log(o.window.app_id); await cua.typeText({window_id: 11, text: "hi"}); "done"');
+    const r = await t.js(`${APP} await app.click(1); await app.typeText("hi"); "done"`);
     assert.equal(r.isError, false, t.text(r));
     assert.equal(t.elicitations.length, before + 1, 'exactly one elicitation for the app');
-    const msg = t.elicitations.at(-1).message;
-    assert.match(msg, /org\.example\.Notes/);
-    assert.match(msg, /untrusted/);
-    assert.match(msg, /Confirmation policy/);
+    const req = t.elicitations.at(-1);
+    assert.match(req.message, /org\.example\.Notes/);
+    assert.match(req.message, /untrusted/);
+    assert.match(req.message, /Confirmation policy/);
+    assert.deepEqual(req.requestedSchema.properties.decision.enum, ['allow_turn', 'allow_session', 'allow_always', 'deny']);
     const text = t.text(r);
-    assert.match(text, /org\.example\.Notes/);
     assert.match(text, /=> done/);
-    assert.match(text, /<<<UNTRUSTED accessibility nonce=/);
-    assert.ok(r.content.some((c) => c.type === 'image' && c.mimeType === 'image/png'), 'screenshot attached');
+    assert.match(text, /state after the last action[^]*<<<UNTRUSTED accessibility nonce=/);
+    assert.ok(r.content.some((c) => c.type === 'image' && c.mimeType === 'image/png'), 'post-action screenshot attached');
     const performed = t.performed().filter((e) => e.params.window_id === 11);
     assert.deepEqual(performed.map((e) => e.method).slice(-2), ['click', 'type_text']);
     const approvals = t.events().filter((e) => e.event === 'request' && e.method === 'approve_app');
     assert.deepEqual(approvals.at(-1).params, { window_id: 11, app_id: 'org.example.Notes' });
+  });
+
+  test('nodeRepl output API: write, emitImage, auto-emitted observations, PNG bytes', async () => {
+    let r = await t.js(`${APP}
+      nodeRepl.write({a: 1}); nodeRepl.write("plain text");
+      const png = await app.getScreenshot({emit: false});
+      await nodeRepl.emitImage(png);
+      await nodeRepl.emitImage({bytes: png.slice(), mimeType: 'image/png'});
+      [png instanceof Uint8Array, png[0], png[1], png[2], png[3]].join()`);
+    assert.equal(r.isError, false, t.text(r));
+    assert.match(t.text(r), /\{\n  "a": 1\n\}\nplain text/);
+    assert.match(t.text(r), /=> true,137,80,78,71/);
+    const images = r.content.filter((c) => c.type === 'image');
+    assert.equal(images.length, 2);
+    assert.equal(images[0].data, images[1].data, 're-encoded bytes round-trip exactly');
+    r = await t.js(`${APP} await app.getScreenshot(); await app.getAXState({emit: false}); "x"`);
+    assert.equal(r.content.filter((c) => c.type === 'image').length, 1, 'getScreenshot emits by default');
+    assert.doesNotMatch(t.text(r), /UNTRUSTED accessibility/, 'emit:false suppresses the tree');
+    r = await t.js(`${APP} await app.getAXStateAndScreenshot(); "y"`);
+    assert.match(t.text(r), /<<<UNTRUSTED accessibility nonce=/);
+    assert.equal(r.content.filter((c) => c.type === 'image').length, 1);
+    r = await t.js('try { await nodeRepl.emitImage(new Uint8Array([1, 2, 3])) } catch (e) { e.code }');
+    assert.match(t.text(r), /=> invalid_params/);
+  });
+
+  test('getAXState diffs are relative to the tree the model last received', async () => {
+    let r = await t.js(`${APP} await app.getAXState({disableDiffing: true}); "baseline"`);
+    const baseline = t.text(r).match(/\[3\] entry ("[^"\n]*")/)[1];
+    // One cell: an internal (not emitted) observation between two actions.
+    r = await t.js(`${APP}
+      await app.typeText("a");
+      await app.getAXState({emit: false});
+      await app.typeText("b");
+      await app.getAXState(); "end"`);
+    assert.equal(r.isError, false, t.text(r));
+    const text = t.text(r);
+    const now = JSON.stringify(JSON.parse(baseline) + 'ab');
+    assert.ok(text.includes(`~ [3] entry ${baseline}\n  -> entry ${now}`), text);
+    assert.doesNotMatch(text, /state after the last action/, 'the emitted tree already showed the final state');
+    // Without an emitted observation, the cell output carries the post-action state as a diff.
+    r = await t.js(`${APP} await app.typeText("c")`);
+    assert.ok(t.text(r).includes(`~ [3] entry ${now}\n  -> entry ${JSON.stringify(JSON.parse(now) + 'c')}`), t.text(r));
   });
 
   test('screen content cannot close the untrusted fence', async () => {
@@ -78,7 +143,7 @@ describe('MCP surface', () => {
 
   test('denial: declined app is never touched, not re-asked in the turn, asked again after turn_ended', async () => {
     const before = t.elicitations.length;
-    let r = await t.js('try { await cua.click({window_id: 13, element_index: 0}) } catch (e) { e.code }');
+    let r = await t.js('try { const v = await cua.getApp({windowId: 13}, {emit: false}); await v.click(0) } catch (e) { e.code }');
     assert.match(t.text(r), /=> approval_denied/);
     assert.equal(t.elicitations.length, before + 1);
     r = await t.client.callTool({ name: 'click', arguments: { window_id: 13, x: 1, y: 1 } });
@@ -91,39 +156,37 @@ describe('MCP surface', () => {
     r = await t.client.callTool({ name: 'turn_ended', arguments: {} });
     assert.match(t.text(r), /approvals cleared/);
     assert.ok(t.events().some((e) => e.event === 'request' && e.method === 'turn_ended'));
-    // approvals were reset too: Notes needs a new elicitation
-    r = await t.js('(await cua.get_ax_state({window_id: 11})).window.window_id');
+    // turn approvals were reset too: Notes needs a new elicitation
+    r = await t.js(`${APP} await app.getAXState({emit: false}); app.windowId`);
     assert.match(t.text(r), /=> 11/);
     assert.equal(t.elicitations.length, before + 2);
     assert.match(t.elicitations.at(-1).message, /org\.example\.Notes/);
-    r = await t.js('try { await cua.get_ax_state({window_id: 13}) } catch (e) { e.code }');
+    r = await t.js('try { await (await cua.getApp({windowId: 13}, {emit: false})).getAXState() } catch (e) { e.code }');
     assert.match(t.text(r), /=> approval_denied/);
     assert.equal(t.elicitations.length, before + 3, 'asked again after turn_ended');
   });
 
-  test('injection boundaries: no host-only methods, no Node APIs, strict params', async () => {
-    let r = await t.js(`[typeof cua.approve_app, typeof cua.turn_ended, typeof cua.turnEnded, typeof __cua_host_call, typeof __cua_emit,
+  test('injection boundaries: no raw or host-only methods, no Node APIs, strict params', async () => {
+    let r = await t.js(`[typeof cua.approve_app, typeof cua.turn_ended, typeof cua.click, typeof cua.list_windows, typeof __cua_host_call, typeof __cua_emit,
       typeof require, typeof process, typeof fetch, typeof globalThis.WebAssembly, typeof setTimeout, typeof Deno, typeof Bun].join(",")`);
-    assert.match(t.text(r), /=> undefined,undefined,undefined,undefined,undefined,undefined,undefined,undefined,undefined,undefined,undefined,undefined/);
+    assert.match(t.text(r), /=> undefined,undefined,undefined,undefined,undefined,undefined,undefined,undefined,undefined,undefined,undefined,undefined,undefined/);
     r = await t.js('try { await import("node:fs"); "imported" } catch (e) { "blocked: " + e.name }');
     assert.match(t.text(r), /blocked/);
-    r = await t.js('Object.isFrozen(cua) && (() => { try { cua.click = 1 } catch (e) {} return typeof cua.click })()');
+    r = await t.js('Object.isFrozen(cua) && Object.isFrozen(nodeRepl) && (() => { try { cua.getApp = 1 } catch (e) {} return typeof cua.getApp })()');
     assert.match(t.text(r), /=> function/);
     const attempts = {
-      'string window id': '{window_id: "11; rm -rf /", element_index: 1}',
-      'extra param': '{window_id: 11, element_index: 1, approve: true}',
-      'proto key': 'JSON.parse(\'{"window_id": 11, "element_index": 1, "__proto__": {"x": 1}}\')',
-      'both targets': '{window_id: 11, element_index: 1, x: 1, y: 1}',
-      'negative coord': '{window_id: 11, x: -5, y: 1}',
-      'extension param': '{window_id: 11, x: 1, y: 1, button: "right"}',
+      'string target': 'app.click("11; rm -rf /")',
+      'extra option': 'app.click(1, {approve: true})',
+      'negative coord': 'app.click([-5, 1])',
+      'extension option': 'app.click([1, 1], {mouseButton: "right"})',
+      'key injection': 'app.pressKey("ctrl+s\\nrm")',
+      'non-string text': 'app.typeText({toString() { return "x" }})',
     };
     const before = t.performed().length;
-    for (const [label, params] of Object.entries(attempts)) {
-      r = await t.js(`try { await cua.click(${params}); "ran" } catch (e) { e.code }`);
+    for (const [label, call] of Object.entries(attempts)) {
+      r = await t.js(`${APP} try { await ${call}; "ran" } catch (e) { e.code }`);
       assert.match(t.text(r), /=> (invalid_params|unsupported)/, label);
     }
-    r = await t.js('try { await cua.press_key({window_id: 11, key: "ctrl+s\\nrm"}) } catch (e) { e.code }');
-    assert.match(t.text(r), /=> invalid_params/);
     assert.equal(t.performed().length, before, 'nothing reached the engine');
     r = await t.client.callTool({ name: 'approve_app', arguments: { window_id: 13, app_id: 'org.example.Vault' } });
     assert.equal(r.isError, true);
@@ -133,21 +196,21 @@ describe('MCP surface', () => {
   });
 
   test('unawaited calls are cancelled at cell end and never land later', async () => {
-    await t.js('await cua.get_ax_state({window_id: 11})'); // ensure approved in this turn
-    const r = await t.js('cua.type_text({window_id: 11, text: "SLOW:unawaited"}); "returned"');
+    await t.js(`${APP} await app.getAXState({emit: false})`); // ensure approved in this turn
+    const r = await t.js(`${APP} app.typeText("SLOW:unawaited"); "returned"`);
     assert.match(t.text(r), /=> returned/);
     assert.match(t.text(r), /cancelled/);
     await sleep(2200);
     assert.equal(t.performed().filter((e) => e.params.text === 'SLOW:unawaited').length, 0);
     // a stale callback from an old cell cannot act between cells either
-    const r2 = await t.js('let later; later = async () => cua.get_ax_state({window_id: 11}); "ok"');
+    const r2 = await t.js(`${APP} let later; later = async () => app.getAXState(); "ok"`);
     assert.match(t.text(r2), /=> ok/);
   });
 
   test('timeout terminates the pending action and keeps REPL state', async () => {
-    await t.js('let keep = "kept"; await cua.get_ax_state({window_id: 11})');
+    await t.js(`let keep = "kept"; ${APP} await app.getAXState({emit: false})`);
     const started = Date.now();
-    let r = await t.js('await cua.type_text({window_id: 11, text: "SLOW:timeout"})', { timeout_ms: 400 });
+    let r = await t.js(`${APP} await app.typeText("SLOW:timeout")`, { timeout_ms: 400 });
     assert.equal(r.isError, true);
     assert.match(t.text(r), /timeout/i);
     assert.ok(Date.now() - started < 1400, 'returned promptly');
@@ -160,15 +223,15 @@ describe('MCP surface', () => {
     assert.match(t.text(r), /=> kept/);
     // the engine was restarted and approvals of this turn were replayed: no new prompt
     const before = t.elicitations.length;
-    r = await t.js('(await cua.click({window_id: 11, element_index: 1})).window.window_id');
+    r = await t.js(`${APP} await app.click(1); app.windowId`);
     assert.match(t.text(r), /=> 11/);
     assert.equal(t.elicitations.length, before);
   });
 
   test('MCP cancellation terminates the pending action', async () => {
-    await t.js('await cua.get_ax_state({window_id: 11})');
+    await t.js(`${APP} await app.getAXState({emit: false})`);
     const ac = new AbortController();
-    const p = t.js('await cua.type_text({window_id: 11, text: "SLOW:cancel"}); "finished"', {}, { signal: ac.signal });
+    const p = t.js(`${APP} await app.typeText("SLOW:cancel"); "finished"`, {}, { signal: ac.signal });
     await sleep(400);
     ac.abort();
     await assert.rejects(p);
@@ -199,24 +262,63 @@ describe('MCP surface', () => {
     assert.ok(starts.every((e) => e.display === ':99'));
   });
 
-  test('window-bound cua API persists and returns observations', async () => {
-    let r = await t.js('const app = await cua.getApp({windowId:11}); await app.getAXState({disableDiffing:true})');
-    assert.equal(r.isError, false, t.text(r));
-    assert.match(t.text(r), /button "OK"/);
-    r = await t.js('await app.setValue(2, "bound"); await app.click(1); (await cua.getState()).apps.length');
-    assert.equal(r.isError, false, t.text(r));
-    assert.match(t.text(r), /=> 3/);
-  });
-
   test('turn_ended cancels an active cell before it can issue another action', async () => {
-    await t.js('await cua.get_ax_state({window_id:11})');
-    const pending = t.js('await sleep(600); await cua.typeText({window_id:11,text:"after-turn"})');
+    await t.js(`${APP} await app.getAXState({emit: false})`);
+    const pending = t.js(`${APP} await sleep(600); await app.typeText("after-turn")`);
     await sleep(100);
-    await t.client.callTool({name:'turn_ended',arguments:{}});
+    await t.client.callTool({ name: 'turn_ended', arguments: {} });
     const r = await pending;
     assert.equal(r.isError, true);
     await sleep(700);
-    assert.equal(t.performed().filter(e => e.params.text === 'after-turn').length, 0);
+    assert.equal(t.performed().filter((e) => e.params.text === 'after-turn').length, 0);
+  });
+});
+
+describe('approval scopes', () => {
+  test('session approval survives turn_ended without a new prompt', async () => {
+    const t = await startClient({ decide: () => 'session' });
+    try {
+      let r = await t.js(`${APP} await app.getAXState({emit: false}); "a"`);
+      assert.match(t.text(r), /=> a/);
+      await t.client.callTool({ name: 'turn_ended', arguments: {} });
+      r = await t.js(`${APP} await app.click(1); "b"`);
+      assert.match(t.text(r), /=> b/);
+      assert.equal(t.elicitations.length, 1);
+      // The daemon forgot its approval at turn end; the host re-granted it.
+      assert.equal(t.events().filter((e) => e.method === 'approve_app').length, 2);
+    } finally {
+      await t.close();
+    }
+  });
+
+  test('always approval persists in the operator file; deny lists still win', async () => {
+    const t = await startClient({ decide: () => 'always' });
+    const file = path.join(t.dir, 'approvals.json');
+    try {
+      const r = await t.js(`${APP} await app.getAXState({emit: false}); "a"`);
+      assert.match(t.text(r), /=> a/);
+      assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), { always_allowed_app_ids: ['org.example.Notes'] });
+      // A new server process with the same file does not ask again.
+      const t2 = await startClient({ decide: () => 'decline', env: { CUA_APPROVALS_FILE: file } });
+      try {
+        const r2 = await t2.js(`${APP} await app.click(1); "b"`);
+        assert.match(t2.text(r2), /=> b/);
+        assert.equal(t2.elicitations.length, 0);
+      } finally {
+        await t2.close();
+      }
+      writeFileSync(file, JSON.stringify({ always_allowed_app_ids: ['org.example.Notes', 'org.example.Calc'] }));
+      const t3 = await startClient({ decide: () => 'accept', env: { CUA_APPROVALS_FILE: file, CUA_DENY_APPS: 'org.example.Calc' } });
+      try {
+        const r3 = await t3.js('try { await (await cua.getApp({windowId: 12}, {emit: false})).getAXState() } catch (e) { e.code }');
+        assert.match(t3.text(r3), /=> app_denied/);
+        assert.equal(t3.events().filter((e) => e.method === 'approve_app').length, 0);
+      } finally {
+        await t3.close();
+      }
+    } finally {
+      await t.close();
+    }
   });
 });
 
@@ -232,7 +334,7 @@ describe('fail-closed configuration', () => {
   test('without client elicitation support, approval fails closed', async () => {
     const t = await startClient({ elicitation: false });
     try {
-      const r = await t.js('try { await cua.click({window_id: 11, element_index: 1}) } catch (e) { e.code }');
+      const r = await t.js(`try { ${APP} await app.click(1) } catch (e) { e.code }`);
       assert.match(t.text(r), /=> approval_unavailable/);
       assert.equal(t.performed().length, 0);
     } finally {
@@ -240,12 +342,12 @@ describe('fail-closed configuration', () => {
     }
   });
 
-  test('daemon deny list wins and declined approval (approve=false) is a denial', async () => {
-    const t = await startClient({ env: { CUA_DENY_APPS: 'org.example.Calc' }, decide: () => 'accept-false' });
+  test('daemon deny list wins and choosing Deny is a denial', async () => {
+    const t = await startClient({ env: { CUA_DENY_APPS: 'org.example.Calc' }, decide: () => 'deny-choice' });
     try {
-      let r = await t.js('try { await cua.get_ax_state({window_id: 12}) } catch (e) { e.code }');
+      let r = await t.js('try { await (await cua.getApp({windowId: 12}, {emit: false})).getAXState() } catch (e) { e.code }');
       assert.match(t.text(r), /=> app_denied/);
-      r = await t.js('try { await cua.get_ax_state({window_id: 11}) } catch (e) { e.code }');
+      r = await t.js(`try { ${APP} await app.getAXState() } catch (e) { e.code }`);
       assert.match(t.text(r), /=> approval_denied/);
       assert.equal(t.events().filter((e) => e.method === 'approve_app').length, 0);
     } finally {

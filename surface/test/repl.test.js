@@ -44,7 +44,7 @@ describe('SandboxRunner', () => {
   });
 
   test('destructuring, classes, functions and await persist', async () => {
-    let res = await r.eval({ code: 'const { a, b: [c = 5] } = { a: 1, b: [] }; var v; let u; async function f() { return (await cua.list_windows()).length }', timeoutMs: 5000 });
+    let res = await r.eval({ code: 'const { a, b: [c = 5] } = { a: 1, b: [] }; var v; let u; async function f() { return (await cua.listWindows({emit: false})).length }', timeoutMs: 5000 });
     assert.equal(res.ok, true, res.error);
     res = await r.eval({ code: '[a, c, typeof v, typeof u, await f()].join()', timeoutMs: 5000 });
     assert.equal(res.value, '1,5,undefined,undefined,1');
@@ -62,11 +62,12 @@ describe('SandboxRunner', () => {
     assert.match(res.error, /cell-\d+\.js:3/);
   });
 
-  test('images are host-side handles that display() can show', async () => {
-    const res = await r.eval({ code: 'const s = await cua.get_screenshot({window_id: 1}); display(s); Object.keys(s).sort().join(",")', timeoutMs: 5000 });
-    assert.equal(res.value, '$image,height,mimeType,width');
-    assert.equal(res.images.length, 1);
-    assert.equal(res.images[0].data, 'iVBORw0KGgo=');
+  test('screenshots are PNG bytes that display() can show without re-encoding', async () => {
+    const res = await r.eval({ code: 'const app = await cua.getApp({windowId: 1}, {emit: false}); const s = await app.getScreenshot({emit: false}); await display(s); [s instanceof Uint8Array, s.length, ...s].join(",")', timeoutMs: 5000 });
+    assert.equal(res.value, 'true,8,137,80,78,71,13,10,26,10');
+    const images = res.outputs.filter((o) => o.type === 'image');
+    assert.equal(images.length, 1);
+    assert.equal(images[0].data, 'iVBORw0KGgo=');
   });
 
   test('memory limit stops runaway allocation without killing the process', async () => {
@@ -95,14 +96,14 @@ describe('SandboxRunner', () => {
   test('console output is captured and bounded', async () => {
     const res = await r.eval({ code: 'for (let i = 0; i < 5000; i++) console.log("line", i)', timeoutMs: 10_000 });
     assert.equal(res.ok, true);
-    assert.ok(res.logs.length <= 2001);
-    assert.equal(res.logs.at(-1).text, '[output truncated]');
+    assert.ok(res.outputs.length <= 2001);
+    assert.equal(res.outputs.at(-1).text, '[warn] [output truncated]');
   });
 
   test('host calls are only possible while a cell runs', async () => {
     // A promise chain that would call the host after the cell ended.
     const before = calls.length;
-    let res = await r.eval({ code: 'globalThis.later = Promise.resolve().then(() => sleep(50)).then(() => cua.list_windows()).then(() => "ran", (e) => e.code); "started"', timeoutMs: 5000 });
+    let res = await r.eval({ code: 'globalThis.later = Promise.resolve().then(() => sleep(50)).then(() => cua.listWindows()).then(() => "ran", (e) => e.code); "started"', timeoutMs: 5000 });
     assert.equal(res.value, 'started');
     res = await r.eval({ code: 'await later', timeoutMs: 5000 });
     assert.equal(res.value, 'no_active_cell');
