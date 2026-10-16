@@ -65,6 +65,8 @@ const MAX_LINES: usize = 1200;
 const MAX_TEXT_CHARS: i32 = 240;
 const MAX_NAME_CHARS: usize = 160;
 const MAX_CHILDREN_LIVE: i32 = 1000;
+/// Children shown of a container larger than `MAX_CHILDREN_LIVE`.
+const MAX_VISIBLE_KIDS: i32 = 150;
 const MAX_TOPLEVELS: usize = 64;
 const MAX_ACTIONS_SHOWN: usize = 8;
 const MAX_INSERT_BYTES: usize = 1 << 20;
@@ -147,6 +149,9 @@ const R_APPLICATION: u32 = 75;
 const R_REDUNDANT_OBJECT: u32 = 86;
 const R_LIST_BOX: u32 = 98;
 const R_SWITCH: u32 = 130;
+const R_ENTRY: u32 = 79;
+
+const A11Y_DISABLED: &str = "org.a11y.Status.IsEnabled is false on the session bus; Qt and Electron applications may need QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1 or --force-renderer-accessibility to expose a tree";
 
 const ROLE_NAMES: [&str; 131] = [
     "invalid",
@@ -366,6 +371,8 @@ pub struct Accessibility {
     events_registered: bool,
     /// Reported with the first observation of the session only.
     setup_warnings: Vec<String>,
+    /// org.a11y.Status.IsEnabled was false on the session bus.
+    a11y_disabled: bool,
     pids: HashMap<String, u32>,
     /// Application buses that recently failed to answer, until when they
     /// are skipped.
@@ -805,6 +812,58 @@ async fn live_children(conn: &Connection, r: &ObjRef) -> Result<Vec<ObjRef>> {
         .collect())
 }
 
+/// Children of a container too large to traverse (web lists, big tables)
+/// that intersect `view` (screen coordinates), at most `MAX_VISIBLE_KIDS`,
+/// found by binary search over child indices; assumes children are laid out
+/// top to bottom. Without geometry, the first `MAX_VISIBLE_KIDS`.
+async fn visible_children(
+    conn: &Connection,
+    r: &ObjRef,
+    count: i32,
+    view: Option<Rect>,
+) -> Result<(i32, Vec<ObjRef>)> {
+    let child = |i: i32| async move {
+        let w: WireRef = call(conn, r, I_ACC, "GetChildAtIndex", &(i,)).await?;
+        anyhow::Ok(ObjRef::from_wire(&w))
+    };
+    let bottom = |c: ObjRef| async move {
+        extents(conn, &c, COORD_SCREEN)
+            .await
+            .ok()
+            .flatten()
+            .map(|e| (e.y, e.y + e.h))
+    };
+    let mut first = 0;
+    if let Some(v) = view {
+        let (mut lo, mut hi) = (0, count);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match bottom(child(mid).await?).await {
+                Some((_, b)) if b <= v.y => lo = mid + 1,
+                Some(_) => hi = mid,
+                None => {
+                    lo = 0;
+                    break;
+                }
+            }
+        }
+        first = lo.min(count.saturating_sub(1)).max(0);
+    }
+    let mut out = Vec::new();
+    for i in first..count.min(first + MAX_VISIBLE_KIDS) {
+        let c = child(i).await?;
+        if let Some(v) = view {
+            if matches!(bottom(c.clone()).await, Some((top, _)) if top >= v.y + v.h) {
+                break;
+            }
+        }
+        if !c.is_null() {
+            out.push(c);
+        }
+    }
+    Ok((first, out))
+}
+
 async fn extents(conn: &Connection, r: &ObjRef, coord: u32) -> Result<Option<Rect>> {
     let t: (i32, i32, i32, i32) = call(conn, r, I_COMPONENT, "GetExtents", &(coord,)).await?;
     Ok(Rect::from_tuple(t))
@@ -1004,9 +1063,7 @@ async fn resolve_bus_address(warnings: &mut Vec<String>) -> Result<String> {
     )?;
     match get_prop::<bool>(&conn, &bus, "org.a11y.Status", "IsEnabled").await {
         Ok(true) => {}
-        Ok(false) => warnings.push(
-            "org.a11y.Status.IsEnabled is false on the session bus; Qt/Chromium/Electron applications may not expose AT-SPI trees".into(),
-        ),
+        Ok(false) => warnings.push(A11Y_DISABLED.into()),
         Err(e) => warnings.push(format!("could not read org.a11y.Status.IsEnabled: {e:#}")),
     }
     Ok(addr)
@@ -1203,7 +1260,12 @@ impl Accessibility {
             );
         }
 
+        // Only relevant when an app shows no tree; GTK apps with atk-bridge
+        // and Chromium with --force-renderer-accessibility work regardless.
+        let a11y_disabled = setup_warnings.iter().any(|w| w == A11Y_DISABLED);
+        setup_warnings.retain(|w| w != A11Y_DISABLED);
         Ok(Accessibility {
+            a11y_disabled,
             conn,
             events,
             listener,
@@ -1484,7 +1546,15 @@ impl Accessibility {
             });
         }
         if cands.is_empty() {
-            bail!("pid {} has no showing AT-SPI top-level window", w.pid);
+            bail!(
+                "pid {} has no showing AT-SPI top-level window{}",
+                w.pid,
+                if self.a11y_disabled {
+                    format!(" ({A11Y_DISABLED})")
+                } else {
+                    String::new()
+                }
+            );
         }
         cands.sort_by_key(|c| std::cmp::Reverse(c.score));
         let describe = |c: &Candidate| {
@@ -1677,6 +1747,7 @@ impl Accessibility {
         let mut tree = Tree::default();
         tree.nodes.insert(frame.clone(), frame_node);
         let mut frontier = vec![frame.clone()];
+        let mut view: Option<Rect> = None;
         for depth in 0..MAX_DEPTH {
             if frontier.is_empty() {
                 break;
@@ -1688,6 +1759,7 @@ impl Accessibility {
             }
             let mut next: Vec<ObjRef> = Vec::new();
             let mut need_live: Vec<ObjRef> = Vec::new();
+            let mut big: Vec<(ObjRef, i32)> = Vec::new();
             for r in &frontier {
                 let n = &tree.nodes[r];
                 if (depth > 0 && !has(n.states, S_SHOWING))
@@ -1720,20 +1792,15 @@ impl Accessibility {
                     }
                     _ => {
                         if n.child_count > MAX_CHILDREN_LIVE {
-                            tree.truncated.push(format!(
-                                "{} children of a {} {} not traversed (exceeds {MAX_CHILDREN_LIVE})",
-                                n.child_count,
-                                role_name(n.role),
-                                quote(&n.name, 40)
-                            ));
+                            big.push((r.clone(), n.child_count));
                             continue;
                         }
                         need_live.push(r.clone());
                     }
                 }
             }
-            if !need_live.is_empty() {
-                let lists: Vec<(ObjRef, Result<Vec<ObjRef>>)> = stream::iter(need_live)
+            if !need_live.is_empty() || !big.is_empty() {
+                let mut lists: Vec<(ObjRef, Result<Vec<ObjRef>>)> = stream::iter(need_live)
                     .map(|r| async move {
                         let k = live_children(conn, &r).await;
                         (r, k)
@@ -1742,6 +1809,33 @@ impl Accessibility {
                     .take_until(tokio::time::sleep_until(deadline.into()))
                     .collect()
                     .await;
+                for (r, count) in big {
+                    if view.is_none() {
+                        view = extents(conn, frame, COORD_SCREEN).await.ok().flatten();
+                    }
+                    let k = tokio::time::timeout_at(
+                        deadline.into(),
+                        visible_children(conn, &r, count, view),
+                    )
+                    .await
+                    .unwrap_or_else(|_| Err(anyhow!("timed out")));
+                    let n = &tree.nodes[&r];
+                    tree.truncated.push(match &k {
+                        Ok((first, k)) if !k.is_empty() => format!(
+                            "{} {} has {count} children; showing {}-{} (the visible part); scroll for more",
+                            role_name(n.role),
+                            quote(&n.name, 40),
+                            first + 1,
+                            first + k.len() as i32
+                        ),
+                        _ => format!(
+                            "{count} children of a {} {} not traversed (exceeds {MAX_CHILDREN_LIVE})",
+                            role_name(n.role),
+                            quote(&n.name, 40)
+                        ),
+                    });
+                    lists.push((r, k.map(|(_, k)| k)));
+                }
                 let mut to_fetch: Vec<ObjRef> = Vec::new();
                 let mut new_lists: Vec<(ObjRef, Vec<ObjRef>)> = Vec::new();
                 for (p, k) in lists {
@@ -2059,6 +2153,39 @@ impl Accessibility {
             return Ok(None);
         }
         Ok(Some((r.x + r.w / 2, r.y + r.h / 2)))
+    }
+
+    /// Screen centre of a text field that exposes Text but not EditableText
+    /// (Chromium web inputs), which can only be set with key events.
+    pub async fn key_entry_point(
+        &mut self,
+        window: &WindowInfo,
+        idx: u32,
+    ) -> Result<Option<(i32, i32)>> {
+        self.ensure_observed(window, Some(idx)).await;
+        let el = self.resolve(window, idx).await?;
+        if el.has_iface(I_EDIT)
+            || !el.has_iface(I_TEXT)
+            || !el.has_iface(I_COMPONENT)
+            || !matches!(el.role, R_ENTRY | R_PASSWORD_TEXT)
+        {
+            return Ok(None);
+        }
+        require_enabled(&el, idx)?;
+        let Some(r) = extents(&self.conn, &el.r, COORD_SCREEN).await? else {
+            return Ok(None);
+        };
+        if r.w <= 0 || r.h <= 0 {
+            return Ok(None);
+        }
+        Ok(Some((r.x + r.w.min(40) / 2, r.y + r.h / 2)))
+    }
+
+    /// Current text of an element with the Text interface.
+    pub async fn element_text(&mut self, window: &WindowInfo, idx: u32) -> Result<String> {
+        let el = self.resolve(window, idx).await?;
+        let n: i32 = get_prop(&self.conn, &el.r, I_TEXT, "CharacterCount").await?;
+        call(&self.conn, &el.r, I_TEXT, "GetText", &(0i32, n.min(4000))).await
     }
 
     /// Reason not to send key events to the window's app, if any. GTK's

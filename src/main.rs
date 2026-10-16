@@ -327,7 +327,50 @@ impl Engine {
                 let ax = self.ax.as_mut().context(
                     "Accessibility unavailable: element actions require an isolated AT-SPI bus",
                 )?;
-                Self::with_input_watch(&mut self.desktop, ax.action(&w, method, &r.params)).await?
+                let key_entry = match (method, element, p["value"].as_str()) {
+                    ("set_value", Some(idx), Some(text)) => ax
+                        .key_entry_point(&w, idx)
+                        .await?
+                        .map(|point| (idx, point, text)),
+                    _ => None,
+                };
+                match key_entry {
+                    // Web inputs in Chromium have no EditableText: focus the
+                    // field, select its content and type the value.
+                    Some((idx, (sx, sy), text)) => {
+                        let (ox, oy) = self.desktop.origin(w.window_id)?;
+                        self.desktop.click_element_point(&w, sx - ox, sy - oy)?;
+                        let key = if text.is_empty() { "ctrl+a BackSpace" } else { "ctrl+a" };
+                        for k in key.split(' ') {
+                            self.desktop.action(
+                                &w,
+                                "press_key",
+                                &json!({"window_id": w.window_id, "key": k}),
+                            )?;
+                        }
+                        if !text.is_empty() {
+                            self.desktop.type_keys(&w, text)?;
+                        }
+                        let deadline = Instant::now() + Duration::from_millis(400);
+                        let got = loop {
+                            let got = ax.element_text(&w, idx).await.unwrap_or_default();
+                            if got == text || Instant::now() >= deadline {
+                                break got;
+                            }
+                            tokio::time::sleep(Duration::from_millis(25)).await;
+                        };
+                        if got != text {
+                            warnings.push(json!(format!(
+                                "typed the value as key events; the field now contains {:?}",
+                                got.chars().take(120).collect::<String>()
+                            )));
+                        }
+                    }
+                    None => {
+                        Self::with_input_watch(&mut self.desktop, ax.action(&w, method, &r.params))
+                            .await?
+                    }
+                }
             }
             ("type_text" | "paste", _) => {
                 let text = p["text"].as_str().unwrap_or_default();

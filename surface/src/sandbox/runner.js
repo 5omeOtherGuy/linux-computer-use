@@ -212,7 +212,10 @@ export class SandboxRunner {
         if (emit) {
           this.#emitText(cell, observationHeader(obs));
           this.#emitText(cell, fenceUntrusted('accessibility', text));
-          if (!query && cell.pending?.window?.window_id === obs.window?.window_id) cell.pending = null;
+          cell.emitted.add(text);
+          // The model asked for this view after the last action; the end of
+          // the cell adds no second copy of that window's state.
+          if (cell.pending?.window?.window_id === obs.window?.window_id) cell.pending = null;
         }
         return text;
       }
@@ -325,7 +328,8 @@ export class SandboxRunner {
     }
     cell.resolve({
       ok: !!msg.ok,
-      value: msg.value,
+      // A returned observation that was already emitted is not repeated.
+      value: cell.emitted.has(msg.value) ? undefined : msg.value,
       error: msg.error,
       reason: msg.reason,
       stateLost: !!msg.stateLost,
@@ -358,6 +362,7 @@ export class SandboxRunner {
         cancelledCalls: 0,
         finished: false,
         pending: null,
+        emitted: new Set(),
       };
       this.cell = cell;
       // Backstop: a sandbox that does not report back in time is killed.
