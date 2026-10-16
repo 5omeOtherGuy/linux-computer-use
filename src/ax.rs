@@ -158,6 +158,8 @@ const R_REDUNDANT_OBJECT: u32 = 86;
 const R_LIST_BOX: u32 = 98;
 const R_SWITCH: u32 = 130;
 const R_ENTRY: u32 = 79;
+const R_SPIN_BUTTON: u32 = 52;
+const R_EDITBAR: u32 = 77;
 const R_MENU_BAR: u32 = 34;
 const R_PUSH_BUTTON: u32 = 43;
 
@@ -401,6 +403,10 @@ pub struct Accessibility {
     /// Buses where an action call timed out: the app is inside that call
     /// (a nested main loop) until it answers a probe again.
     blocked: std::collections::HashSet<String>,
+    /// Warnings of the last semantic action (reported, not errors).
+    pub action_warnings: Vec<String>,
+    /// Processes already told about their decimal-comma number format.
+    numeric_hinted: std::collections::HashSet<u32>,
     caches: HashMap<String, Arc<AppCache>>,
     obs: Observations,
 }
@@ -1319,6 +1325,8 @@ impl Accessibility {
             pids: HashMap::new(),
             unresponsive: HashMap::new(),
             blocked: Default::default(),
+            numeric_hinted: Default::default(),
+            action_warnings: Vec::new(),
             caches: HashMap::new(),
             obs: Observations {
                 last_id: first_id.saturating_sub(1),
@@ -1348,6 +1356,36 @@ impl Accessibility {
                     .and_then(|f| ws.ids.get(f))
                     .is_some_and(|&(_, role)| role == R_ALERT)
         })
+    }
+
+    /// Role of the window's accessible frame in its latest usable
+    /// observation; None when the window has no mapped frame.
+    pub fn window_role(&self, w: &WindowInfo) -> Option<u32> {
+        let ws = self.obs.windows.get(&w.window_id).filter(|ws| ws.pid == w.pid && ws.valid)?;
+        ws.frame.as_ref().and_then(|f| ws.ids.get(f)).map(|&(_, role)| role)
+    }
+
+    /// The window's only editable text field in its latest observation.
+    pub fn sole_text_field(&self, w: &WindowInfo) -> Option<u32> {
+        let ws = self.obs.windows.get(&w.window_id).filter(|ws| ws.pid == w.pid && ws.valid)?;
+        let mut fields = ws
+            .elements
+            .iter()
+            .filter(|(_, e)| e.has_iface(I_EDIT) && has(e.states, S_EDITABLE) && !has(e.states, S_READ_ONLY));
+        match (fields.next(), fields.next()) {
+            (Some((&i, _)), None) => Some(i),
+            _ => None,
+        }
+    }
+
+    /// Text of the object that last reported focus in the window's app, if
+    /// it has the Text interface (readback after typing key events).
+    pub async fn focused_text(&self, w: &WindowInfo) -> Option<String> {
+        let ws = self.obs.windows.get(&w.window_id).filter(|ws| ws.pid == w.pid)?;
+        let bus = ws.frame.as_ref()?.bus.clone();
+        let r = self.events.lock().ok()?.focused.get(&bus).cloned()?;
+        let n: i32 = get_prop(&self.conn, &r, I_TEXT, "CharacterCount").await.ok()?;
+        call(&self.conn, &r, I_TEXT, "GetText", &(0i32, n.min(4000))).await.ok()
     }
 
     /// Whether element `idx` was last observed as a push button.
@@ -2178,6 +2216,16 @@ impl Accessibility {
         }
         warnings.extend(tree.truncated.iter().cloned());
 
+        // Number fields of an app with a decimal-comma locale: say so up
+        // front (once per process) rather than after a reformatted input.
+        if elements.values().any(|e| matches!(e.role, R_SPIN_BUTTON | R_EDITBAR))
+            && self.numeric_hinted.insert(w.pid)
+        {
+            if let Some(h) = numeric_locale(w.pid).and_then(|l| decimal_hint(&l, "125.50")) {
+                warnings.push(format!("number input: {}", h.replace("type 125,50 rather than 125.50", "type numbers like 125,50, not 125.50")));
+            }
+        }
+        let obs = &mut self.obs;
         let ws = obs.windows.get_mut(&w.window_id).expect("window state");
         ws.elements = elements;
         ws.snap_seq = snap_seq;
@@ -2796,10 +2844,16 @@ impl Accessibility {
                 let n: i32 = get_prop(conn, &el.r, I_TEXT, "CharacterCount").await?;
                 let got: String = call(conn, &el.r, I_TEXT, "GetText", &(0i32, n)).await?;
                 if got != text {
-                    bail!(
-                        "value was not applied as given (field now contains {})",
+                    // The app reformatted the value (a decimal comma, a
+                    // length limit): reported, not an error.
+                    self.action_warnings.push(format!(
+                        "the application changed the value: set {}, the field now contains {}",
+                        quote(&text, 80),
                         quote(&got, 80)
-                    );
+                    ));
+                    if let Some(h) = locale_hint(w.pid, &text) {
+                        self.action_warnings.push(h);
+                    }
                 }
             }
             return Ok(());
@@ -3504,7 +3558,12 @@ const COMMA_DECIMAL: [&str; 30] = [
 
 /// Hint for a reformatted insertion of a number with '.' decimals in an app
 /// whose locale (from its environment) uses a decimal comma.
-fn locale_hint(pid: u32, text: &str) -> Option<String> {
+pub fn locale_hint(pid: u32, text: &str) -> Option<String> {
+    decimal_hint(&numeric_locale(pid)?, text)
+}
+
+/// The locale a process formats numbers with (LC_ALL, LC_NUMERIC, LANG).
+fn numeric_locale(pid: u32) -> Option<String> {
     if pid == 0 {
         return None;
     }
@@ -3517,10 +3576,9 @@ fn locale_hint(pid: u32, text: &str) -> Option<String> {
                 .map(str::to_string)
         })
     };
-    let locale = var("LC_ALL")
+    var("LC_ALL")
         .or_else(|| var("LC_NUMERIC"))
-        .or_else(|| var("LANG"))?;
-    decimal_hint(&locale, text)
+        .or_else(|| var("LANG"))
 }
 
 fn decimal_hint(locale: &str, text: &str) -> Option<String> {

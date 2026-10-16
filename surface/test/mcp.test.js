@@ -96,16 +96,31 @@ describe('MCP surface', () => {
     const done = t.performed().slice(-7).map((e) => [e.method, e.params]);
     assert.deepEqual(done, [
       ['click', { window_id: 11, app: true, element_index: 1 }],
-      ['click', { window_id: 11, app: true, x: 3, y: 4 }],
-      ['type_text', { window_id: 11, app: true, text: 'x' }],
+      ['click', { window_id: 11, app: true, x: 3, y: 4, frame_window: 11 }],
+      ['type_text', { window_id: 11, app: true, text: 'x', frame_window: 11 }],
       ['press_key', { window_id: 11, app: true, key: 'Ctrl+s' }],
       ['press_key', { window_id: 11, app: true, key: 'ctrl+shift+n' }],
       ['set_value', { window_id: 11, app: true, element_index: 3, value: '5' }],
-      ['scroll', { window_id: 11, app: true, x: 1, y: 2, direction: 'up', pixels: 300 }],
+      ['scroll', { window_id: 11, app: true, x: 1, y: 2, direction: 'up', pixels: 300, frame_window: 11 }],
     ]);
     // A returned observation that was emitted is not repeated as the value.
     r = await t.js(`const n2 = await cua.getApp({windowId: 11}, {emit: false}); await n2.getAXState({disableDiffing: true})`);
     assert.equal(t.text(r).split('[1] button "OK"').length - 1, 1, t.text(r));
+  });
+
+  test('coordinates refer to the window the model last saw, not one an action opened unseen', async () => {
+    const r = await t.js(`const n3 = await cua.getApp("org.example.Notes", {emit: false});
+      await n3.getAXState({emit: false});
+      await n3.click([777, 1]);   // opens the Save As dialog (14), unseen
+      await n3.click([5, 5]); "x"`);
+    assert.equal(r.isError, false, t.text(r));
+    let clicks = t.performed().filter((e) => e.method === 'click');
+    assert.equal(clicks.at(-1).params.frame_window, 11, 'second click refers to the window seen before the dialog');
+    // The cell output showed the dialog; the next coordinates refer to it.
+    assert.match(t.text(r), /state after the last action: window 14/);
+    await t.js(`await n3.click([6, 6]); await n3.pressKey("Escape")`);
+    clicks = t.performed().filter((e) => e.method === 'click');
+    assert.equal(clicks.at(-1).params.frame_window, 14);
   });
 
   test('nodeRepl output API: write, emitImage, auto-emitted observations, PNG bytes', async () => {

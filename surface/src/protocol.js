@@ -179,13 +179,20 @@ const APP_SCOPED = ['get_app_state', 'get_ax_state', 'get_screenshot', 'click', 
 for (const m of APP_SCOPED) {
   const spec = METHODS[m];
   const build = spec.build;
-  spec.keys = [...spec.keys, 'app'];
+  const pointer = ['click', 'drag', 'scroll', 'type_text', 'paste'].includes(m);
+  spec.keys = [...spec.keys, 'app', ...(pointer ? ['frame_window'] : [])];
   spec.build = (method, p) => {
-    const { app, ...rest } = p;
+    const { app, frame_window, ...rest } = p;
     const out = build(method, rest);
     if (app !== undefined) {
       if (typeof app !== 'boolean') fail(method, 'app must be a boolean');
       out.app = app;
+    }
+    // Set by the sandbox host, not model code: the window of the last state
+    // the model received for this app, which app-scoped coordinates refer to.
+    if (frame_window !== undefined) {
+      if (!pointer || app !== true) fail(method, 'frame_window needs app: true and a pointer or text method');
+      out.frame_window = checks.windowId(method, frame_window);
     }
     return out;
   };
@@ -247,6 +254,7 @@ export function toolInputSchema(method, extensions = new Set()) {
       case 'value': add(k, { type: 'string', maxLength: MAX_TEXT }, true); break;
       case 'action': add(k, { type: 'string', description: 'Secondary accessibility action name' }, true); break;
       case 'app': add(k, { type: 'boolean', description: 'Treat window_id as the app: act on its focused or dialog window (element: the window holding it)' }); break;
+      case 'frame_window': break; // set by the sandbox host only
       default: throw new Error(`no schema for ${k}`);
     }
   }

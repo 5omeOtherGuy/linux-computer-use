@@ -32,9 +32,6 @@ struct Engine {
     /// session, so an app-scoped request still finds its app after the
     /// window it names (e.g. a dialog) has closed.
     known: HashMap<u32, (u32, String)>,
-    /// App -> window of its latest observation or screenshot: the frame of
-    /// app-scoped coordinates.
-    last_seen: HashMap<(u32, String), u32>,
 }
 
 /// Bound for the first sign that the app reacted to an action.
@@ -108,8 +105,6 @@ impl Engine {
         if text.is_empty() && warnings.is_empty() {
             warnings.push("no accessibility tree".into());
         }
-        self.last_seen
-            .insert((w.pid, w.app_id.clone()), w.window_id);
         let others: Vec<Value> = wins
             .iter()
             .filter(|o| o.window_id != w.window_id)
@@ -154,6 +149,103 @@ impl Engine {
         }
     }
 
+    /// Text input (type_text, paste). Semantic insertion into the focused
+    /// text field; in a single-line field one trailing newline becomes a
+    /// Return after the text. Without a focused field: in a dialog its only
+    /// text field, else refused; in a main window key events, but only to
+    /// the window the model last saw. Key-typed text is never sent to an
+    /// alert or to a dialog whose accessibility tree is unknown: text meant
+    /// for another window must not answer an unexpected "Save changes?".
+    async fn enter_text(&mut self, w: &WindowInfo, text: &str, frame: Option<u32>) -> Result<Vec<Value>> {
+        let mut warnings = Vec::new();
+        let outcome = match self.ax.as_mut() {
+            Some(ax) => Self::with_input_watch(&mut self.desktop, ax.text_input(w, text, None)).await?,
+            None => ax::TextInput::NoTarget("AT-SPI is unavailable".into()),
+        };
+        let mut target = None;
+        let reason = match outcome {
+            ax::TextInput::Inserted(ws) => return Ok(ws.into_iter().map(Value::from).collect()),
+            ax::TextInput::SingleLine => return self.enter_line(w, text, None).await,
+            ax::TextInput::NoTarget(reason) => reason,
+        };
+        let ax = self.ax.as_ref();
+        let dialog = w.transient_for.is_some() || ax.is_some_and(|ax| ax.window_is_alert(w));
+        if dialog {
+            let refuse = |why: String| {
+                x11_error("input_refused", format!("{why}; the text was not typed. Read the window (getAXState) first"))
+            };
+            match ax.and_then(|ax| ax.window_role(w)) {
+                None => return Err(refuse(format!("window {} {:?} is a dialog whose accessibility tree is unknown", w.window_id, w.title))),
+                Some(_) if ax.is_some_and(|ax| ax.window_is_alert(w)) => {
+                    return Err(refuse(format!("window {} {:?} is an alert with no text field", w.window_id, w.title)))
+                }
+                Some(_) => {}
+            }
+            target = ax.and_then(|ax| ax.sole_text_field(w));
+            if target.is_none() {
+                return Err(refuse(format!(
+                    "dialog {} {:?} has no text field reporting focus, and not exactly one text field ({reason}); click the field or use setValue",
+                    w.window_id, w.title
+                )));
+            }
+        }
+        if let Some(idx) = target {
+            // The dialog's only text field (GTK's file chooser location entry
+            // does not report focus): inserted there semantically.
+            let ax = self.ax.as_mut().expect("target came from AT-SPI");
+            match Self::with_input_watch(&mut self.desktop, ax.text_input(w, text, Some(idx))).await? {
+                ax::TextInput::Inserted(ws) => warnings.extend(ws.into_iter().map(Value::from)),
+                ax::TextInput::SingleLine => return self.enter_line(w, text, Some(idx)).await,
+                ax::TextInput::NoTarget(r) => bail!("text field {idx}: {r}"),
+            }
+            return Ok(warnings);
+        }
+        if frame.is_some_and(|f| f != w.window_id) {
+            return Err(x11_error("input_refused", format!(
+                "the app's active window is now {} {:?}, not the window you last saw, and it has no focused text field; look at it first. The text was not typed",
+                w.window_id, w.title
+            )));
+        }
+        self.desktop.type_keys(w, text)?;
+        warnings.push(json!(format!("typed as key events to the window's focus ({reason})")));
+        // Readback where the app reports the focused text object.
+        if let Some(ax) = self.ax.as_ref() {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            if let Some(got) = ax.focused_text(w).await {
+                if !got.contains(text.trim_end_matches('\n')) {
+                    warnings.push(json!(format!(
+                        "the focused field now contains {:?}",
+                        got.chars().take(120).collect::<String>()
+                    )));
+                    if let Some(h) = ax::locale_hint(w.pid, text) {
+                        warnings.push(json!(h));
+                    }
+                }
+            }
+        }
+        Ok(warnings)
+    }
+
+    /// Single-line field: the text with at most one trailing newline, which
+    /// is pressed as Return after the insertion completed.
+    async fn enter_line(&mut self, w: &WindowInfo, text: &str, idx: Option<u32>) -> Result<Vec<Value>> {
+        let Some(line) = text.strip_suffix('\n').filter(|l| !l.contains('\n')) else {
+            return Err(x11_error("invalid_params", "the focused field is single-line and the text has a line break inside; type the parts separately with pressKey(\"Tab\") or pressKey(\"Return\") between them".into()));
+        };
+        let mut warnings = Vec::new();
+        if !line.is_empty() {
+            let ax = self.ax.as_mut().expect("single-line target came from AT-SPI");
+            match Self::with_input_watch(&mut self.desktop, ax.text_input(w, line, idx)).await? {
+                ax::TextInput::Inserted(ws) => warnings.extend(ws.into_iter().map(Value::from)),
+                _ => bail!("the single-line field lost focus before the text was inserted; nothing was typed"),
+            }
+        }
+        // InsertText returned after the app applied it; the Return follows.
+        self.desktop
+            .action(w, "press_key", &json!({"window_id": w.window_id, "key": "Return"}))?;
+        Ok(warnings)
+    }
+
     async fn execute_inner(&mut self, r: Request) -> Result<Value> {
         let p = r.params.as_object().context("params must be an object")?;
         let method = r.method.as_str();
@@ -165,23 +257,25 @@ impl Engine {
                 "click" => &[
                     "window_id",
                     "app",
+                    "frame_window",
                     "element_index",
                     "x",
                     "y",
                     "button",
                     "click_count",
                 ],
-                "drag" => &["window_id", "app", "from", "to"],
+                "drag" => &["window_id", "app", "frame_window", "from", "to"],
                 "scroll" => &[
                     "window_id",
                     "app",
+                    "frame_window",
                     "element_index",
                     "x",
                     "y",
                     "direction",
                     "pixels",
                 ],
-                "type_text" | "paste" => &["window_id", "app", "text"],
+                "type_text" | "paste" => &["window_id", "app", "frame_window", "text"],
                 "press_key" => &["window_id", "app", "key"],
                 "set_value" => &["window_id", "app", "element_index", "value"],
                 "perform_secondary_action" => &["window_id", "app", "element_index", "action"],
@@ -224,7 +318,6 @@ impl Engine {
                 ax.reset();
             }
             self.desktop.end_turn()?;
-            self.last_seen.clear();
             return Ok(json!({"reset":true}));
         }
         if matches!(method, "list_windows" | "list_apps") {
@@ -272,30 +365,37 @@ impl Engine {
             let element = match int_param(p, "element_index").and_then(|i| {
                 self.ax.as_ref().and_then(|ax| ax.window_of_element(i)).map(|wid| (i, wid))
             }) {
-                Some((i, wid)) => Some(wins.iter().find(|w| w.window_id == wid).cloned().ok_or_else(
-                    || {
-                        x11_error("window_not_found", format!(
+                Some((i, wid)) => match wins.iter().find(|w| w.window_id == wid) {
+                    Some(w) => Some(w.clone()),
+                    // Still listed but not one of this app's windows.
+                    None if self.desktop.window(wid).is_ok() => {
+                        return Err(x11_error("invalid_params", format!(
+                            "element {i} belongs to window {wid} of another app; use that app's object"
+                        )))
+                    }
+                    None => {
+                        return Err(x11_error("window_not_found", format!(
                             "element {i} was in window {wid}, which has closed; the app's current state is in the latest observation, or observe the app again"
-                        ))
-                    },
-                )?),
+                        )))
+                    }
+                },
                 None => None,
             };
             let pointer = p.contains_key("x") || p.contains_key("from");
+            let active = self
+                .desktop
+                .active_window(&wins, id)
+                .expect("wins is not empty");
             let w = if let Some(w) = element {
                 w
-            } else if pointer && self.last_seen.contains_key(&app) {
-                let seen = self.last_seen[&app];
-                wins.iter()
-                    .find(|w| w.window_id == seen)
-                    .cloned()
-                    .ok_or_else(|| x11_error("window_not_found", format!(
-                        "window {seen}, which the coordinates refer to (the app's latest observation), has closed; observe the app again"
-                    )))?
+            } else if pointer {
+                // Coordinates refer to the window the model last saw (the
+                // surface passes it); never to one only an implicit
+                // observation inside the same cell showed.
+                let frame = int_param(p, "frame_window").unwrap_or(id);
+                coordinate_window(frame, &wins, &active)?
             } else {
-                self.desktop
-                    .active_window(&wins, id)
-                    .expect("wins is not empty")
+                active
             };
             (app, wins, w)
         } else {
@@ -306,8 +406,8 @@ impl Engine {
         self.authorize(&w).map_err(ProtocolError)?;
         self.desktop.check_user_input()?;
         if method == "get_screenshot" {
-            let shot = self.desktop.screenshot(&w)?;
-            self.last_seen.insert(app, w.window_id);
+            let mut shot = self.desktop.screenshot(&w)?;
+            shot["window_id"] = json!(w.window_id);
             return Ok(shot);
         }
         if matches!(method, "get_app_state" | "get_ax_state") {
@@ -325,6 +425,9 @@ impl Engine {
             }
         }
         // Baseline for the app's accessibility events, before the action.
+        if let Some(ax) = self.ax.as_mut() {
+            ax.action_warnings.clear();
+        }
         let mut ax_activity = self.ax.as_ref().map(|ax| ax.activity_probe(&w));
         self.desktop.prepare_action(&w)?;
         let element = int_param(p, "element_index");
@@ -418,60 +521,9 @@ impl Engine {
             }
             ("type_text" | "paste", _) => {
                 let text = p["text"].as_str().unwrap_or_default();
-                let outcome = match self.ax.as_mut() {
-                    Some(ax) => {
-                        Self::with_input_watch(&mut self.desktop, ax.text_input(&w, text, None))
-                            .await?
-                    }
-                    None => ax::TextInput::NoTarget("AT-SPI is unavailable".into()),
-                };
-                match outcome {
-                    ax::TextInput::Inserted(w) => warnings.extend(w.into_iter().map(Value::from)),
-                    // Typed keys in an alert do nothing useful, and a
-                    // newline (or the caller's next Return) confirms its
-                    // default button: an unexpected "Save changes?" must not
-                    // be answered by text meant for another window.
-                    ax::TextInput::NoTarget(_)
-                        if self.ax.as_ref().is_some_and(|ax| ax.window_is_alert(&w)) =>
-                    {
-                        return Err(x11_error(
-                            "input_refused",
-                            format!(
-                                "window {} {:?} is an alert with no text field; the text was not typed. Read it (getAXState) and choose a button",
-                                w.window_id, w.title
-                            ),
-                        ));
-                    }
-                    ax::TextInput::NoTarget(reason) => {
-                        self.desktop.type_keys(&w, text)?;
-                        warnings.push(json!(format!(
-                            "typed as key events to the window's focus ({reason})"
-                        )));
-                    }
-                    // "path\n" into a location entry: insert, then Return,
-                    // as typing would.
-                    ax::TextInput::SingleLine => {
-                        for (i, line) in text.split('\n').enumerate() {
-                            if i > 0 {
-                                self.desktop.action(
-                                    &w,
-                                    "press_key",
-                                    &json!({"window_id": w.window_id, "key": "Return"}),
-                                )?;
-                            }
-                            if line.is_empty() {
-                                continue;
-                            }
-                            let ax = self.ax.as_mut().expect("text_input came from AT-SPI");
-                            match ax.text_input(&w, line, None).await? {
-                                ax::TextInput::Inserted(w) => {
-                                    warnings.extend(w.into_iter().map(Value::from))
-                                }
-                                _ => self.desktop.type_keys(&w, line)?,
-                            }
-                        }
-                    }
-                }
+                let frame = int_param(p, "frame_window");
+                let w2 = w.clone();
+                warnings.extend(self.enter_text(&w2, text, frame).await?);
             }
             ("scroll", Some(idx)) => {
                 let ax = self.ax.as_mut().context("Accessibility unavailable")?;
@@ -490,6 +542,9 @@ impl Engine {
                 params["window_id"] = json!(w.window_id);
                 self.desktop.action(&w, method, &params)?;
             }
+        }
+        if let Some(ax) = self.ax.as_mut() {
+            warnings.extend(ax.action_warnings.drain(..).map(Value::from));
         }
         let start = Instant::now();
         let mut external = || ax_activity.as_mut().is_some_and(|probe| probe());
@@ -541,7 +596,14 @@ impl Engine {
                     }
                     (Some(c.clone()), vec![c])
                 }
-                Err(_) => (None, Vec::new()),
+                Err(e)
+                    if e
+                        .downcast_ref::<x11::X11Error>()
+                        .is_some_and(|x| x.code == "window_not_found") =>
+                {
+                    (None, Vec::new())
+                }
+                Err(e) => return Err(e),
             }
         };
         let mut observation = match after {
@@ -576,6 +638,30 @@ impl Engine {
             .extend(warnings);
         Ok(observation)
     }
+}
+
+/// Window that app-scoped coordinates act on: `frame`, the window of the
+/// last screenshot or tree the model received. Refused when it has closed,
+/// or when the app's active window is another one (a dialog the action
+/// before opened, which the model has not seen): the point would land on
+/// whatever that window shows now.
+fn coordinate_window(frame: u32, wins: &[WindowInfo], active: &WindowInfo) -> Result<WindowInfo> {
+    let Some(w) = wins.iter().find(|w| w.window_id == frame) else {
+        return Err(x11_error(
+            "window_not_found",
+            format!("window {frame}, which the coordinates refer to (the last state you received), has closed; look at the app again (getScreenshot or getAXState) before using coordinates"),
+        ));
+    };
+    if active.window_id != frame {
+        return Err(x11_error(
+            "input_refused",
+            format!(
+                "the app's active window is now {} {:?}, not window {frame} that the coordinates refer to; look at it (getScreenshot or getAXState) before using coordinates. Nothing was clicked",
+                active.window_id, active.title
+            ),
+        ));
+    }
+    Ok(w.clone())
 }
 
 fn x11_error(code: &'static str, message: String) -> anyhow::Error {
@@ -696,7 +782,6 @@ async fn main() -> Result<()> {
         ax_error_reported: false,
         policy: policy::Policy::from_env(),
         known: HashMap::new(),
-        last_seen: HashMap::new(),
     };
     let mut input = BufReader::new(tokio::io::stdin());
     let mut output = tokio::io::stdout();
@@ -744,6 +829,39 @@ mod tests {
     fn args(a: &[&str]) -> Result<Option<x11::LiveScope>> {
         parse_args(a.iter().map(|s| s.to_string())).map(|a| a.live)
     }
+    fn win(window_id: u32, title: &str) -> WindowInfo {
+        WindowInfo {
+            window_id,
+            title: title.into(),
+            app_id: "Xed".into(),
+            pid: 7,
+            width: 100,
+            height: 100,
+            transient_for: (window_id != 1).then_some(1),
+            origin: (0, 0),
+        }
+    }
+
+    /// Regression: coordinates went to the window of the latest observation
+    /// of any kind, including the implicit one after an action that opened
+    /// a dialog the model never saw, so `click([500,40]); click([300,200])`
+    /// sent the second click into that dialog. They now refer to the window
+    /// the model last received and are refused when the app's active window
+    /// changed since.
+    #[test]
+    fn coordinates_never_land_in_an_unseen_window() {
+        let (main, dialog) = (win(1, "doc"), win(2, "Replace?"));
+        let wins = vec![main.clone(), dialog.clone()];
+        let e = coordinate_window(1, &wins, &dialog).unwrap_err();
+        assert_eq!(e.downcast_ref::<x11::X11Error>().unwrap().code, "input_refused");
+        assert!(e.to_string().contains("\"Replace?\""), "{e}");
+        assert_eq!(coordinate_window(2, &wins, &dialog).unwrap().window_id, 2);
+        assert_eq!(coordinate_window(1, &wins[..1], &main).unwrap().window_id, 1);
+        // The window the model saw has closed.
+        let e = coordinate_window(2, &wins[..1], &main).unwrap_err();
+        assert_eq!(e.downcast_ref::<x11::X11Error>().unwrap().code, "window_not_found");
+    }
+
     #[test]
     fn live_desktop_is_an_explicit_scoped_flag() {
         assert!(args(&[]).unwrap().is_none());

@@ -23,6 +23,10 @@ const WINDOWS = [
 ];
 WINDOWS.unshift(WINDOWS.pop());
 const approved = new Set();
+// App-scoped requests act on the app's active window: a click at x=777 in
+// Notes "opens" its Save As dialog (14), Escape closes it.
+let notesDialog = false;
+const active = (win, params) => (params.app && win.pid === 101 && notesDialog ? WINDOWS.find((w) => w.window_id === 14) : win);
 let pointer = null;
 const typed = [];
 
@@ -87,7 +91,7 @@ async function handle(method, params) {
       return screenshot(windowFor(params));
     case 'get_ax_state':
     case 'get_app_state':
-      return observation(windowFor(params), false);
+      return observation(active(windowFor(params), params), false);
     case 'approve_app': {
       const win = WINDOWS.find((w) => w.window_id === params.window_id && w.app_id === params.app_id);
       if (!win) throw new EngineError('window_not_found', 'no such window/app');
@@ -107,7 +111,9 @@ async function handle(method, params) {
   if (method === 'type_text' || method === 'paste') typed.push(params.text);
   if (params.x !== undefined) pointer = [params.x, params.y];
   record({ event: 'performed', method, params, pointer });
-  return observation(win, true);
+  if (method === 'click' && params.x === 777) notesDialog = true;
+  if (method === 'press_key' && params.key === 'Escape') notesDialog = false;
+  return observation(active(win, params), true);
 }
 
 const rl = createInterface({ input: process.stdin });

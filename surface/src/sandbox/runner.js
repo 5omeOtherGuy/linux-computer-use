@@ -29,6 +29,8 @@ const MAX_CELL_IMAGES = 16;
 const STDERR_TAIL = 4000;
 const MAX_EMITTED_IMAGE_CHARS = 16_000_000;
 const VIEWS = ['windows', 'apps', 'state', 'getApp', 'ax', 'screenshot', 'action'];
+// Actions whose target window depends on what the model last saw.
+const FRAMED = ['click', 'drag', 'scroll', 'type_text', 'paste'];
 const ACTIONS = ['click', 'drag', 'scroll', 'type_text', 'press_key', 'paste', 'set_value', 'perform_secondary_action', 'mouse_move'];
 const KILL_GRACE_MS = 1500;
 const CANCEL_GRACE_MS = 750;
@@ -49,6 +51,30 @@ export class SandboxRunner {
     this.fatal = null;
     this.stateLost = false;
     this.generation = 0;
+    // App coordinates refer to the window of the last state model code
+    // received for that app (screenshot or tree), never to a window only an
+    // implicit post-action observation showed. appKey -> window id.
+    this.frames = new Map();
+    this.windowApp = new Map(); // window id -> appKey
+  }
+
+  #noteWindows(windows) {
+    for (const w of windows || []) {
+      if (w && Number.isInteger(w.window_id) && w.pid !== undefined) this.windowApp.set(w.window_id, `${w.pid}|${w.app_id}`);
+    }
+  }
+
+  // The window an observation shows is now the app's coordinate frame.
+  #sawWindow(windowId, appWindowId) {
+    const key = this.windowApp.get(appWindowId) ?? this.windowApp.get(windowId);
+    if (key !== undefined && Number.isInteger(windowId)) this.frames.set(key, windowId);
+  }
+
+  #observed(obs) {
+    if (!obs?.window) return;
+    this.#noteWindows([obs.window]);
+    const key = `${obs.window.pid}|${obs.window.app_id}`;
+    for (const o of obs.app_windows || []) if (Number.isInteger(o.window_id)) this.windowApp.set(o.window_id, key);
   }
 
   #spawn() {
@@ -180,6 +206,7 @@ export class SandboxRunner {
         // AppInfo is built from the window list (it carries the windows).
         if (method !== 'list_windows') throw new CuaError('invalid_params', 'method does not match view');
         const raw = await this.#call(cell, method, params);
+        if (Array.isArray(raw)) this.#noteWindows(raw);
         const windows = Array.isArray(raw) ? raw.map(windowInfo) : [];
         const value = view === 'windows' ? windows : view === 'apps' ? appInfos(windows) : { apps: appInfos(windows), browsers: [] };
         if (emit) this.#emitText(cell, fenceUntrusted(view, JSON.stringify(value)));
@@ -191,6 +218,7 @@ export class SandboxRunner {
         if (windowId !== undefined && (!Number.isInteger(windowId) || windowId < 0 || windowId > 0xffffffff)) throw new CuaError('invalid_params', 'getApp: windowId must be a WindowInfo id from cua.listWindows()');
         if (appId !== undefined && typeof appId !== 'string') throw new CuaError('invalid_params', 'getApp: appId must be a string');
         const raw = await this.#call(cell, 'list_windows', {});
+        if (Array.isArray(raw)) this.#noteWindows(raw);
         const window = windowId !== undefined ? raw.find((w) => w.window_id === windowId) : mainWindow(raw, appId);
         if (!window) {
           const apps = [...new Set(raw.map((w) => String(w.app_id)))].join(', ');
@@ -207,6 +235,8 @@ export class SandboxRunner {
       case 'ax': {
         if (method !== 'get_ax_state') throw new CuaError('invalid_params', 'method does not match view');
         const obs = await this.#call(cell, method, params);
+        this.#observed(obs);
+        this.#sawWindow(obs?.window?.window_id, params.window_id);
         const query = typeof opts.query === 'string' && opts.query.trim() ? opts.query.trim() : null;
         const text = query ? queryTree(obs.accessibility, query) : this.host.axView(obs, { diff: !opts.disableDiffing, commit: emit });
         if (emit) {
@@ -223,6 +253,7 @@ export class SandboxRunner {
         if (method !== 'get_screenshot') throw new CuaError('invalid_params', 'method does not match view');
         const shot = await this.#call(cell, method, params);
         if (!isScreenshot(shot)) throw new CuaError('protocol_error', 'engine returned no screenshot');
+        this.#sawWindow(Number.isInteger(shot.window_id) ? shot.window_id : params.window_id, params.window_id);
         const id = this.#storeImage(shot);
         if (emit) cell.outputs.push({ type: 'image', id });
         // The sandbox decodes $bytes natively and hands model code a Uint8Array.
@@ -230,7 +261,12 @@ export class SandboxRunner {
       }
       case 'action': {
         if (!ACTIONS.includes(method)) throw new CuaError('invalid_params', 'not an action');
+        if (params.app === true && FRAMED.includes(method) && params.element_index === undefined) {
+          const frame = this.frames.get(this.windowApp.get(params.window_id));
+          if (frame !== undefined) params = { ...params, frame_window: frame };
+        }
         const obs = await this.#call(cell, method, params);
+        this.#observed(obs);
         if (obs && typeof obs === 'object' && obs.window) {
           cell.pending = obs;
           cell.pendingTarget = params.app ? { window_id: params.window_id, app: true } : { window_id: obs.window.window_id };
@@ -315,6 +351,9 @@ export class SandboxRunner {
     if (cell.pending) {
       const obs = cell.pending;
       observation = { header: observationHeader(obs), accessibility: this.host.axView(obs, { diff: true, shortest: true, commit: true }) };
+      // The end-of-cell state is what the model sees next.
+      this.#observed(obs);
+      this.#sawWindow(obs.window?.window_id, obs.window?.window_id);
       if (isScreenshot(obs.screenshot)) cell.outputs.push({ type: 'image', id: this.#storeImage(obs.screenshot) });
     }
     let images = 0;
