@@ -159,7 +159,7 @@ export class AnthropicComputerToolset {
         if (input.coordinate !== undefined) pt = g.toWindow(input.coordinate);
         else if (this.cursor) pt = this.cursor;
         else throw new CuaError('no_cursor', `${name} without coordinate: the pointer position is unknown; pass coordinate`);
-        const params = { window_id: w, x: pt[0], y: pt[1] };
+        const params = { window_id: w, x: pt[0], y: pt[1], observe: false };
         if (button !== 'left') params.button = button;
         if (count !== 1) params.click_count = count;
         if (modifiers) params.modifiers = modifiers;
@@ -173,7 +173,7 @@ export class AnthropicComputerToolset {
         if (input.start_coordinate === undefined || input.coordinate === undefined) throw invalid('left_click_drag needs start_coordinate and coordinate');
         const from = g.toWindow(input.start_coordinate, 'start_coordinate');
         const to = g.toWindow(input.coordinate);
-        const params = { window_id: w, from, to };
+        const params = { window_id: w, from, to, observe: false };
         if (modifiers) params.modifiers = modifiers;
         await this.host.call('drag', params, { signal });
         this.cursor = to;
@@ -183,7 +183,7 @@ export class AnthropicComputerToolset {
         const g = await this.#ensureGeometry(signal);
         if (input.coordinate === undefined) throw invalid('mouse_move needs coordinate');
         const pt = g.toWindow(input.coordinate);
-        await this.host.call('mouse_move', { window_id: w, x: pt[0], y: pt[1] }, { signal });
+        await this.host.call('mouse_move', { window_id: w, x: pt[0], y: pt[1], observe: false }, { signal });
         this.cursor = pt;
         return okText();
       }
@@ -204,7 +204,7 @@ export class AnthropicComputerToolset {
         if (input.coordinate !== undefined) pt = g.toWindow(input.coordinate);
         else if (this.cursor) pt = this.cursor;
         else throw new CuaError('no_cursor', 'scroll without coordinate: the pointer position is unknown; pass coordinate');
-        const params = { window_id: w, x: pt[0], y: pt[1], direction: dir, pixels: amount * this.scrollPixelsPerClick };
+        const params = { window_id: w, x: pt[0], y: pt[1], direction: dir, pixels: amount * this.scrollPixelsPerClick, observe: false };
         if (modifiers) params.modifiers = modifiers;
         await this.host.call('scroll', params, { signal });
         this.cursor = pt;
@@ -212,14 +212,14 @@ export class AnthropicComputerToolset {
       }
       case 'type': {
         if (typeof input.text !== 'string' || !input.text) throw invalid('type.text must be a non-empty string');
-        await this.host.call('type_text', { window_id: w, text: input.text }, { signal });
+        await this.host.call('type_text', { window_id: w, text: input.text, observe: false }, { signal });
         return okText();
       }
       case 'key': {
         if (typeof input.text !== 'string' || !input.text) throw invalid('key.text must be a key or chord such as "Return" or "ctrl+s"');
         const repeat = input.repeat ?? 1;
         if (!Number.isInteger(repeat) || repeat < 1 || repeat > 100) throw invalid('key.repeat must be an integer from 1 to 100');
-        for (let i = 0; i < repeat; i++) await this.host.call('press_key', { window_id: w, key: input.text }, { signal });
+        for (let i = 0; i < repeat; i++) await this.host.call('press_key', { window_id: w, key: input.text, observe: false }, { signal });
         return okText();
       }
       case 'wait': {

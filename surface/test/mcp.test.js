@@ -97,7 +97,9 @@ describe('MCP surface', () => {
     const text = t.text(r);
     assert.match(text, /=> done/);
     assert.match(text, /state after the last action[^]*<<<UNTRUSTED accessibility nonce=/);
-    assert.ok(r.content.some((c) => c.type === 'image' && c.mimeType === 'image/png'), 'post-action screenshot attached');
+    // The end-of-cell state is a fresh observation (the actions ran with
+    // observe: false), which carries no screenshot.
+    assert.ok(!r.content.some((c) => c.type === 'image'), 'no image unless the cell asked for one');
     const performed = t.performed().filter((e) => e.params.window_id === 11);
     assert.deepEqual(performed.map((e) => e.method).slice(-2), ['click', 'type_text']);
     const approvals = t.events().filter((e) => e.event === 'request' && e.method === 'approve_app');
@@ -112,15 +114,17 @@ describe('MCP surface', () => {
       JSON.stringify([notes.windowId, notes.windows.map((w) => w.id).sort()])`);
     assert.equal(r.isError, false, t.text(r));
     assert.match(t.text(r), /=> \[11,\[11,14\]\]/, 'main window, not the newer dialog; the app lists both');
+    // Actions in a cell skip the post-action tree (observe: false); the
+    // cell's end observes once.
     const done = t.performed().slice(-7).map((e) => [e.method, e.params]);
     assert.deepEqual(done, [
-      ['click', { window_id: 11, app: true, element_index: 1 }],
-      ['click', { window_id: 11, app: true, x: 3, y: 4, frame_window: 11 }],
-      ['type_text', { window_id: 11, app: true, text: 'x', frame_window: 11 }],
-      ['press_key', { window_id: 11, app: true, key: 'Ctrl+s' }],
-      ['press_key', { window_id: 11, app: true, key: 'ctrl+shift+n' }],
-      ['set_value', { window_id: 11, app: true, element_index: 3, value: '5' }],
-      ['scroll', { window_id: 11, app: true, x: 1, y: 2, direction: 'up', pixels: 300, frame_window: 11 }],
+      ['click', { window_id: 11, app: true, element_index: 1, observe: false }],
+      ['click', { window_id: 11, app: true, x: 3, y: 4, frame_window: 11, observe: false }],
+      ['type_text', { window_id: 11, app: true, text: 'x', frame_window: 11, observe: false }],
+      ['press_key', { window_id: 11, app: true, key: 'Ctrl+s', observe: false }],
+      ['press_key', { window_id: 11, app: true, key: 'ctrl+shift+n', observe: false }],
+      ['set_value', { window_id: 11, app: true, element_index: 3, value: '5', observe: false }],
+      ['scroll', { window_id: 11, app: true, x: 1, y: 2, direction: 'up', pixels: 300, frame_window: 11, observe: false }],
     ]);
     // A returned observation that was emitted is not repeated as the value.
     r = await t.js(`const n2 = await cua.getApp({windowId: 11}, {emit: false}); await n2.getAXState({disableDiffing: true})`);

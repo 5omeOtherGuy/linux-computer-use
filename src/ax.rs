@@ -55,10 +55,18 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Time budget of one observation; larger trees are returned partially
 /// with a warning.
 const SNAPSHOT_BUDGET: Duration = Duration::from_millis(500);
-/// First call to an application in an observation. An app that does not
-/// answer within it is treated as unresponsive (busy, or blocked in a nested
-/// main loop inside an accessibility call) and skipped for a while.
+/// Hard bound on one observation: the wait for a busy app, the budget, and
+/// a margin for calls that do not take the budget into account.
+const SNAPSHOT_BACKSTOP: Duration = Duration::from_millis(2000);
+/// First call to an application in an observation, when the app is
+/// confirmed blocked in a nested main loop inside an earlier accessibility
+/// action: it will not answer. An app that does not answer within its probe
+/// is treated as unresponsive and skipped for a while.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(300);
+/// The same first call for an app that is merely busy (populating the file
+/// chooser it just opened takes 300-500 ms): the observation waits for it,
+/// because an observation without a tree costs the model a turn.
+const BUSY_WAIT: Duration = Duration::from_millis(1000);
 const UNRESPONSIVE_RETRY: Duration = Duration::from_secs(3);
 /// Probe of an app's accessibility connection before key input.
 const KEY_PROBE_TIMEOUT: Duration = Duration::from_millis(150);
@@ -381,11 +389,12 @@ pub struct AxSnapshot {
 
 /// Outcome of a semantic text input (`type_text`, `paste`).
 pub enum ClickPlan {
-    /// Pointer click at a screen point; `popup`: it must land on one of the
-    /// app's popup windows (an open menu).
-    Pointer { x: i32, y: i32, popup: bool },
-    /// AT-SPI action (no visible geometry).
-    Action,
+    /// Pointer click at a screen point. `popup`: the element's screen
+    /// rectangle, which must lie on the app's popup window under the point
+    /// (an open menu); otherwise no popup may cover the point.
+    Pointer { x: i32, y: i32, popup: Option<(i32, i32, i32, i32)> },
+    /// AT-SPI action (no visible geometry, or the centre is covered).
+    Action { warning: Option<String> },
 }
 
 pub enum TextInput {
@@ -417,8 +426,10 @@ pub struct Accessibility {
     blocked: std::collections::HashSet<String>,
     /// Warnings of the last semantic action (reported, not errors).
     pub action_warnings: Vec<String>,
-    caches: HashMap<String, Arc<AppCache>>,
+    caches: HashMap<String, AppCache>,
     obs: Observations,
+    /// Event sequence when the last action started (`begin_action`).
+    last_action_seq: u64,
 }
 
 impl Drop for Accessibility {
@@ -558,6 +569,41 @@ struct EventLog {
     lost_before: u64,
     /// Last object of each application that reported gaining focus.
     focused: HashMap<String, ObjRef>,
+    /// Objects named by an event since the daemon's mirror of their
+    /// application last looked at them, per application bus, with how much
+    /// of the mirror around them the event invalidates.
+    dirty: HashMap<String, Vec<(ObjRef, Forget)>>,
+    /// Event kinds seen since the last observation (tracing only).
+    kinds: HashMap<String, usize>,
+}
+
+/// How much of the mirror an event invalidates around the object it names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Forget {
+    /// The object's own node (a state or name change).
+    Node,
+    /// Also its child list (a child added or removed).
+    Kids,
+    /// Also its children's nodes (a tree view's visible-data-changed, row
+    /// and column changes: the only notice GTK gives of cell changes).
+    Deep,
+}
+
+/// What an event invalidates in the mirror, if anything. Text, value and
+/// geometry are read live, so their events change nothing cached.
+fn forget_for(member: &str, detail: &str) -> Option<Forget> {
+    match member {
+        "StateChanged" => Some(Forget::Node),
+        "PropertyChange" => matches!(
+            detail,
+            "accessible-name" | "accessible-description" | "accessible-parent" | "accessible-role"
+        )
+        .then_some(Forget::Node),
+        "ChildrenChanged" => Some(Forget::Kids),
+        "VisibleDataChanged" | "RowInserted" | "RowDeleted" | "RowReordered" | "ColumnInserted"
+        | "ColumnDeleted" | "ColumnReordered" | "ModelChanged" => Some(Forget::Deep),
+        _ => None,
+    }
 }
 
 const LOG_PRUNE_AT: usize = 20_000;
@@ -588,15 +634,53 @@ impl EventLog {
     }
 }
 
+/// The daemon's mirror of one application's objects: the bulk
+/// `Cache.GetItems` result plus every object and child list fetched live
+/// since. Objects an event names are dropped (with their children) and
+/// fetched again when next needed; the whole mirror is rebuilt after
+/// `CACHE_MAX_AGE`, as a backstop for changes no event announced.
 struct AppCache {
-    fetched_seq: u64,
     fetched_at: Instant,
     /// False when the application does not implement the Cache interface,
     /// or its last bulk fetch failed (then until `retry_at`).
     supported: bool,
     retry_at: Option<Instant>,
     nodes: HashMap<ObjRef, Node>,
+    /// Complete child lists (never the visible slice of a huge container).
     kids: HashMap<ObjRef, Vec<ObjRef>>,
+    /// Action names, which a widget keeps for its lifetime.
+    actions: HashMap<ObjRef, Vec<String>>,
+}
+
+impl AppCache {
+    fn empty(supported: bool, retry_at: Option<Instant>) -> Self {
+        AppCache {
+            fetched_at: Instant::now(),
+            supported,
+            retry_at,
+            nodes: HashMap::new(),
+            kids: HashMap::new(),
+            actions: HashMap::new(),
+        }
+    }
+
+    /// Forgets an object an event named, and around it what the event
+    /// invalidates (`Forget`).
+    fn forget(&mut self, r: &ObjRef, how: Forget) {
+        self.nodes.remove(r);
+        self.actions.remove(r);
+        if how == Forget::Node {
+            return;
+        }
+        if let Some(kids) = self.kids.remove(r) {
+            if how == Forget::Deep {
+                for k in kids {
+                    self.nodes.remove(&k);
+                    self.actions.remove(&k);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -738,6 +822,8 @@ impl Observations {
 struct Tree {
     nodes: HashMap<ObjRef, Node>,
     kids: HashMap<ObjRef, Vec<ObjRef>>,
+    /// Containers whose `kids` are only the visible slice.
+    partial: std::collections::HashSet<ObjRef>,
     live_nodes: usize,
     cached_nodes: usize,
     truncated: Vec<String>,
@@ -748,7 +834,9 @@ struct Tree {
 struct Details {
     text: Option<(String, i32)>,
     value: Option<String>,
-    actions: Vec<String>,
+    /// Action names (None when the object has no Action interface or the
+    /// call failed).
+    actions: Option<Vec<String>>,
 }
 
 struct Candidate {
@@ -1160,18 +1248,55 @@ fn handle_event(log: &Mutex<EventLog>, msg: &Message) {
     let Some(sender) = sender else { return };
     let seq = log.bump(&sender);
     let body = msg.body();
-    match member.as_str() {
-        "RemoveAccessible" => {
-            if let Ok(w) = body.deserialize::<WireRef>() {
-                log.removed.insert(ObjRef::from_wire(&w), seq);
-            }
+    if iface == I_CACHE {
+        // AddAccessible carries the new object (and its parent, whose child
+        // list grew); RemoveAccessible the object that went.
+        let (obj, parent) = if let Ok(it) = body.deserialize::<NewItem>() {
+            (ObjRef::from_wire(&it.0), Some(ObjRef::from_wire(&it.2)))
+        } else if let Ok(it) = body.deserialize::<OldItem>() {
+            (ObjRef::from_wire(&it.0), Some(ObjRef::from_wire(&it.2)))
+        } else if let Ok(w) = body.deserialize::<WireRef>() {
+            (ObjRef::from_wire(&w), None)
+        } else {
+            return;
+        };
+        if crate::trace_on() {
+            *log.kinds.entry(member.clone()).or_default() += 1;
         }
+        let dirty = log.dirty.entry(sender.clone()).or_default();
+        dirty.push((obj.clone(), Forget::Kids));
+        dirty.extend(parent.filter(|p| !p.is_null()).map(|p| (p, Forget::Kids)));
+        if member == "RemoveAccessible" {
+            log.removed.insert(obj, seq);
+        }
+        log.prune();
+        return;
+    }
+    // Object events carry (detail, d1, d2, any_data[, properties]).
+    let parsed = body
+        .deserialize::<(String, i32, i32, OwnedValue, HashMap<String, OwnedValue>)>()
+        .map(|(d, a, b, v, _)| (d, a, b, v))
+        .or_else(|_| body.deserialize::<(String, i32, i32, OwnedValue)>())
+        .ok();
+    let detail = parsed.as_ref().map(|p| p.0.as_str()).unwrap_or_default();
+    if crate::trace_on() {
+        *log.kinds.entry(format!("{member}:{detail}")).or_default() += 1;
+        if log.kinds.len() == 1 || (member == "ChildrenChanged" && path == REGISTRY_ROOT) || iface.ends_with("Window") {
+            eprintln!("trace atspi {member}:{detail} {sender}{path} t={:?}", crate::since_start());
+        }
+    }
+    if let Some(how) = forget_for(&member, detail) {
+        let dirty = log.dirty.entry(sender.clone()).or_default();
+        dirty.push((ObjRef::new(&sender, &path), how));
+        if dirty.len() > LOG_HARD_MAX {
+            // Too many to track: the next observation drops the whole mirror.
+            dirty.clear();
+            dirty.push((ObjRef::new(&sender, "*"), Forget::Deep));
+        }
+    }
+    match member.as_str() {
         "StateChanged" | "ChildrenChanged" => {
-            let parsed = body
-                .deserialize::<(String, i32, i32, OwnedValue, HashMap<String, OwnedValue>)>()
-                .map(|(d, a, b, v, _)| (d, a, b, v))
-                .or_else(|_| body.deserialize::<(String, i32, i32, OwnedValue)>());
-            if let Ok((detail, d1, _d2, v)) = parsed {
+            if let Some((detail, d1, _d2, v)) = parsed {
                 if member == "StateChanged" && detail == "defunct" && d1 == 1 {
                     log.removed.insert(ObjRef::new(&sender, &path), seq);
                 } else if member == "StateChanged" && detail == "focused" {
@@ -1181,7 +1306,7 @@ fn handle_event(log: &Mutex<EventLog>, msg: &Message) {
                     } else if log.focused.get(&sender) == Some(&r) {
                         log.focused.remove(&sender);
                     }
-                } else if member == "ChildrenChanged" && detail.starts_with("remove") {
+                } else if member == "ChildrenChanged" {
                     if let Ok(w) = <(String, OwnedObjectPath)>::try_from(v) {
                         let r = ObjRef::from_wire(&w);
                         let r = if r.bus.is_empty() {
@@ -1189,7 +1314,10 @@ fn handle_event(log: &Mutex<EventLog>, msg: &Message) {
                         } else {
                             r
                         };
-                        log.removed.insert(r, seq);
+                        if detail.starts_with("remove") {
+                            log.removed.insert(r.clone(), seq);
+                        }
+                        log.dirty.entry(sender.clone()).or_default().push((r, Forget::Node));
                     }
                 }
             }
@@ -1341,6 +1469,7 @@ impl Accessibility {
                 last_id: first_id.saturating_sub(1),
                 windows: HashMap::new(),
             },
+            last_action_seq: 0,
         })
     }
 
@@ -1467,13 +1596,12 @@ impl Accessibility {
     /// Observe a window. Accessibility failures never fail the observation;
     /// they are returned as warnings with empty `text`.
     pub async fn snapshot(&mut self, window: &WindowInfo) -> Result<AxSnapshot> {
-        let deadline = Instant::now() + SNAPSHOT_BUDGET;
         let mut warnings = std::mem::take(&mut self.setup_warnings);
-        // The deadline bounds every phase; this is the backstop for calls
+        // The budget bounds every phase; this is the backstop for calls
         // that do not take it into account.
         let r = tokio::time::timeout(
-            SNAPSHOT_BUDGET + PROBE_TIMEOUT,
-            self.snapshot_inner(window, deadline, &mut warnings),
+            SNAPSHOT_BACKSTOP,
+            self.snapshot_inner(window, &mut warnings),
         )
         .await
         .unwrap_or_else(|_| {
@@ -1537,12 +1665,61 @@ impl Accessibility {
         }
     }
 
-    async fn map_window(
-        &mut self,
-        w: &WindowInfo,
-        deadline: Instant,
-        warnings: &mut Vec<String>,
-    ) -> Result<(ObjRef, Node)> {
+    /// How long the first call of an observation waits for the app: a busy
+    /// app gets `BUSY_WAIT`, one confirmed blocked inside an earlier action
+    /// call `PROBE_TIMEOUT`.
+    fn probe_timeout(&self, bus: &str) -> Duration {
+        if self.blocked.contains(bus) {
+            PROBE_TIMEOUT
+        } else {
+            BUSY_WAIT
+        }
+    }
+
+    /// The window's accessible frame and its current node. The frame bound
+    /// by an earlier observation is reused while it is still showing (one
+    /// call, which also serves as the liveness probe); otherwise the app's
+    /// top-levels are enumerated and scored.
+    async fn map_window(&mut self, w: &WindowInfo, warnings: &mut Vec<String>) -> Result<(ObjRef, Node)> {
+        let bound = self
+            .obs
+            .windows
+            .get(&w.window_id)
+            .filter(|ws| ws.pid == w.pid)
+            .and_then(|ws| ws.frame.clone());
+        if let Some(frame) = bound {
+            if self.still_unresponsive(&frame.bus).await {
+                bail!(
+                    "the app's accessibility interface is not responding (busy{}); pointer input still works",
+                    if self.blocked.contains(&frame.bus) {
+                        ", and an earlier accessibility action is still running inside it"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            let t = self.probe_timeout(&frame.bus);
+            match tokio::time::timeout(t, fetch_node_live(&self.conn, &frame)).await {
+                Ok(Ok(node))
+                    if has(node.states, S_SHOWING)
+                        && !has(node.states, S_DEFUNCT)
+                        && node.role != R_APPLICATION =>
+                {
+                    self.unresponsive.remove(&frame.bus);
+                    return Ok((frame, node));
+                }
+                // Gone or hidden (a dialog closing): map afresh.
+                Ok(_) => {}
+                Err(_) => {
+                    self.unresponsive
+                        .insert(frame.bus.clone(), Instant::now() + UNRESPONSIVE_RETRY);
+                    bail!(
+                        "the app's accessibility interface did not answer within {} ms (busy); pointer input still works",
+                        t.as_millis()
+                    );
+                }
+            }
+        }
         let apps = self.registry_apps().await?;
         self.app_pids(&apps).await;
         let mine: Vec<ObjRef> = apps
@@ -1558,20 +1735,15 @@ impl Accessibility {
         }
         let mut tops: Vec<ObjRef> = Vec::new();
         let mut blocked = 0;
+        let mut waited = Duration::ZERO;
         for app in &mine {
             if self.still_unresponsive(&app.bus).await {
                 blocked += 1;
                 continue;
             }
-            let kids: Result<Vec<WireRef>> = call_t(
-                &self.conn,
-                app,
-                I_ACC,
-                "GetChildren",
-                &(),
-                PROBE_TIMEOUT,
-            )
-            .await;
+            let t = self.probe_timeout(&app.bus);
+            let kids: Result<Vec<WireRef>> =
+                call_t(&self.conn, app, I_ACC, "GetChildren", &(), t).await;
             match kids {
                 Ok(k) => {
                     self.unresponsive.remove(&app.bus);
@@ -1586,6 +1758,7 @@ impl Accessibility {
                     self.unresponsive
                         .insert(app.bus.clone(), Instant::now() + UNRESPONSIVE_RETRY);
                     blocked += 1;
+                    waited = waited.max(t);
                 }
                 Err(e) => warnings.push(format!(
                     "could not list top-level objects of {}: {e:#}",
@@ -1596,7 +1769,7 @@ impl Accessibility {
         if tops.is_empty() && blocked > 0 {
             bail!(
                 "the app's accessibility interface did not answer within {} ms (busy{}); pointer input still works",
-                PROBE_TIMEOUT.as_millis(),
+                waited.max(REPROBE_TIMEOUT).as_millis(),
                 if mine.iter().any(|a| self.blocked.contains(&a.bus)) {
                     ", and an earlier accessibility action is still running inside it"
                 } else {
@@ -1604,6 +1777,8 @@ impl Accessibility {
                 }
             );
         }
+        // The app answered: its top-levels come quickly.
+        let deadline = Instant::now() + PROBE_TIMEOUT;
         let conn = &self.conn;
         let fetched: Vec<(ObjRef, Result<Node>, Option<Rect>)> = stream::iter(tops)
             .map(|r| async move {
@@ -1724,28 +1899,54 @@ impl Accessibility {
         Ok((best.r.clone(), best.node.clone()))
     }
 
-    async fn ensure_cache(
-        &mut self,
-        bus: &str,
-        deadline: Instant,
-        warnings: &mut Vec<String>,
-    ) -> Option<Arc<AppCache>> {
+    /// Brings the application's mirror (`AppCache`) up to date for an
+    /// observation: objects that events named since the last one are
+    /// forgotten; the bulk `Cache.GetItems` is fetched the first time and
+    /// again after `CACHE_MAX_AGE`, or on every observation while event
+    /// delivery is degraded. Afterwards `self.caches` holds the mirror,
+    /// unless the bulk fetch failed outright.
+    async fn app_store(&mut self, bus: &str, deadline: Instant, warnings: &mut Vec<String>) {
         let live = self.invalidation_live();
-        let last = self
+        let dirty = self
             .events
             .lock()
             .ok()
-            .and_then(|l| l.last.get(bus).copied())
-            .unwrap_or(0);
-        if let Some(c) = self.caches.get(bus) {
-            if !c.supported && c.retry_at.is_none_or(|t| Instant::now() < t) {
-                return None;
+            .and_then(|mut l| l.dirty.remove(bus))
+            .unwrap_or_default();
+        let reset = !live || dirty.iter().any(|(r, _)| r.path == "*");
+        let now = Instant::now();
+        match self.caches.get_mut(bus) {
+            Some(c) if !reset && now.duration_since(c.fetched_at) < CACHE_MAX_AGE => {
+                let before = c.nodes.len();
+                for (r, how) in &dirty {
+                    c.forget(r, *how);
+                }
+                if crate::trace_on() {
+                    let kinds = self.events.lock().ok().map(|mut l| std::mem::take(&mut l.kinds)).unwrap_or_default();
+                    let mut kinds: Vec<(String, usize)> = kinds.into_iter().collect();
+                    kinds.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+                    let kinds: Vec<String> = kinds.iter().take(8).map(|(k, n)| format!("{k}={n}")).collect();
+                    eprintln!(
+                        "trace store {bus} dirty={} forgot={} nodes={} kids={} events[{}]",
+                        dirty.len(),
+                        before - c.nodes.len(),
+                        c.nodes.len(),
+                        c.kids.len(),
+                        kinds.join(" ")
+                    );
+                }
+                return;
             }
-            if live && c.fetched_seq >= last && c.fetched_at.elapsed() < CACHE_MAX_AGE {
-                return Some(c.clone());
+            // Without a usable bulk cache, the mirror holds live-fetched
+            // objects only: the backstop starts it over.
+            Some(c) if !c.supported && c.retry_at.is_none_or(|t| now < t) => {
+                c.nodes.clear();
+                c.kids.clear();
+                c.fetched_at = now;
+                return;
             }
+            _ => {}
         }
-        let seq_before = self.event_seq();
         let cache_ref = ObjRef::new(bus, CACHE_PATH);
         let msg = match call_raw(
             &self.conn,
@@ -1753,53 +1954,34 @@ impl Accessibility {
             I_CACHE,
             "GetItems",
             &(),
-            BULK_TIMEOUT.min(deadline.saturating_duration_since(Instant::now())),
+            BULK_TIMEOUT.min(deadline.saturating_duration_since(now)),
         )
         .await
         {
             Ok(m) => m,
             Err(e) => {
-                if format!("{e:#}").contains("timed out") {
+                let store = if format!("{e:#}").contains("timed out") {
                     // A bulk fetch too big for the budget (large web pages):
                     // live traversal for a while instead of paying it again.
-                    self.caches.insert(
-                        bus.to_string(),
-                        Arc::new(AppCache {
-                            fetched_seq: seq_before,
-                            fetched_at: Instant::now(),
-                            supported: false,
-                            retry_at: Some(Instant::now() + CACHE_RETRY),
-                            nodes: HashMap::new(),
-                            kids: HashMap::new(),
-                        }),
-                    );
                     warnings.push(format!(
                         "the app's bulk accessibility cache did not arrive within the observation budget; using a time-bounded live walk (retrying the cache in {} s)",
                         CACHE_RETRY.as_secs()
                     ));
+                    AppCache::empty(false, Some(now + CACHE_RETRY))
                 } else if is_unsupported(&e) {
-                    self.caches.insert(
-                        bus.to_string(),
-                        Arc::new(AppCache {
-                            fetched_seq: seq_before,
-                            fetched_at: Instant::now(),
-                            supported: false,
-                            retry_at: None,
-                            nodes: HashMap::new(),
-                            kids: HashMap::new(),
-                        }),
-                    );
                     warnings.push(
                         "application has no org.a11y.atspi.Cache; using bounded live traversal"
                             .into(),
                     );
+                    AppCache::empty(false, None)
                 } else {
-                    self.caches.remove(bus);
                     warnings.push(format!(
                         "Cache.GetItems failed; using bounded live traversal: {e:#}"
                     ));
-                }
-                return None;
+                    AppCache::empty(false, Some(now + CACHE_RETRY))
+                };
+                self.caches.insert(bus.to_string(), store);
+                return;
             }
         };
         let body = msg.body();
@@ -1863,28 +2045,33 @@ impl Accessibility {
                 "unrecognized Cache.GetItems signature {:?}; using bounded live traversal",
                 body.signature().to_string()
             ));
-            self.caches.remove(bus);
-            return None;
+            self.caches
+                .insert(bus.to_string(), AppCache::empty(false, Some(now + CACHE_RETRY)));
+            return;
         }
         if nodes.is_empty() {
             warnings
                 .push("Cache.GetItems returned no objects; using bounded live traversal".into());
         }
-        let c = Arc::new(AppCache {
-            fetched_seq: seq_before,
-            fetched_at: Instant::now(),
-            supported: true,
-            retry_at: None,
-            nodes,
-            kids,
-        });
-        self.caches.insert(bus.to_string(), c.clone());
-        Some(c)
+        self.caches.insert(
+            bus.to_string(),
+            AppCache {
+                fetched_at: now,
+                supported: true,
+                retry_at: None,
+                nodes,
+                kids,
+                actions: HashMap::new(),
+            },
+        );
     }
 
+    /// The window's tree below `frame`, breadth first: child lists and
+    /// nodes from the application's mirror where it has them, fetched live
+    /// otherwise (and recorded in `tree` for the mirror).
     async fn collect_tree(
         &self,
-        cache: Option<&AppCache>,
+        store: Option<&AppCache>,
         frame: &ObjRef,
         frame_node: Node,
         deadline: Instant,
@@ -1904,6 +2091,7 @@ impl Accessibility {
                 break;
             }
             let mut next: Vec<ObjRef> = Vec::new();
+            let mut lists: Vec<(ObjRef, Result<Vec<ObjRef>>)> = Vec::new();
             let mut need_live: Vec<ObjRef> = Vec::new();
             let mut big: Vec<(ObjRef, i32)> = Vec::new();
             for r in &frontier {
@@ -1914,39 +2102,19 @@ impl Accessibility {
                 {
                     continue;
                 }
-                let cached = cache.and_then(|c| c.kids.get(r));
-                match cached {
+                match store.and_then(|s| s.kids.get(r)) {
                     Some(k)
                         if !k.is_empty()
                             && (n.child_count < 0 || k.len() as i32 >= n.child_count) =>
                     {
-                        let list: Vec<ObjRef> = k.clone();
-                        for c in &list {
-                            if tree.nodes.len() >= MAX_TREE_NODES {
-                                break;
-                            }
-                            if tree.nodes.contains_key(c) {
-                                continue;
-                            }
-                            if let Some(cn) = cache.and_then(|cc| cc.nodes.get(c)) {
-                                tree.nodes.insert(c.clone(), cn.clone());
-                                tree.cached_nodes += 1;
-                                next.push(c.clone());
-                            }
-                        }
-                        tree.kids.insert(r.clone(), list);
+                        lists.push((r.clone(), Ok(k.clone())));
                     }
-                    _ => {
-                        if n.child_count > MAX_CHILDREN_LIVE {
-                            big.push((r.clone(), n.child_count));
-                            continue;
-                        }
-                        need_live.push(r.clone());
-                    }
+                    _ if n.child_count > MAX_CHILDREN_LIVE => big.push((r.clone(), n.child_count)),
+                    _ => need_live.push(r.clone()),
                 }
             }
-            if !need_live.is_empty() || !big.is_empty() {
-                let mut lists: Vec<(ObjRef, Result<Vec<ObjRef>>)> = stream::iter(need_live)
+            if !need_live.is_empty() {
+                let fetched: Vec<(ObjRef, Result<Vec<ObjRef>>)> = stream::iter(need_live)
                     .map(|r| async move {
                         let k = live_children(conn, &r).await;
                         (r, k)
@@ -1955,56 +2123,63 @@ impl Accessibility {
                     .take_until(tokio::time::sleep_until(deadline.into()))
                     .collect()
                     .await;
-                for (r, count) in big {
-                    if view.is_none() {
-                        view = extents(conn, frame, COORD_SCREEN).await.ok().flatten();
-                    }
-                    let k = tokio::time::timeout_at(
-                        deadline.into(),
-                        visible_children(conn, &r, count, view),
-                    )
-                    .await
-                    .unwrap_or_else(|_| Err(anyhow!("timed out")));
-                    let n = &tree.nodes[&r];
-                    tree.truncated.push(match &k {
-                        Ok((first, k)) if !k.is_empty() => format!(
-                            "{} {} has {count} children; showing {}-{} (the visible part); scroll for more",
-                            role_name(n.role),
-                            quote(&n.name, 40),
-                            first + 1,
-                            first + k.len() as i32
-                        ),
-                        _ => format!(
-                            "{count} children of a {} {} not traversed (exceeds {MAX_CHILDREN_LIVE})",
-                            role_name(n.role),
-                            quote(&n.name, 40)
-                        ),
-                    });
-                    lists.push((r, k.map(|(_, k)| k)));
+                lists.extend(fetched);
+            }
+            for (r, count) in big {
+                if view.is_none() {
+                    view = extents(conn, frame, COORD_SCREEN).await.ok().flatten();
                 }
-                let mut to_fetch: Vec<ObjRef> = Vec::new();
-                let mut new_lists: Vec<(ObjRef, Vec<ObjRef>)> = Vec::new();
-                for (p, k) in lists {
-                    match k {
-                        Ok(k) => {
-                            for c in &k {
-                                if !tree.nodes.contains_key(c) && !to_fetch.contains(c) {
-                                    if let Some(cn) = cache.and_then(|cc| cc.nodes.get(c)) {
-                                        if tree.nodes.len() < MAX_TREE_NODES {
-                                            tree.nodes.insert(c.clone(), cn.clone());
-                                            tree.cached_nodes += 1;
-                                            next.push(c.clone());
-                                        }
-                                    } else {
-                                        to_fetch.push(c.clone());
-                                    }
-                                }
+                let k = tokio::time::timeout_at(
+                    deadline.into(),
+                    visible_children(conn, &r, count, view),
+                )
+                .await
+                .unwrap_or_else(|_| Err(anyhow!("timed out")));
+                let n = &tree.nodes[&r];
+                tree.truncated.push(match &k {
+                    Ok((first, k)) if !k.is_empty() => format!(
+                        "{} {} has {count} children; showing {}-{} (the visible part); scroll for more",
+                        role_name(n.role),
+                        quote(&n.name, 40),
+                        first + 1,
+                        first + k.len() as i32
+                    ),
+                    _ => format!(
+                        "{count} children of a {} {} not traversed (exceeds {MAX_CHILDREN_LIVE})",
+                        role_name(n.role),
+                        quote(&n.name, 40)
+                    ),
+                });
+                tree.partial.insert(r.clone());
+                lists.push((r, k.map(|(_, k)| k)));
+            }
+            let mut to_fetch: Vec<ObjRef> = Vec::new();
+            let mut queued: std::collections::HashSet<ObjRef> = std::collections::HashSet::new();
+            let mut new_lists: Vec<(ObjRef, Vec<ObjRef>)> = Vec::new();
+            for (p, k) in lists {
+                match k {
+                    Ok(k) => {
+                        for c in &k {
+                            if tree.nodes.contains_key(c) || queued.contains(c) {
+                                continue;
                             }
-                            new_lists.push((p, k));
+                            if let Some(cn) = store.and_then(|s| s.nodes.get(c)) {
+                                if tree.nodes.len() < MAX_TREE_NODES {
+                                    tree.nodes.insert(c.clone(), cn.clone());
+                                    tree.cached_nodes += 1;
+                                    next.push(c.clone());
+                                }
+                            } else {
+                                queued.insert(c.clone());
+                                to_fetch.push(c.clone());
+                            }
                         }
-                        Err(_) => tree.failures += 1,
+                        new_lists.push((p, k));
                     }
+                    Err(_) => tree.failures += 1,
                 }
+            }
+            if !to_fetch.is_empty() {
                 let room = MAX_LIVE_NODES
                     .saturating_sub(tree.live_nodes)
                     .min(MAX_TREE_NODES.saturating_sub(tree.nodes.len()));
@@ -2034,13 +2209,13 @@ impl Accessibility {
                         Err(_) => tree.failures += 1,
                     }
                 }
-                for (p, k) in new_lists {
-                    let k: Vec<ObjRef> = k
-                        .into_iter()
-                        .filter(|c| tree.nodes.contains_key(c))
-                        .collect();
-                    tree.kids.insert(p, k);
-                }
+            }
+            for (p, k) in new_lists {
+                let k: Vec<ObjRef> = k
+                    .into_iter()
+                    .filter(|c| tree.nodes.contains_key(c))
+                    .collect();
+                tree.kids.insert(p, k);
             }
             if tree.nodes.len() >= MAX_TREE_NODES && !next.is_empty() {
                 tree.truncated
@@ -2058,71 +2233,60 @@ impl Accessibility {
         tree
     }
 
-    async fn snapshot_inner(
-        &mut self,
-        w: &WindowInfo,
-        deadline: Instant,
-        warnings: &mut Vec<String>,
-    ) -> Result<String> {
+    async fn snapshot_inner(&mut self, w: &WindowInfo, warnings: &mut Vec<String>) -> Result<String> {
+        let mut trace = crate::Trace::new(format!("snapshot {}", w.window_id));
         let snap_seq = self.event_seq();
         self.obs.begin(w);
 
-        let (frame, frame_node) = self.map_window(w, deadline, warnings).await?;
+        let (frame, frame_node) = self.map_window(w, warnings).await?;
         if self.obs.bind_frame(w.window_id, &frame) {
             warnings.push("window maps to a different accessible frame than before; earlier element IDs are no longer valid".into());
         }
-
-        // The tree walk leaves part of the budget for geometry and details.
+        trace.mark("map");
+        // The budget starts once the app answers: the tree walk leaves part
+        // of it for geometry and details.
+        let deadline = Instant::now() + SNAPSHOT_BUDGET;
         let walk_deadline = deadline
             .checked_sub(RENDER_RESERVE)
             .unwrap_or(deadline)
             .max(Instant::now());
-        let cache = self.ensure_cache(&frame.bus, walk_deadline, warnings).await;
-        let cache_ref = cache.as_deref().filter(|c| !c.nodes.is_empty());
+        self.app_store(&frame.bus, walk_deadline, warnings).await;
+        trace.mark("cache");
+        let store = self.caches.get(&frame.bus);
         let tree = self
-            .collect_tree(cache_ref, &frame, frame_node, walk_deadline)
+            .collect_tree(store, &frame, frame_node.clone(), walk_deadline)
             .await;
+        trace.mark("tree");
+        trace.note("nodes", tree.nodes.len());
+        trace.note("live", tree.live_nodes);
+        let mirrored = store.is_some();
+        // What was fetched live joins the mirror for the next observation.
+        if let Some(store) = self.caches.get_mut(&frame.bus) {
+            store.nodes.insert(frame.clone(), frame_node);
+            for (r, n) in &tree.nodes {
+                store.nodes.entry(r.clone()).or_insert_with(|| n.clone());
+            }
+            for (p, k) in &tree.kids {
+                if !tree.partial.contains(p) && !store.kids.contains_key(p) {
+                    store.kids.insert(p.clone(), k.clone());
+                }
+            }
+        }
         let conn = &self.conn;
 
-        // Geometry for every collected object (window-relative).
-        let comp: Vec<ObjRef> = tree
-            .nodes
-            .iter()
-            .filter(|(_, n)| n.has_iface(I_COMPONENT) && has(n.states, S_SHOWING))
-            .map(|(r, _)| r.clone())
-            .collect();
-        // Screen coordinates relative to the X window's origin: unlike
-        // COORD_WINDOW (relative to each object's own toplevel), this is also
-        // right for menus and other popups.
-        let (ox, oy) = w.origin;
-        let rects: HashMap<ObjRef, Rect> = stream::iter(comp)
-            .map(|r| async move {
-                let e = extents(conn, &r, COORD_SCREEN).await.map(|e| {
-                    e.map(|e| Rect {
-                        x: e.x - ox,
-                        y: e.y - oy,
-                        ..e
-                    })
-                });
-                (r, e)
-            })
-            .buffer_unordered(CONCURRENCY)
-            .take_until(tokio::time::sleep_until(deadline.into()))
-            .filter_map(|(r, e)| async move { e.ok().flatten().map(|e| (r, e)) })
-            .collect()
-            .await;
-
         let (ww, wh) = (w.width as i32, w.height as i32);
-        let mut offscreen = 0usize;
-        // Pass 1: candidates (no detail-dependent decisions).
+        // Pass 1: candidates (no detail-dependent decisions). Geometry is
+        // not known yet, so subtrees outside the window are not pruned here;
+        // the few details fetched for them cost less than a second round of
+        // calls after the geometry.
         let mut cands: Vec<ObjRef> = Vec::new();
         walk(
             &tree,
-            &rects,
+            &HashMap::new(),
             &frame,
             ww,
             wh,
-            &mut offscreen,
+            &mut 0,
             &mut |r, n, _| {
                 if cands.len() >= MAX_CANDIDATES {
                     return false;
@@ -2135,34 +2299,89 @@ impl Accessibility {
             },
         );
 
-        // Details for candidates.
-        let details: HashMap<ObjRef, Details> = stream::iter(
-            cands
-                .into_iter()
-                .filter_map(|r| tree.nodes.get(&r).map(|n| (r, n.clone()))),
-        )
-        .map(|(r, n)| async move {
-            let d = fetch_details(conn, &r, &n).await;
-            (r, d)
-        })
-        .buffer_unordered(CONCURRENCY)
-        .take_until(tokio::time::sleep_until(deadline.into()))
-        .collect()
-        .await;
+        // Geometry for every collected object (window-relative) and details
+        // for the candidates, in one round of concurrent calls. Screen
+        // coordinates relative to the X window's origin: unlike COORD_WINDOW
+        // (relative to each object's own toplevel), this is also right for
+        // menus and other popups.
+        enum Fetch {
+            Rect(ObjRef),
+            Detail(ObjRef, Node, Option<Vec<String>>),
+        }
+        enum Fetched {
+            Rect(ObjRef, Option<Rect>),
+            Detail(ObjRef, Details),
+        }
+        let (ox, oy) = w.origin;
+        let known_actions = self.caches.get(&frame.bus).map(|s| &s.actions);
+        // Built eagerly: an iterator holding borrows across the awaits below
+        // would keep the observation future from being Send.
+        let mut fetches: Vec<Fetch> = Vec::new();
+        for (r, n) in &tree.nodes {
+            if n.has_iface(I_COMPONENT) && has(n.states, S_SHOWING) {
+                fetches.push(Fetch::Rect(r.clone()));
+            }
+        }
+        for r in cands {
+            if let Some(n) = tree.nodes.get(&r) {
+                let actions = known_actions.and_then(|a| a.get(&r)).cloned();
+                fetches.push(Fetch::Detail(r, n.clone(), actions));
+            }
+        }
+        let fetched: Vec<Fetched> = stream::iter(fetches)
+            .map(|f| async move {
+                match f {
+                    Fetch::Rect(r) => {
+                        let e = extents(conn, &r, COORD_SCREEN).await.ok().flatten();
+                        Fetched::Rect(r, e.map(|e| Rect { x: e.x - ox, y: e.y - oy, ..e }))
+                    }
+                    Fetch::Detail(r, n, actions) => {
+                        let d = fetch_details(conn, &r, &n, actions).await;
+                        Fetched::Detail(r, d)
+                    }
+                }
+            })
+            .buffer_unordered(CONCURRENCY)
+            .take_until(tokio::time::sleep_until(deadline.into()))
+            .collect()
+            .await;
+        let mut rects: HashMap<ObjRef, Rect> = HashMap::new();
+        let mut details: HashMap<ObjRef, Details> = HashMap::new();
+        for f in fetched {
+            match f {
+                Fetched::Rect(r, Some(e)) => {
+                    rects.insert(r, e);
+                }
+                Fetched::Rect(_, None) => {}
+                Fetched::Detail(r, d) => {
+                    details.insert(r, d);
+                }
+            }
+        }
+        if let Some(store) = self.caches.get_mut(&frame.bus) {
+            for (r, d) in &details {
+                if let Some(a) = &d.actions {
+                    store.actions.entry(r.clone()).or_insert_with(|| a.clone());
+                }
+            }
+        }
+        trace.mark("rects+details");
+        trace.note("comps", rects.len());
+        trace.note("cands", details.len());
 
         // Pass 2: render.
         let obs = &mut self.obs;
         let mut lines: Vec<(usize, u32, String)> = Vec::new();
         let mut elements: HashMap<u32, Elem> = HashMap::new();
         let mut line_truncated = false;
-        let mut off2 = 0usize;
+        let mut offscreen = 0usize;
         walk(
             &tree,
             &rects,
             &frame,
             ww,
             wh,
-            &mut off2,
+            &mut offscreen,
             &mut |r, n, depth| {
                 let d = details.get(r);
                 let show = r == &frame || interesting(n, d);
@@ -2189,9 +2408,9 @@ impl Accessibility {
             },
         );
 
-        let source = match (cache_ref.is_some(), tree.live_nodes) {
-            (true, 0) => "bulk cache".to_string(),
-            (true, n) => format!("bulk cache + {n} live"),
+        let source = match (mirrored, tree.live_nodes) {
+            (true, 0) => "cached".to_string(),
+            (true, n) => format!("cached + {n} live"),
             (false, n) => format!("live traversal ({n} objects)"),
         };
         let mut text = format!(
@@ -2243,6 +2462,9 @@ impl Accessibility {
         ws.snap_seq = snap_seq;
         ws.valid = true;
         self.publish_floor();
+        trace.mark("render");
+        trace.note("lines", lines.len());
+        trace.done();
         Ok(text)
     }
 
@@ -2284,15 +2506,35 @@ impl Accessibility {
         text: &str,
         element_index: Option<u32>,
     ) -> Result<TextInput> {
+        let mut trace = crate::Trace::new("text_input");
         self.ensure_observed(window, element_index).await;
+        trace.mark("ensure");
         let el = match element_index {
             Some(_) => self.focused_editable(window, element_index).await?,
-            None => match self.focused_editable(window, None).await {
-                Ok(el) => el,
-                Err(e) => return Ok(TextInput::NoTarget(format!("{e:#}"))),
-            },
+            None => {
+                let mut found = self.focused_editable(window, None).await;
+                // The focused field may be newer than the window's
+                // observation (the location entry a shortcut just showed in
+                // a file chooser): observe again once after an action.
+                if found.is_err() && self.stale(window) {
+                    self.observe_now(window).await;
+                    trace.mark("reobserve");
+                    found = self.focused_editable(window, None).await;
+                }
+                match found {
+                    Ok(el) => el,
+                    Err(e) => {
+                        trace.mark("focused");
+                        trace.note("target", "none");
+                        trace.done();
+                        return Ok(TextInput::NoTarget(format!("{e:#}")));
+                    }
+                }
+            }
         };
+        trace.mark("focused");
         if text.contains('\n') && has(el.states, S_SINGLE_LINE) {
+            trace.done();
             return Ok(TextInput::SingleLine);
         }
         let mut warnings = Vec::new();
@@ -2302,40 +2544,66 @@ impl Accessibility {
                 warnings.push(hint);
             }
         }
+        trace.mark("insert");
+        trace.done();
         Ok(TextInput::Inserted(warnings))
     }
 
     /// How to click element `idx`. A pointer click whenever the element has
-    /// visible geometry: toolkits run DoAction inside the accessibility call,
-    /// and a handler that opens a modal dialog (gtk_dialog_run, as GTK menu
-    /// items and buttons do) then blocks the app's accessibility connection,
-    /// and with it all key input, until the dialog closes. DoAction only for
-    /// elements without visible geometry (scrolled out of view); a menu item
-    /// without geometry is refused, its menu is not open.
+    /// visible geometry and the toolkit does not report another element
+    /// covering its centre: toolkits run DoAction inside the accessibility
+    /// call, and a handler that opens a modal dialog (gtk_dialog_run, as GTK
+    /// menu items and buttons do) then blocks the app's accessibility
+    /// connection, and with it all key input, until the dialog closes.
+    /// DoAction for elements without visible geometry (scrolled out of view)
+    /// or whose centre is covered (an overlay, a sticky header); a menu item
+    /// in either case is refused, its menu is not open or the click would hit
+    /// something else. A toolkit that does not answer the hit test, or
+    /// answers with a sibling (GTK tree views), does not stop the click.
     pub async fn click_plan(&mut self, window: &WindowInfo, idx: u32) -> Result<ClickPlan> {
+        let mut trace = crate::Trace::new(format!("click_plan {idx}"));
         self.ensure_observed(window, Some(idx)).await;
+        trace.mark("ensure");
         let el = self.resolve(window, idx).await?;
+        trace.mark("resolve");
         require_enabled(&el, idx)?;
         let menu_item = matches!(el.role, R_MENU_ITEM | R_CHECK_MENU_ITEM | R_RADIO_MENU_ITEM);
-        let point = if el.has_iface(I_COMPONENT) {
-            visible_center(&self.conn, &el, menu_item).await?
+        let geometry = if el.has_iface(I_COMPONENT) {
+            click_geometry(&self.conn, &el, menu_item).await?
         } else {
             None
         };
-        Ok(match point {
-            // Items of an open menu lie on the app's popup windows; an item of
-            // a menu bar lies in the window itself.
-            Some((x, y)) if menu_item => ClickPlan::Pointer {
-                x,
-                y,
-                popup: parent_role(&self.conn, &el.r).await != Some(R_MENU_BAR),
-            },
-            Some((x, y)) => ClickPlan::Pointer { x, y, popup: false },
-            None if menu_item => bail!(
-                "menu item {idx} has no on-screen geometry (its menu is closed or it is scrolled out of view); open or scroll its menu first"
-            ),
-            None => ClickPlan::Action,
-        })
+        trace.mark("geometry");
+        let Some(g) = geometry else {
+            if menu_item {
+                bail!("menu item {idx} has no on-screen geometry (its menu is closed or it is scrolled out of view); open or scroll its menu first");
+            }
+            return Ok(ClickPlan::Action { warning: None });
+        };
+        let hit = hit_at_point(&self.conn, &el.r, &g).await;
+        trace.mark("hit");
+        trace.note("hit", format!("{hit:?}").split('(').next().unwrap_or("?"));
+        trace.done();
+        if let PointHit::Other(o) = &hit {
+            let what = format!("its centre is covered by {o}");
+            if menu_item {
+                bail!("menu item {idx}: {what}; refusing to click (close what covers it, or scroll the menu)");
+            }
+            return Ok(ClickPlan::Action {
+                warning: Some(format!("element {idx}: {what}, so it was activated through accessibility instead of a pointer click")),
+            });
+        }
+        let (x, y) = g.center;
+        // Items of an open menu, and elements of popup windows (completion
+        // lists, dropdowns), lie on the app's popup windows; an item of a
+        // menu bar lies in the window itself.
+        let popup = if menu_item {
+            parent_role(&self.conn, &el.r).await != Some(R_MENU_BAR)
+        } else {
+            g.top_role.is_some_and(is_popup_role)
+        };
+        let r = g.rect;
+        Ok(ClickPlan::Pointer { x, y, popup: popup.then_some((r.x, r.y, r.w, r.h)) })
     }
 
     /// Screen centre of a text field that exposes Text but not EditableText
@@ -2408,6 +2676,17 @@ impl Accessibility {
     /// again for up to `KEY_BUSY_WAIT` and then gets the keys (queued) with a
     /// warning. `Err` is the refusal, `Ok(Some)` a warning.
     pub async fn key_input_gate(
+        &mut self,
+        w: &WindowInfo,
+    ) -> std::result::Result<Option<String>, String> {
+        let mut trace = crate::Trace::new("key_gate");
+        let r = self.key_input_gate_inner(w).await;
+        trace.mark("probe");
+        trace.done();
+        r
+    }
+
+    async fn key_input_gate_inner(
         &mut self,
         w: &WindowInfo,
     ) -> std::result::Result<Option<String>, String> {
@@ -2491,15 +2770,30 @@ impl Accessibility {
             }
         };
         if need {
-            let deadline = Instant::now() + SNAPSHOT_BUDGET;
-            let mut ignored = Vec::new();
-            let r = tokio::time::timeout(
-                SNAPSHOT_BUDGET + PROBE_TIMEOUT,
-                self.snapshot_inner(w, deadline, &mut ignored),
-            )
-            .await;
-            let _ = r;
+            self.observe_now(w).await;
         }
+    }
+
+    /// A bounded snapshot whose warnings nobody reads: it refreshes the
+    /// window's element map (or leaves the previous one when it fails).
+    async fn observe_now(&mut self, w: &WindowInfo) {
+        let mut ignored = Vec::new();
+        let r = tokio::time::timeout(SNAPSHOT_BACKSTOP, self.snapshot_inner(w, &mut ignored)).await;
+        let _ = r;
+    }
+
+    /// Marks the start of an action: observations taken before it may not
+    /// show the elements the action creates (actions do not observe).
+    pub fn begin_action(&mut self) {
+        self.last_action_seq = self.event_seq();
+    }
+
+    /// Whether the window's latest observation predates the last action.
+    fn stale(&self, w: &WindowInfo) -> bool {
+        self.obs
+            .windows
+            .get(&w.window_id)
+            .is_none_or(|ws| !ws.valid || ws.snap_seq <= self.last_action_seq)
     }
 
     /// Window-local centre of a still-valid element from the latest observation,
@@ -3167,8 +3461,10 @@ fn interesting(n: &Node, d: Option<&Details>) -> bool {
     false
 }
 
-async fn fetch_details(conn: &Connection, r: &ObjRef, n: &Node) -> Details {
-    let mut d = Details::default();
+/// Text, value and actions of an object. `actions` are the names already
+/// known from an earlier observation (they do not change for a widget).
+async fn fetch_details(conn: &Connection, r: &ObjRef, n: &Node, actions: Option<Vec<String>>) -> Details {
+    let mut d = Details { actions, ..Details::default() };
     if n.has_iface(I_TEXT) && n.role != R_PASSWORD_TEXT {
         if let Ok(count) = get_prop::<i32>(conn, r, I_TEXT, "CharacterCount").await {
             if count > 0 {
@@ -3200,15 +3496,16 @@ async fn fetch_details(conn: &Connection, r: &ObjRef, n: &Node) -> Details {
             }
         }
     }
-    if n.has_iface(I_ACTION) {
+    if n.has_iface(I_ACTION) && d.actions.is_none() {
         if let Ok(a) =
             call::<_, Vec<(String, String, String)>>(conn, r, I_ACTION, "GetActions", &()).await
         {
-            d.actions = a
-                .into_iter()
-                .map(|(n, _, _)| n)
-                .filter(|n| !n.is_empty())
-                .collect();
+            d.actions = Some(
+                a.into_iter()
+                    .map(|(n, _, _)| n)
+                    .filter(|n| !n.is_empty())
+                    .collect(),
+            );
         }
     }
     d
@@ -3301,10 +3598,9 @@ fn render_line(n: &Node, d: Option<&Details>, rect: Option<&Rect>, ww: i32, wh: 
             s.push_str(" (outside window)");
         }
     }
-    if let Some(d) = d {
-        if !d.actions.is_empty() {
-            let shown: Vec<&str> = d
-                .actions
+    if let Some(actions) = d.and_then(|d| d.actions.as_ref()) {
+        if !actions.is_empty() {
+            let shown: Vec<&str> = actions
                 .iter()
                 .take(MAX_ACTIONS_SHOWN)
                 .map(String::as_str)
@@ -3400,27 +3696,45 @@ fn empty_item_view_hint(tree: &Tree) -> Option<String> {
     ))
 }
 
-/// Screen centre of the part of an element that its ancestors leave
-/// visible (scroll panes and viewports clip their children), up to its
-/// top-level. Menu items are not clipped by their parent menu, whose
-/// extents are those of its menu-bar entry rather than of the popup.
-async fn visible_center(conn: &Connection, el: &Elem, menu_item: bool) -> Result<Option<(i32, i32)>> {
-    let Some(mut clip) = extents(conn, &el.r, COORD_SCREEN).await?.filter(|r| r.w > 0 && r.h > 0)
+/// Where an element can be clicked: the screen centre of the part of it
+/// that its ancestors leave visible (scroll panes and viewports clip their
+/// children), the element's own extents, and the objects a hit test starts
+/// from and passes through.
+struct ClickGeometry {
+    center: (i32, i32),
+    rect: Rect,
+    /// Ancestors up to and including `top` (parent first).
+    ancestors: Vec<ObjRef>,
+    /// Where the accessible hit test starts: the top-level, or for a menu
+    /// item its menu.
+    start: ObjRef,
+    top_role: Option<u32>,
+}
+
+/// Menu items are not clipped by their parent menu, whose extents are those
+/// of its menu-bar entry rather than of the popup; their hit test starts at
+/// that menu, which reports its items at points on the popup.
+async fn click_geometry(conn: &Connection, el: &Elem, menu_item: bool) -> Result<Option<ClickGeometry>> {
+    let Some(rect) = extents(conn, &el.r, COORD_SCREEN).await?.filter(|r| r.w > 0 && r.h > 0)
     else {
         return Ok(None);
     };
-    if !menu_item {
-        let mut cur = el.r.clone();
-        for _ in 0..32 {
-            let parent: (String, OwnedObjectPath) = get_prop(conn, &cur, I_ACC, "Parent").await?;
-            let p = ObjRef::from_wire(&parent);
-            if p.is_null() {
-                break;
-            }
-            let role: u32 = call(conn, &p, I_ACC, "GetRole", &()).await?;
-            if role == R_APPLICATION {
-                break;
-            }
+    let mut clip = rect;
+    let mut ancestors = Vec::new();
+    let mut top_role = None;
+    let mut cur = el.r.clone();
+    for _ in 0..32 {
+        let parent: (String, OwnedObjectPath) = get_prop(conn, &cur, I_ACC, "Parent").await?;
+        let p = ObjRef::from_wire(&parent);
+        if p.is_null() {
+            break;
+        }
+        let role: u32 = call(conn, &p, I_ACC, "GetRole", &()).await?;
+        if role == R_APPLICATION {
+            break;
+        }
+        ancestors.push(p.clone());
+        if !menu_item {
             if let Ok(Some(pr)) = extents(conn, &p, COORD_SCREEN).await {
                 if pr.w > 0 && pr.h > 0 {
                     match clip.intersect(&pr) {
@@ -3429,13 +3743,86 @@ async fn visible_center(conn: &Connection, el: &Elem, menu_item: bool) -> Result
                     }
                 }
             }
-            if is_toplevel_role(role) {
-                break;
-            }
-            cur = p;
         }
+        if is_toplevel_role(role) {
+            top_role = Some(role);
+            break;
+        }
+        cur = p;
     }
-    Ok(Some((clip.x + clip.w / 2, clip.y + clip.h / 2)))
+    let start = if menu_item { ancestors.first() } else { ancestors.last() };
+    let Some(start) = start.cloned() else {
+        return Ok(None);
+    };
+    Ok(Some(ClickGeometry {
+        center: (clip.x + clip.w / 2, clip.y + clip.h / 2),
+        rect,
+        ancestors,
+        start,
+        top_role,
+    }))
+}
+
+/// What the toolkit reports at a screen point, descending from `g.start`
+/// with Component.GetAccessibleAtPoint.
+#[derive(Debug, PartialEq)]
+enum PointHit {
+    /// The element or one of its descendants.
+    Element,
+    /// Another element covers the point (its description).
+    Other(String),
+    /// The toolkit did not answer down to the element.
+    Unknown,
+}
+
+async fn hit_at_point(conn: &Connection, target: &ObjRef, g: &ClickGeometry) -> PointHit {
+    let (x, y) = g.center;
+    let ancestors: std::collections::HashSet<&ObjRef> = g.ancestors.iter().collect();
+    let mut cur = g.start.clone();
+    for _ in 0..MAX_DEPTH {
+        let r: Result<(String, OwnedObjectPath)> =
+            call(conn, &cur, I_COMPONENT, "GetAccessibleAtPoint", &(x, y, COORD_SCREEN)).await;
+        let Ok(r) = r else { return PointHit::Unknown };
+        let r = ObjRef::from_wire(&r);
+        if r.is_null() || r == cur {
+            return PointHit::Unknown;
+        }
+        if &r == target {
+            return PointHit::Element;
+        }
+        if !ancestors.contains(&r) {
+            // A descendant of the element (its label), or something else.
+            let mut up = r.clone();
+            let mut hit_parent = None;
+            for step in 0..MAX_DEPTH {
+                let Ok(parent) = get_prop::<(String, OwnedObjectPath)>(conn, &up, I_ACC, "Parent").await else {
+                    break;
+                };
+                let p = ObjRef::from_wire(&parent);
+                if step == 0 {
+                    hit_parent = Some(p.clone());
+                }
+                if &p == target {
+                    return PointHit::Element;
+                }
+                if p.is_null() || ancestors.contains(&p) {
+                    break;
+                }
+                up = p;
+            }
+            // A sibling of the element is the toolkit's imprecision, not a
+            // cover: GTK tree views answer with the neighbouring cell (their
+            // hit test leaves out the header row).
+            if hit_parent.as_ref() == g.ancestors.first() {
+                return PointHit::Unknown;
+            }
+            let role: u32 = call(conn, &r, I_ACC, "GetRole", &()).await.unwrap_or(0);
+            let name: String = get_prop(conn, &r, I_ACC, "Name").await.unwrap_or_default();
+            return PointHit::Other(format!("{} {}", role_name(role), quote(&name, 40)));
+        }
+        cur = r;
+    }
+    PointHit::Unknown
 }
 
 async fn parent_role(conn: &Connection, r: &ObjRef) -> Option<u32> {

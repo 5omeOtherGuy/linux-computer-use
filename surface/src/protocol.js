@@ -180,9 +180,10 @@ for (const m of APP_SCOPED) {
   const spec = METHODS[m];
   const build = spec.build;
   const pointer = ['click', 'drag', 'scroll', 'type_text', 'paste'].includes(m);
-  spec.keys = [...spec.keys, 'app', ...(pointer ? ['frame_window'] : [])];
+  const action = spec.kind === 'action';
+  spec.keys = [...spec.keys, 'app', ...(pointer ? ['frame_window'] : []), ...(action ? ['observe'] : [])];
   spec.build = (method, p) => {
-    const { app, frame_window, ...rest } = p;
+    const { app, frame_window, observe, ...rest } = p;
     const out = build(method, rest);
     if (app !== undefined) {
       if (typeof app !== 'boolean') fail(method, 'app must be a boolean');
@@ -193,6 +194,12 @@ for (const m of APP_SCOPED) {
     if (frame_window !== undefined) {
       if (!pointer || app !== true) fail(method, 'frame_window needs app: true and a pointer or text method');
       out.frame_window = checks.windowId(method, frame_window);
+    }
+    // Set by the host for an action whose post-action tree nobody reads (the
+    // sandbox observes once at the end of a cell; adapters take a screenshot).
+    if (observe !== undefined) {
+      if (typeof observe !== 'boolean') fail(method, 'observe must be a boolean');
+      out.observe = observe;
     }
     return out;
   };
@@ -254,7 +261,7 @@ export function toolInputSchema(method, extensions = new Set()) {
       case 'value': add(k, { type: 'string', maxLength: MAX_TEXT }, true); break;
       case 'action': add(k, { type: 'string', description: 'Secondary accessibility action name' }, true); break;
       case 'app': add(k, { type: 'boolean', description: 'Treat window_id as the app: act on its focused or dialog window (element: the window holding it)' }); break;
-      case 'frame_window': break; // set by the sandbox host only
+      case 'frame_window': case 'observe': break; // set by the host only
       default: throw new Error(`no schema for ${k}`);
     }
   }

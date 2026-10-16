@@ -75,8 +75,13 @@ pub struct WindowInfo {
 pub enum HitArea {
     /// The window area (as captured), on the window or a popup over it.
     Window,
-    /// One of the client's popup windows (an open menu), anywhere on screen.
-    Popup,
+    /// The window itself, for an element of the window: refused when one
+    /// of the client's popups (a menu, a tooltip) covers the point.
+    Body,
+    /// One of the client's popup windows (an open menu), anywhere on screen;
+    /// the element's screen rectangle (x, y, w, h) must lie on that popup,
+    /// not on another one over it.
+    Popup((i32, i32, i32, i32)),
 }
 
 /// Explicit live-desktop opt-in (daemon command line only). The display is
@@ -150,6 +155,11 @@ const REPAINT_WAIT: Duration = Duration::from_millis(300);
 const REPAINT_QUIET: Duration = Duration::from_millis(15);
 /// Granularity for noticing accessibility events while waiting on X.
 const POLL_SLICE: Duration = Duration::from_millis(4);
+/// Quiet interval while the app has reacted only with accessibility events
+/// and shown nothing yet (it is building a dialog: GTK registers hundreds
+/// of objects, with pauses, before it creates the window), in place of the
+/// caller's quiet interval.
+const QUIET_INVISIBLE: Duration = Duration::from_millis(150);
 /// How long settling waits for a new top-level of an observed client (a
 /// dialog being built) to map.
 const MAP_WAIT: Duration = Duration::from_millis(1500);
@@ -777,6 +787,9 @@ pub struct Desktop {
     /// Relevant UI activity since `prepare_action`, and when it last happened.
     activity: bool,
     last_activity: Instant,
+    /// Some of that activity was visible on X (damage, a window mapping or
+    /// being created), not only accessibility events.
+    x_activity: bool,
     cursors: HashMap<Window, (i32, i32)>,
     hover: HashMap<Window, Window>,
     settle_target: Option<Window>,
@@ -924,6 +937,7 @@ impl Desktop {
             abort: None,
             activity: false,
             last_activity: Instant::now(),
+            x_activity: false,
             cursors: HashMap::new(),
             hover: HashMap::new(),
             settle_target: None,
@@ -1602,7 +1616,15 @@ impl Desktop {
         }
     }
 
+    /// Activity visible on X (the event handlers).
     fn note_activity(&mut self) {
+        self.activity = true;
+        self.x_activity = true;
+        self.last_activity = Instant::now();
+    }
+
+    /// Activity reported by the accessibility probe.
+    fn note_external_activity(&mut self) {
         self.activity = true;
         self.last_activity = Instant::now();
     }
@@ -1688,9 +1710,15 @@ impl Desktop {
                 if viewable == Some(false) {
                     self.creating.insert(e.window, Instant::now());
                 }
+                if crate::trace_on() {
+                    eprintln!("trace x11 CreateNotify {:#x} viewable={viewable:?} t={:?}", e.window, crate::since_start());
+                }
                 self.note_activity();
             }
             Event::MapNotify(e) if self.creating.remove(&e.window).is_some() => {
+                if crate::trace_on() {
+                    eprintln!("trace x11 MapNotify {:#x} t={:?}", e.window, crate::since_start());
+                }
                 self.note_activity();
             }
             Event::DestroyNotify(e) if e.event == self.root || e.event == e.window => {
@@ -1799,9 +1827,13 @@ impl Desktop {
         self.track_window(w.window_id, w.pid)?;
         self.settle_target = Some(w.window_id);
         self.activity = false;
+        self.x_activity = false;
         // Windows another action left half-created do not hold this one.
         self.creating.clear();
         self.conn.flush()?;
+        if crate::trace_on() {
+            eprintln!("trace x11 action_start t={:?}", crate::since_start());
+        }
         Ok(())
     }
 
@@ -1826,7 +1858,7 @@ impl Desktop {
         loop {
             self.pump()?;
             if external() {
-                self.note_activity();
+                self.note_external_activity();
             }
             if self.abort.is_some() {
                 return Ok(Settled {
@@ -1843,6 +1875,9 @@ impl Desktop {
                 continue;
             }
             let left = if self.activity {
+                // Accessibility events without anything shown yet: the app
+                // is still at work (building a dialog), with pauses.
+                let quiet = if self.x_activity { quiet } else { quiet.max(QUIET_INVISIBLE) };
                 let quiet_for = now - self.last_activity.max(start);
                 if quiet_for >= quiet {
                     return Ok(Settled {
@@ -1890,13 +1925,19 @@ impl Desktop {
     ) -> Result<bool> {
         let mut active = false;
         let start = Instant::now();
+        let mut trace = crate::Trace::new(format!("wait_closed {window:#x}"));
         loop {
             self.pump()?;
             let before = self.last_activity;
             if external() {
-                self.note_activity();
+                self.note_external_activity();
             }
-            active |= self.last_activity != before;
+            if self.last_activity != before {
+                if !active {
+                    trace.mark("first_activity");
+                }
+                active = true;
+            }
             if self.abort.is_some() {
                 return Ok(false);
             }
@@ -1905,10 +1946,16 @@ impl Desktop {
                 Err(_) => false,
             };
             if !open {
+                trace.mark("closed");
+                trace.done();
                 return Ok(true);
             }
             let now = Instant::now();
             if close_wait_over(active, now - self.last_activity, now - start, idle, still, max) {
+                trace.mark("gave_up");
+                trace.note("active", active);
+                trace.note("since_activity_ms", (now - self.last_activity).as_millis());
+                trace.done();
                 return Ok(false);
             }
             self.wait_readable(Duration::from_millis(20).min(max.saturating_sub(now - start)))?;
@@ -1939,7 +1986,7 @@ impl Desktop {
         let (rdx, rdy) = (r.dst_x as i32 - x, r.dst_y as i32 - y);
         // Captures show the window area only (popups clipped to it), so
         // coordinate input is limited to the same area.
-        if area == HitArea::Window {
+        if matches!(area, HitArea::Window | HitArea::Body) {
             check_in_window(x, y, info)?;
         }
         let mut start = None;
@@ -1954,25 +2001,45 @@ impl Desktop {
             };
             let (px, py) = (t.dst_x as i32, t.dst_y as i32);
             if (0..g.width as i32).contains(&px) && (0..g.height as i32).contains(&py) {
-                start = Some((p, px, py));
+                // Root rectangle of the popup.
+                let popup = (x + rdx - px, y + rdy - py, g.width as i32, g.height as i32);
+                start = Some((p, px, py, popup));
                 break;
             }
         }
-        let (mut win, mut lx, mut ly) = match start {
-            Some(s) => s,
+        let (mut win, mut lx, mut ly) = match (start, area) {
+            (Some((p, ..)), HitArea::Body) => {
+                return Err(xerr(
+                    "input_refused",
+                    format!("point ({x}, {y}) is covered by the app's popup window {p:#x} (an open menu, dropdown or tooltip); close it (Escape) first"),
+                ))
+            }
+            (Some((p, px, py, popup)), HitArea::Popup(el)) => {
+                // The element must be on this popup, not under another
+                // popup over it (a submenu over its parent menu).
+                let inside = el.0 >= popup.0 - 1
+                    && el.1 >= popup.1 - 1
+                    && el.0 + el.2 <= popup.0 + popup.2 + 1
+                    && el.1 + el.3 <= popup.1 + popup.3 + 1;
+                if !inside {
+                    return Err(xerr(
+                        "input_refused",
+                        format!("the menu item at ({x}, {y}) is not on the popup window {p:#x} at that point (another menu covers it, or the item is partly scrolled out); refusing the click"),
+                    ));
+                }
+                (p, px, py)
+            }
+            (Some((p, px, py, _)), HitArea::Window) => (p, px, py),
             // An item of an open menu must be on one of its popups; a point
             // beside them (an item scrolled out of a long menu) would
             // otherwise hit the main window.
-            None if area == HitArea::Popup => {
+            (None, HitArea::Popup(_)) => {
                 return Err(xerr(
                     "input_refused",
                     format!("point ({x}, {y}) is not on any open popup of the app (the menu item may be scrolled out of view); refusing the click"),
                 ))
             }
-            None => {
-                check_in_window(x, y, info)?;
-                (client, x, y)
-            }
+            (None, _) => (client, x, y),
         };
         for _ in 0..32 {
             let t = self
@@ -2267,9 +2334,9 @@ impl Desktop {
     /// which may lie on a popup beyond the window. Used instead of AT-SPI
     /// DoAction where the toolkit would run a nested main loop inside the
     /// accessibility call (GTK menu items opening modal dialogs).
-    pub fn click_element_point(&mut self, info: &WindowInfo, x: i32, y: i32, area: HitArea) -> Result<()> {
+    pub fn click_element_point(&mut self, info: &WindowInfo, click: &Value, area: HitArea) -> Result<()> {
         let mut time = self.server_time()?;
-        let r = self.do_click(info, &json!({"x": x, "y": y}), &mut time, area);
+        let r = self.do_click(info, click, &mut time, area);
         self.conn.flush()?;
         r
     }

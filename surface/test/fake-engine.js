@@ -118,6 +118,11 @@ async function handle(method, params) {
   record({ event: 'performed', method, params, pointer });
   if (method === 'click' && params.x === 777) notesDialog = true;
   if (method === 'press_key' && params.key === 'Escape') notesDialog = false;
+  if (params.observe === false) {
+    // As the daemon: the window the action landed on, without a tree.
+    const { accessibility, ax_diff, ...rest } = observation(active(win, params), false);
+    return { ...rest, observed: false };
+  }
   return observation(active(win, params), true);
 }
 

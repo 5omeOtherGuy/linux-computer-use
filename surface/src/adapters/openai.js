@@ -234,7 +234,8 @@ export class OpenAIComputerTool {
       const steps = this.#plan(actions, g);
       for (const [idx, step] of steps.entries()) {
         if (signal?.aborted) throw new CuaError('cancelled', 'computer_call cancelled');
-        if (step.method) await this.host.call(step.method, step.params, { signal });
+        // The screenshot after the batch is the only state read: no tree per action.
+        if (step.method) await this.host.call(step.method, { ...step.params, observe: false }, { signal });
         else if (step.wait) await this.sleep(step.wait, signal);
         if (steps[idx + 1]?.action !== step.action) executed = step.action + 1; // actions fully completed
       }

@@ -139,6 +139,9 @@ export function createSurface({ engineOptions, engine, extensions = new Set(), p
   const host = new HostApi({ engine, engineOptions, elicit, extensions, policyText, approvalsFile, log });
   const runner = new SandboxRunner({ host, memoryLimitMb: sandboxMemoryMb, log });
   const methods = host.methods;
+  // The sandbox process and the daemon start now, not inside the first call.
+  runner.warm();
+  host.engine.ensure().catch((err) => log(`engine warm-up failed: ${err.message}`));
 
   const tools = [
     {

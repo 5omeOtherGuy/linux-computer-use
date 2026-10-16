@@ -34,19 +34,76 @@ struct Engine {
     known: HashMap<u32, (u32, String)>,
 }
 
-/// Bound for the first sign that the app reacted to an action.
-const SETTLE_REACT: Duration = Duration::from_millis(100);
+/// Bound for the first sign that the app reacted to an action. A GTK app
+/// that has to build a file chooser shows nothing for 70-100 ms on an idle
+/// machine and longer on a loaded one; an action it actually ignored costs
+/// this once.
+const SETTLE_REACT: Duration = Duration::from_millis(200);
 /// Quiet interval after the last reaction.
 const SETTLE_QUIET: Duration = Duration::from_millis(35);
 const SETTLE_CAP: Duration = Duration::from_millis(600);
 /// Longest wait, from the action, for a dialog to close after its confirm
 /// key or button.
-const DIALOG_CLOSE_WAIT: Duration = Duration::from_millis(1000);
+const DIALOG_CLOSE_WAIT: Duration = Duration::from_millis(1500);
 /// A dialog that shows no activity for this long after settling is staying
-/// open; the close wait ends.
-const DIALOG_IDLE: Duration = Duration::from_millis(175);
-/// ... and a dialog with no activity at all since settling, for this long.
-const DIALOG_STILL: Duration = Duration::from_millis(500);
+/// open; the close wait ends. A dialog that stays open costs this once; one
+/// that closes after a longer pause costs the model a turn.
+const DIALOG_IDLE: Duration = Duration::from_millis(350);
+/// ... and a dialog with no activity at all since settling, for this long
+/// (the GTK file chooser opens a typed file 400-900 ms after Return, with
+/// no activity before it unmaps, the longer on a loaded machine).
+const DIALOG_STILL: Duration = Duration::from_millis(1000);
+/// A dialog whose accessible frame is gone is closing: how long an
+/// observation waits for its X window to unmap before showing the window
+/// behind it.
+const CLOSING_WAIT: Duration = Duration::from_millis(300);
+
+/// Phase timings of requests and observations on stderr, when `CUA_TRACE`
+/// is set in the environment.
+pub(crate) fn trace_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CUA_TRACE").is_some())
+}
+
+/// Time since the daemon started (for ordering trace lines).
+pub(crate) fn since_start() -> Duration {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed()
+}
+
+/// Named phases of one operation, printed as one line by `done`.
+pub(crate) struct Trace {
+    what: String,
+    start: Instant,
+    last: Instant,
+    parts: Vec<String>,
+}
+
+impl Trace {
+    pub(crate) fn new(what: impl Into<String>) -> Self {
+        let now = Instant::now();
+        Trace { what: what.into(), start: now, last: now, parts: Vec::new() }
+    }
+    /// Records the time since the previous mark under `name`.
+    pub(crate) fn mark(&mut self, name: &str) {
+        let now = Instant::now();
+        self.parts.push(format!("{name}={:.1}", (now - self.last).as_secs_f64() * 1000.0));
+        self.last = now;
+    }
+    pub(crate) fn note(&mut self, name: &str, value: impl std::fmt::Display) {
+        self.parts.push(format!("{name}={value}"));
+    }
+    pub(crate) fn done(self) {
+        if trace_on() {
+            eprintln!(
+                "trace {} total={:.1} {}",
+                self.what,
+                self.start.elapsed().as_secs_f64() * 1000.0,
+                self.parts.join(" ")
+            );
+        }
+    }
+}
 
 fn int_param(p: &serde_json::Map<String, Value>, k: &str) -> Option<u32> {
     p.get(k)
@@ -258,27 +315,29 @@ impl Engine {
                     "window_id",
                     "app",
                     "frame_window",
+                    "observe",
                     "element_index",
                     "x",
                     "y",
                     "button",
                     "click_count",
                 ],
-                "drag" => &["window_id", "app", "frame_window", "from", "to"],
+                "drag" => &["window_id", "app", "frame_window", "observe", "from", "to"],
                 "scroll" => &[
                     "window_id",
                     "app",
                     "frame_window",
+                    "observe",
                     "element_index",
                     "x",
                     "y",
                     "direction",
                     "pixels",
                 ],
-                "type_text" | "paste" => &["window_id", "app", "frame_window", "text"],
-                "press_key" => &["window_id", "app", "key"],
-                "set_value" => &["window_id", "app", "element_index", "value"],
-                "perform_secondary_action" => &["window_id", "app", "element_index", "action"],
+                "type_text" | "paste" => &["window_id", "app", "frame_window", "observe", "text"],
+                "press_key" => &["window_id", "app", "observe", "key"],
+                "set_value" => &["window_id", "app", "observe", "element_index", "value"],
+                "perform_secondary_action" => &["window_id", "app", "observe", "element_index", "action"],
                 _ => return Err(ProtocolError(
                     json!({"code":"unknown_method","message":format!("Unknown method {method}")}),
                 )
@@ -308,6 +367,18 @@ impl Engine {
             Some(_) => {
                 return Err(ProtocolError(
                     json!({"code":"invalid_params","message":"app must be a boolean"}),
+                )
+                .into())
+            }
+        };
+        // `observe: false`: an action returns without the post-action tree
+        // (the caller observes once at the end of a sequence).
+        let observe = match p.get("observe") {
+            None => true,
+            Some(Value::Bool(b)) => *b,
+            Some(_) => {
+                return Err(ProtocolError(
+                    json!({"code":"invalid_params","message":"observe must be a boolean"}),
                 )
                 .into())
             }
@@ -354,6 +425,7 @@ impl Engine {
             return Ok(json!({"approved":true}));
         }
 
+        let mut trace = Trace::new(format!("request {method}"));
         // The target window is resolved once per request and passed down;
         // actions re-resolve once after settling. App-scoped requests name
         // any window of the app and act on the app's window that the input
@@ -412,14 +484,23 @@ impl Engine {
         };
         self.authorize(&w).map_err(ProtocolError)?;
         self.desktop.check_user_input()?;
+        trace.mark("resolve");
         if method == "get_screenshot" {
             let mut shot = self.desktop.screenshot(&w)?;
             shot["window_id"] = json!(w.window_id);
+            trace.mark("capture");
+            trace.done();
             return Ok(shot);
         }
         if matches!(method, "get_app_state" | "get_ax_state") {
             self.desktop.track(&w)?;
-            return self.observe(&w, &wins, 0.0).await;
+            let scope = app_scope.then_some(&app);
+            let r = self
+                .observe_following(w.clone(), wins, scope, id, Instant::now(), &mut || false)
+                .await;
+            trace.mark("observe");
+            trace.done();
+            return r;
         }
 
         let mut warnings: Vec<Value> = Vec::new();
@@ -431,9 +512,11 @@ impl Engine {
                 }
             }
         }
+        trace.mark("gate");
         // Baseline for the app's accessibility events, before the action.
         if let Some(ax) = self.ax.as_mut() {
             ax.action_warnings.clear();
+            ax.begin_action();
         }
         let mut ax_activity = self.ax.as_ref().map(|ax| ax.activity_probe(&w));
         self.desktop.prepare_action(&w)?;
@@ -448,19 +531,33 @@ impl Engine {
                     ax::ClickPlan::Pointer { x, y, popup } => {
                         let (ox, oy) = self.desktop.origin(w.window_id)?;
                         let (x, y) = (x - ox, y - oy);
-                        if popup {
-                            Some((x, y, HitArea::Popup))
+                        if let Some(rect) = popup {
+                            Some((x, y, HitArea::Popup(rect)))
                         } else if (0..w.width as i32).contains(&x) && (0..w.height as i32).contains(&y)
                         {
-                            Some((x, y, HitArea::Window))
+                            Some((x, y, HitArea::Body))
                         } else {
                             None
                         }
                     }
-                    ax::ClickPlan::Action => None,
+                    ax::ClickPlan::Action { warning } => {
+                        warnings.extend(warning.map(Value::from));
+                        None
+                    }
                 };
                 match point {
-                    Some((x, y, area)) => self.desktop.click_element_point(&w, x, y, area)?,
+                    Some((x, y, area)) => {
+                        // The pointer click carries the requested button and
+                        // count (right-click opens a context menu, not the
+                        // left-click handler).
+                        let mut click = json!({"x": x, "y": y});
+                        for k in ["button", "click_count"] {
+                            if let Some(v) = p.get(k) {
+                                click[k] = v.clone();
+                            }
+                        }
+                        self.desktop.click_element_point(&w, &click, area)?
+                    }
                     None => {
                         Self::with_input_watch(&mut self.desktop, ax.action(&w, method, &r.params))
                             .await?
@@ -484,7 +581,7 @@ impl Engine {
                     Some((idx, (sx, sy), text)) => {
                         self.desktop.check_typeable(text)?;
                         let (ox, oy) = self.desktop.origin(w.window_id)?;
-                        self.desktop.click_element_point(&w, sx - ox, sy - oy, HitArea::Window)?;
+                        self.desktop.click_element_point(&w, &json!({"x": sx - ox, "y": sy - oy}), HitArea::Body)?;
                         // The click may have hit an overlay or a read-only
                         // input: Ctrl+A and the value would then go to another
                         // field or trigger page shortcuts.
@@ -540,16 +637,18 @@ impl Engine {
                 o.remove("element_index");
                 o.remove("app");
                 o.remove("frame_window");
+                o.remove("observe");
                 params["x"] = json!(x);
                 params["y"] = json!(y);
                 self.desktop.action(&w, method, &params)?;
             }
             _ => {
-                // `app` and `frame_window` were resolved into `w` above.
+                // `app`, `frame_window` and `observe` were resolved above.
                 let mut params = r.params.clone();
                 let o = params.as_object_mut().unwrap();
                 o.remove("app");
                 o.remove("frame_window");
+                o.remove("observe");
                 params["window_id"] = json!(w.window_id);
                 self.desktop.action(&w, method, &params)?;
             }
@@ -557,11 +656,14 @@ impl Engine {
         if let Some(ax) = self.ax.as_mut() {
             warnings.extend(ax.action_warnings.drain(..).map(Value::from));
         }
+        trace.mark("act");
         let start = Instant::now();
         let mut external = || ax_activity.as_mut().is_some_and(|probe| probe());
         let settled = self
             .desktop
             .settle(SETTLE_REACT, SETTLE_QUIET, SETTLE_CAP, &mut external)?;
+        trace.mark("settle");
+        trace.note("reacted", settled.reacted);
         // A dialog confirmed or dismissed (Return, Escape, a button) often
         // closes only after a file check or similar, past the quiet window;
         // wait for that so the next action and the observation see the app's
@@ -592,6 +694,8 @@ impl Engine {
                 self.desktop
                     .settle(SETTLE_REACT, SETTLE_QUIET, SETTLE_CAP, &mut external)?;
             }
+            trace.mark("dialog");
+            trace.note("closed", closed);
         }
         self.desktop.check_user_input()?;
         // One re-check after settling: the window the result describes.
@@ -617,17 +721,32 @@ impl Engine {
                 Err(e) => return Err(e),
             }
         };
+        trace.mark("recheck");
         let mut observation = match after {
-            Some(current) => {
+            Some(current) if !observe => {
+                // The caller observes later (the end of a cell with several
+                // actions): the result names the window the action landed
+                // on and the app's windows after it, without a tree.
                 self.authorize(&current).map_err(ProtocolError)?;
-                self.observe(&current, &wins, start.elapsed().as_secs_f64() * 1000.0)
-                    .await?
+                let others: Vec<Value> = wins
+                    .iter()
+                    .filter(|o| o.window_id != current.window_id)
+                    .map(|o| json!({"window_id":o.window_id,"title":o.title,"transient_for":o.transient_for}))
+                    .collect();
+                json!({"window":current,"observed":false,"warnings":[],"app_windows":others,
+                    "timing":{"settle_ms":start.elapsed().as_secs_f64()*1000.0,"observation_ms":0.0}})
+            }
+            Some(current) => {
+                let scope = app_scope.then_some(&app);
+                let o = self
+                    .observe_following(current, wins, scope, w.window_id, start, &mut external)
+                    .await?;
+                trace.mark("observe");
+                o
             }
             // The action closed the window (and, app-scoped, the app has no
             // other window): it happened; there is nothing left to observe.
-            None => json!({"window":w,"closed":true,"accessibility":"","app_windows":[],
-                "warnings":["the window closed after the action"],
-                "timing":{"settle_ms":start.elapsed().as_secs_f64()*1000.0,"observation_ms":0.0}}),
+            None => closed_result(&w, start),
         };
         if observation["window"]["window_id"] != json!(w.window_id) && !observation["closed"].as_bool().unwrap_or(false) {
             warnings.push(json!(format!(
@@ -647,8 +766,59 @@ impl Engine {
             .as_array_mut()
             .expect("observation warnings")
             .extend(warnings);
+        trace.done();
         Ok(observation)
     }
+}
+
+impl Engine {
+    /// Observes `w` (the app's active window), following a dialog that is
+    /// closing: its accessible frame goes before its X window unmaps, so a
+    /// dialog without a tree is given `CLOSING_WAIT` to unmap, and the
+    /// app's window behind it is observed instead. `scope` is the app of an
+    /// app-scoped request (only then is there a window behind to follow).
+    async fn observe_following(
+        &mut self,
+        w: WindowInfo,
+        wins: Vec<WindowInfo>,
+        scope: Option<&(u32, String)>,
+        preferred: u32,
+        start: Instant,
+        external: &mut dyn FnMut() -> bool,
+    ) -> Result<Value> {
+        self.authorize(&w).map_err(ProtocolError)?;
+        let settle_ms = |start: Instant| start.elapsed().as_secs_f64() * 1000.0;
+        let o = self.observe(&w, &wins, settle_ms(start)).await?;
+        let Some(app) = scope else { return Ok(o) };
+        if w.transient_for.is_none() || o["accessibility"] != "" {
+            return Ok(o);
+        }
+        if !self
+            .desktop
+            .wait_closed(w.window_id, CLOSING_WAIT, DIALOG_IDLE, CLOSING_WAIT, external)?
+        {
+            return Ok(o);
+        }
+        self.desktop
+            .settle(SETTLE_REACT, SETTLE_QUIET, SETTLE_CAP, external)?;
+        let wins = self.desktop.app_windows(app.0, &app.1)?;
+        self.remember(&wins);
+        match self.desktop.active_window(&wins, preferred) {
+            Some(behind) => {
+                self.authorize(&behind).map_err(ProtocolError)?;
+                self.observe(&behind, &wins, settle_ms(start)).await
+            }
+            None => Ok(closed_result(&w, start)),
+        }
+    }
+}
+
+/// Result of an action whose window closed, when the app has no other
+/// window: it happened; there is nothing left to observe.
+fn closed_result(w: &WindowInfo, start: Instant) -> Value {
+    json!({"window":w,"closed":true,"accessibility":"","app_windows":[],
+        "warnings":["the window closed after the action"],
+        "timing":{"settle_ms":start.elapsed().as_secs_f64()*1000.0,"observation_ms":0.0}})
 }
 
 /// Window that app-scoped coordinates act on: `frame`, the window of the

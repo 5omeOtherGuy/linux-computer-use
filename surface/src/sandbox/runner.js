@@ -305,7 +305,9 @@ export class SandboxRunner {
           const frame = this.frames.get(this.windowApp.get(params.window_id));
           if (frame !== undefined) params = { ...params, frame_window: frame };
         }
-        const obs = await this.#call(cell, method, params);
+        // The tree after an action is observed once, when the cell ends
+        // (#finish), not after every action of a sequence.
+        const obs = await this.#call(cell, method, { ...params, observe: false });
         cell.shown.clear();
         this.#observed(obs);
         if (obs && typeof obs === 'object' && obs.window) {
@@ -363,16 +365,17 @@ export class SandboxRunner {
     }
   }
 
-  // The state shown after the cell is observed afresh when the cell ends:
-  // apps often finish reacting (a dialog closing after Save) after the last
-  // action's settle.
+  // The state shown after the cell is the tree observed when the cell ends:
+  // actions return without one (observe: false), and apps often finish
+  // reacting (a dialog closing after Save) after the last action's settle.
   async #finish(cell, msg) {
     if (cell.pending && cell.pendingTarget && !isScreenshot(cell.pending.screenshot) && !msg.reason && Date.now() < cell.deadline) {
       try {
         const obs = await this.host.call('get_ax_state', cell.pendingTarget, { signal: cell.controller.signal, deadline: Math.min(cell.deadline, Date.now() + 3000) });
         if (obs?.window) cell.pending = obs;
-      } catch {
-        // keep the action's own observation
+      } catch (err) {
+        // The action's own result stands: the window it landed on, without a tree.
+        if (cell.pending.observed === false) cell.pending = { ...cell.pending, accessibility: `(the state after the last action could not be observed: ${toCuaError(err).message})` };
       }
     }
     this.#complete(cell, msg);
@@ -419,6 +422,12 @@ export class SandboxRunner {
       cancelledCalls: cell.cancelledCalls,
       observation,
     });
+  }
+
+  // Starts the sandbox process ahead of the first cell: forking Node and
+  // initialising QuickJS costs about 250 ms, paid at server start instead.
+  warm() {
+    if (!this.child) this.#spawn().catch((err) => this.log(`sandbox warm-up failed: ${err.message}`));
   }
 
   async eval({ code, timeoutMs, signal }) {

@@ -105,14 +105,15 @@ describe('Anthropic computer_toolset_20260801', () => {
     const g = t.geometry;
     const [cx, cy] = g.toWindow([100, 50]);
     assert.ok(cx > 100 && cy > 50, 'scaled up to window space');
+    // Actions skip the post-action tree: the batch ends with a screenshot.
     assert.deepEqual(host.actions().map((c) => [c.method, c.params]), [
-      ['click', { window_id: 7, x: cx, y: cy }],
-      ['type_text', { window_id: 7, text: 'hello' }],
-      ['press_key', { window_id: 7, key: 'ctrl+s' }],
-      ['press_key', { window_id: 7, key: 'ctrl+s' }],
-      ['press_key', { window_id: 7, key: 'ctrl+s' }],
-      ['scroll', { window_id: 7, x: cx, y: cy, direction: 'down', pixels: 200 }],
-      ['drag', { window_id: 7, from: g.toWindow([0, 0]), to: g.toWindow([10, 10]) }],
+      ['click', { window_id: 7, x: cx, y: cy, observe: false }],
+      ['type_text', { window_id: 7, text: 'hello', observe: false }],
+      ['press_key', { window_id: 7, key: 'ctrl+s', observe: false }],
+      ['press_key', { window_id: 7, key: 'ctrl+s', observe: false }],
+      ['press_key', { window_id: 7, key: 'ctrl+s', observe: false }],
+      ['scroll', { window_id: 7, x: cx, y: cy, direction: 'down', pixels: 200, observe: false }],
+      ['drag', { window_id: 7, from: g.toWindow([0, 0]), to: g.toWindow([10, 10]), observe: false }],
     ]);
     assert.deepEqual(res[6].content, [{ type: 'text', text: `[${g.toScreenshot(g.toWindow([10, 10])).join(', ')}]` }]);
     assert.equal(res[1].content[0].text, 'OK');
@@ -188,9 +189,9 @@ describe('Anthropic computer_toolset_20260801', () => {
     ]);
     assert.ok(res.every((r) => !r.is_error), JSON.stringify(res));
     assert.deepEqual(host.actions().map((c) => c.params), [
-      { window_id: 7, x: 5, y: 5, button: 'right' },
-      { window_id: 7, x: 5, y: 5, click_count: 3, modifiers: ['ctrl', 'shift'] },
-      { window_id: 7, x: 5, y: 5, click_count: 2 },
+      { window_id: 7, x: 5, y: 5, button: 'right', observe: false },
+      { window_id: 7, x: 5, y: 5, click_count: 3, modifiers: ['ctrl', 'shift'], observe: false },
+      { window_id: 7, x: 5, y: 5, click_count: 2, observe: false },
     ]);
   });
 
@@ -236,13 +237,13 @@ describe('OpenAI computer tool', () => {
     assert.equal(r.executed, 8);
     assert.deepEqual(slept, [1000]);
     assert.deepEqual(host.actions().map((c) => [c.method, c.params]), [
-      ['click', { window_id: 7, x: 811, y: 315 }],
-      ['type_text', { window_id: 7, text: 'penguin' }],
-      ['press_key', { window_id: 7, key: 'ctrl+a' }],
-      ['press_key', { window_id: 7, key: 'Return' }],
-      ['scroll', { window_id: 7, x: 21, y: 41, direction: 'down', pixels: 240 }],
-      ['scroll', { window_id: 7, x: 21, y: 41, direction: 'left', pixels: 60 }],
-      ['drag', { window_id: 7, from: [3, 5], to: [61, 81] }],
+      ['click', { window_id: 7, x: 811, y: 315, observe: false }],
+      ['type_text', { window_id: 7, text: 'penguin', observe: false }],
+      ['press_key', { window_id: 7, key: 'ctrl+a', observe: false }],
+      ['press_key', { window_id: 7, key: 'Return', observe: false }],
+      ['scroll', { window_id: 7, x: 21, y: 41, direction: 'down', pixels: 240, observe: false }],
+      ['scroll', { window_id: 7, x: 21, y: 41, direction: 'left', pixels: 60, observe: false }],
+      ['drag', { window_id: 7, from: [3, 5], to: [61, 81], observe: false }],
     ]);
     assert.equal(r.output.type, 'computer_call_output');
     assert.equal(r.output.call_id, 'call_1');
@@ -311,6 +312,6 @@ describe('OpenAI computer tool', () => {
     const t = new OpenAIComputerTool({ host, windowId: 7 });
     const r = await t.handleCall({ type: 'computer_call', call_id: 'c', action: { type: 'type', text: 'hi' }, pending_safety_checks: [] });
     assert.equal(r.executed, 1);
-    assert.deepEqual(host.actions()[0].params, { window_id: 7, text: 'hi' });
+    assert.deepEqual(host.actions()[0].params, { window_id: 7, text: 'hi', observe: false });
   });
 });
