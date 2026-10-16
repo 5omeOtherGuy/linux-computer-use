@@ -398,6 +398,21 @@ impl Engine {
                 };
                 match outcome {
                     ax::TextInput::Inserted(w) => warnings.extend(w.into_iter().map(Value::from)),
+                    // Typed keys in an alert do nothing useful, and a
+                    // newline (or the caller's next Return) confirms its
+                    // default button: an unexpected "Save changes?" must not
+                    // be answered by text meant for another window.
+                    ax::TextInput::NoTarget(_)
+                        if self.ax.as_ref().is_some_and(|ax| ax.window_is_alert(&w)) =>
+                    {
+                        return Err(x11_error(
+                            "input_refused",
+                            format!(
+                                "window {} {:?} is an alert with no text field; the text was not typed. Read it (getAXState) and choose a button",
+                                w.window_id, w.title
+                            ),
+                        ));
+                    }
                     ax::TextInput::NoTarget(reason) => {
                         self.desktop.type_keys(&w, text)?;
                         warnings.push(json!(format!(

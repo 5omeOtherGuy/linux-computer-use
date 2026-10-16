@@ -1295,6 +1295,19 @@ impl Accessibility {
         self.obs.window_of(idx)
     }
 
+    /// Whether the window was last observed as an alert (a message or
+    /// confirmation dialog without text fields).
+    pub fn window_is_alert(&self, w: &WindowInfo) -> bool {
+        self.obs.windows.get(&w.window_id).is_some_and(|ws| {
+            ws.pid == w.pid
+                && ws
+                    .frame
+                    .as_ref()
+                    .and_then(|f| ws.ids.get(f))
+                    .is_some_and(|&(_, role)| role == R_ALERT)
+        })
+    }
+
     /// Whether element `idx` was last observed as a push button.
     pub fn element_is_button(&self, idx: u32) -> bool {
         self.obs
@@ -1544,6 +1557,16 @@ impl Accessibility {
                 } else if dw <= 100 && dh <= 100 {
                     score += 1;
                     why.push("approx-size");
+                }
+                // The frame is the window plus at most window-manager
+                // decorations around it (a title bar, borders): strong
+                // evidence for untitled dialogs such as GTK alerts.
+                let (ox, oy) = w.origin;
+                let (l, t) = (ox - rc.x, oy - rc.y);
+                let (r, b) = (rc.x + rc.w - (ox + ww), rc.y + rc.h - (oy + wh));
+                if [l, t, r, b].iter().all(|&d| (0..=40).contains(&d)) {
+                    score += 2;
+                    why.push("position");
                 }
             }
             if is_toplevel_role(node.role) {
