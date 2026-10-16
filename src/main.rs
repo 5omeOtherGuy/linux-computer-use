@@ -45,6 +45,11 @@ const SETTLE_CAP: Duration = Duration::from_millis(600);
 /// Longest wait, from the action, for a dialog to close after its confirm
 /// key or button.
 const DIALOG_CLOSE_WAIT: Duration = Duration::from_millis(1000);
+/// A dialog that shows no activity for this long after settling is staying
+/// open; the close wait ends.
+const DIALOG_IDLE: Duration = Duration::from_millis(175);
+/// ... and a dialog with no activity at all since settling, for this long.
+const DIALOG_STILL: Duration = Duration::from_millis(500);
 
 fn int_param(p: &serde_json::Map<String, Value>, k: &str) -> Option<u32> {
     p.get(k)
@@ -510,7 +515,14 @@ impl Engine {
         };
         if w.transient_for.is_some() && confirms {
             let left = DIALOG_CLOSE_WAIT.saturating_sub(start.elapsed());
-            if self.desktop.wait_closed(w.window_id, left)? {
+            let closed = self.desktop.wait_closed(
+                w.window_id,
+                left,
+                DIALOG_IDLE,
+                DIALOG_STILL,
+                &mut external,
+            )?;
+            if closed {
                 self.desktop
                     .settle(SETTLE_REACT, SETTLE_QUIET, SETTLE_CAP, &mut external)?;
             }

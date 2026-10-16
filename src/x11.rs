@@ -386,6 +386,19 @@ fn keysyms_for(km: &Keymap, text: &str) -> Result<Vec<u32>> {
     Ok(syms)
 }
 
+/// Whether waiting for a dialog to close is over (see `wait_closed`):
+/// `since_activity` is meaningful only when `active`.
+fn close_wait_over(
+    active: bool,
+    since_activity: Duration,
+    waited: Duration,
+    idle: Duration,
+    still: Duration,
+    max: Duration,
+) -> bool {
+    waited >= max || if active { since_activity >= idle } else { waited >= still }
+}
+
 /// Pre-Unicode keysyms that keyboard maps still use for some characters.
 fn legacy_keysym(c: char) -> Option<u32> {
     match c {
@@ -1655,21 +1668,27 @@ impl Desktop {
             Event::CreateNotify(e)
                 if e.parent == self.root
                     && !e.override_redirect
-                    && self
-                        .tracked
-                        .keys()
-                        .any(|&w| self.client_base(w) == self.client_base(e.window)) =>
+                    && self.settle_target.is_some_and(|t| self.client_base(t) == self.client_base(e.window)) =>
             {
-                // A client we observe is building a new top-level (a dialog):
-                // settling waits for it to map. Its own MapNotify is selected
-                // because a reparenting window manager reports the map to the
-                // frame, not to the root.
+                // The app being acted on is building a new top-level (a
+                // dialog): settling waits for it to map. Its own MapNotify is
+                // selected because a reparenting window manager reports the
+                // map to the frame, not to the root; a map that happened
+                // before the selection is caught by the attribute check.
                 let _ = self.conn.change_window_attributes(
                     e.window,
                     &xproto::ChangeWindowAttributesAux::new()
                         .event_mask(EventMask::STRUCTURE_NOTIFY),
                 );
-                self.creating.insert(e.window, Instant::now());
+                let viewable = self
+                    .conn
+                    .get_window_attributes(e.window)
+                    .ok()
+                    .and_then(|c| c.reply().ok())
+                    .map(|a| a.map_state != xproto::MapState::UNMAPPED);
+                if viewable == Some(false) {
+                    self.creating.insert(e.window, Instant::now());
+                }
                 self.note_activity();
             }
             Event::MapNotify(e) if self.creating.remove(&e.window).is_some() => {
@@ -1781,6 +1800,8 @@ impl Desktop {
         self.track_window(w.window_id, w.pid)?;
         self.settle_target = Some(w.window_id);
         self.activity = false;
+        // Windows another action left half-created do not hold this one.
+        self.creating.clear();
         self.conn.flush()?;
         Ok(())
     }
@@ -1790,7 +1811,9 @@ impl Desktop {
     /// window of the same client (un)mapping, or `external()` reporting an
     /// accessibility event of the app. Activity seen while the action ran
     /// counts. Phase 2 waits until that activity has been quiet for `quiet`.
-    /// Everything is bounded by `cap`; a latched user-input abort ends early.
+    /// Everything is bounded by `cap`, except that a top-level the target app
+    /// is creating extends the wait until it maps, up to `MAP_WAIT`; a
+    /// latched user-input abort ends early.
     pub fn settle(
         &mut self,
         react: Duration,
@@ -1850,10 +1873,31 @@ impl Desktop {
 
     /// Waits up to `max` for `window` to stop being viewable (a dialog
     /// closing after its confirm key or button). True if it closed.
-    pub fn wait_closed(&mut self, window: Window, max: Duration) -> Result<bool> {
+    /// Waits up to `max` for `window` to stop being viewable (a dialog
+    /// closing after its confirm key or button). True if it closed.
+    ///
+    /// The wait ends early when the dialog is evidently staying open: after
+    /// activity during the wait (a folder listing loading, Find matching),
+    /// `idle` without further activity; with no activity since the settle,
+    /// `still` (longer: the GTK file chooser closes about 400 ms after
+    /// Return with no activity at all before it unmaps).
+    pub fn wait_closed(
+        &mut self,
+        window: Window,
+        max: Duration,
+        idle: Duration,
+        still: Duration,
+        external: &mut dyn FnMut() -> bool,
+    ) -> Result<bool> {
+        let mut active = false;
         let start = Instant::now();
         loop {
             self.pump()?;
+            let before = self.last_activity;
+            if external() {
+                self.note_activity();
+            }
+            active |= self.last_activity != before;
             if self.abort.is_some() {
                 return Ok(false);
             }
@@ -1864,10 +1908,11 @@ impl Desktop {
             if !open {
                 return Ok(true);
             }
-            if start.elapsed() >= max {
+            let now = Instant::now();
+            if close_wait_over(active, now - self.last_activity, now - start, idle, still, max) {
                 return Ok(false);
             }
-            self.wait_readable(Duration::from_millis(20).min(max - start.elapsed()))?;
+            self.wait_readable(Duration::from_millis(20).min(max.saturating_sub(now - start)))?;
         }
     }
 
@@ -2472,6 +2517,23 @@ mod tests {
         }
         let e = Desktop::connect(":0").err().unwrap();
         assert_eq!(e.downcast_ref::<X11Error>().unwrap().code, "display_denied");
+    }
+
+    /// Regression: the close wait ran to its 1 s cap for every confirm key
+    /// in a dialog that stays open. Measured on the GTK file chooser: a
+    /// dialog that closes shows no activity for ~400 ms before unmapping; one
+    /// that stays open (navigating into a folder) shows a burst, then quiet.
+    #[test]
+    fn dialog_close_wait_ends_for_dialogs_that_stay_open() {
+        let ms = Duration::from_millis;
+        let (idle, still, max) = (ms(175), ms(500), ms(900));
+        // Stays open: activity until 390 ms, quiet since -> over at ~565 ms.
+        assert!(close_wait_over(true, ms(180), ms(570), idle, still, max));
+        assert!(!close_wait_over(true, ms(100), ms(490), idle, still, max));
+        // Closing without any activity first: keep waiting past 420 ms.
+        assert!(!close_wait_over(false, ms(0), ms(420), idle, still, max));
+        assert!(close_wait_over(false, ms(0), ms(500), idle, still, max));
+        assert!(close_wait_over(true, ms(0), ms(900), idle, still, max));
     }
 
     #[test]
