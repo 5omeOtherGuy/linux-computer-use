@@ -2,11 +2,14 @@
 //! capture, XI2 raw-input abort latch and XDamage-based settling.
 //!
 //! Clean-room implementation on top of x11rb. Design rules:
-//! * Never connect to display 0.
+//! * Never connect to display 0, except in the explicit live-desktop mode
+//!   (`LiveScope`), which only ever lists allow-listed apps.
 //! * Never use XTEST, never warp the pointer, never change input focus, never
 //!   grab. Input is delivered with `SendEvent` to the creating client of the
 //!   target window and positioned with a per-window virtual cursor.
 //! * Only windows that `list_windows` reports are valid targets.
+//! * Process identity comes from the X server (X-Resource `LocalClientPID`),
+//!   never from the client-writable `_NET_WM_PID` property.
 //! * Physical input (anything the server reports as an XI2 raw event, which
 //!   synthetic `SendEvent` input never produces) latches an abort until
 //!   `clear_input_abort`.
@@ -14,7 +17,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -24,6 +26,7 @@ use serde_json::{json, Value};
 use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::composite::{self, ConnectionExt as _};
 use x11rb::protocol::damage::{self, ConnectionExt as _};
+use x11rb::protocol::res::{self, ConnectionExt as _};
 use x11rb::protocol::shm::{self, ConnectionExt as _};
 use x11rb::protocol::xfixes::{self, ConnectionExt as _};
 use x11rb::protocol::xinput::{self, ConnectionExt as _};
@@ -34,23 +37,21 @@ use x11rb::protocol::xproto::{
 use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
-use x11rb::{CURRENT_TIME, NONE};
+use x11rb::NONE;
 
 x11rb::atom_manager! {
     Atoms: AtomsCookie {
         _NET_CLIENT_LIST,
         _NET_WM_NAME,
-        _NET_WM_PID,
         UTF8_STRING,
         WM_STATE,
-        CLIPBOARD,
-        TARGETS,
-        TEXT,
         _LINUX_CUA_TIME,
     }
 }
 
-/// Window description shared with the daemon and policy layer.
+/// Window description shared with the daemon and policy layer. `pid` is the
+/// X-Resource-verified PID of the client that created the window, or 0 when
+/// the server cannot report it (remote client, missing extension support).
 #[derive(Serialize, Clone, Debug)]
 pub struct WindowInfo {
     pub window_id: u32,
@@ -59,6 +60,32 @@ pub struct WindowInfo {
     pub pid: u32,
     pub width: u16,
     pub height: u16,
+}
+
+/// Explicit live-desktop opt-in (daemon command line only). The display is
+/// not checked against :0, but only windows of allow-listed apps, optionally
+/// restricted to the given server-verified PIDs, are ever listed.
+#[derive(Clone, Debug, Default)]
+pub struct LiveScope {
+    pub apps: HashSet<String>,
+    pub pids: HashSet<u32>,
+}
+
+impl LiveScope {
+    fn admits(&self, w: &WindowInfo) -> bool {
+        w.pid != 0
+            && self.apps.contains(&w.app_id.to_lowercase())
+            && (self.pids.is_empty() || self.pids.contains(&w.pid))
+    }
+}
+
+/// Outcome of the two-phase settle after an action.
+#[derive(Clone, Copy, Debug)]
+pub struct Settled {
+    /// Damage, a popup map or an accessibility event arrived after the action.
+    pub reacted: bool,
+    /// The UI then stayed quiet for the quiet interval before the cap.
+    pub quiet: bool,
 }
 
 /// Typed error carried inside `anyhow::Error`; the daemon can
@@ -91,10 +118,13 @@ fn invalid(message: impl Into<String>) -> anyhow::Error {
 const XI_ALL_MASTER_DEVICES: u16 = 1;
 const SCROLL_PIXELS_PER_NOTCH: u32 = 50;
 const MAX_SCROLL_NOTCHES: u32 = 100;
-const MAX_TEXT_CHARS: usize = 20_000;
 const DRAG_STEPS: i32 = 12;
-const PASTE_CONSUME_TIMEOUT: Duration = Duration::from_millis(2000);
-const CLIPBOARD_LIFETIME: Duration = Duration::from_secs(10);
+/// Bound on waiting for a client repaint after a fresh Composite redirect or
+/// a resize, before the first read of its backing pixmap.
+const REPAINT_WAIT: Duration = Duration::from_millis(300);
+const REPAINT_QUIET: Duration = Duration::from_millis(15);
+/// Granularity for noticing accessibility events while waiting on X.
+const POLL_SLICE: Duration = Duration::from_millis(4);
 
 // Core modifier / button masks (X11 protocol constants).
 const SHIFT: u16 = 0x0001;
@@ -293,14 +323,6 @@ fn char_keysym(c: char) -> Option<u32> {
         _ if (0x20..=0x7e).contains(&cp) || (0xa0..=0xff).contains(&cp) => Some(cp),
         _ if c.is_control() => None,
         _ => Some(0x0100_0000 | cp),
-    }
-}
-
-/// Legacy (non-Unicode-range) keysyms some keymaps use for common characters.
-fn legacy_keysym(c: char) -> Option<u32> {
-    match c {
-        '€' => Some(0x20ac),
-        _ => None,
     }
 }
 
@@ -523,9 +545,6 @@ struct ShmBuf {
     len: usize,
 }
 
-// The mapping is only accessed while holding the Desktop's state mutex.
-unsafe impl Send for ShmBuf {}
-
 impl Drop for ShmBuf {
     fn drop(&mut self) {
         unsafe {
@@ -581,18 +600,18 @@ impl ShmBuf {
 // Desktop
 // ---------------------------------------------------------------------------
 
-#[derive(Default)]
-struct Shared {
-    shm: Option<ShmBuf>,
-    shm_disabled: bool,
-    redirected: HashSet<Window>,
-    damage: HashMap<Window, damage::Damage>,
-}
-
-struct Clipboard {
-    text: String,
-    expires: Instant,
-    served: u32,
+/// Composite/Damage state of a window (or popup) whose pixels this session
+/// reads. Keyed by XID but bound to the owning PID: a reused XID of another
+/// process starts fresh.
+struct Tracked {
+    pid: u32,
+    damage: damage::Damage,
+    /// Set while the backing pixmap may not hold the client's own pixels yet
+    /// (fresh redirect or resize): damage with at least this event sequence
+    /// number is the client's repaint.
+    repaint_after: Option<u64>,
+    last_damage: Instant,
+    size: (u16, u16),
 }
 
 /// Resolved pointer target inside a window hierarchy.
@@ -628,6 +647,29 @@ fn clamp16(v: i32) -> i16 {
     v.clamp(i16::MIN as i32, i16::MAX as i32) as i16
 }
 
+/// Copies `src` (`sw`x`sh` RGB) into `dst` (`dw`x`dh` RGB) at offset `(ox, oy)`,
+/// clipped to `dst`.
+fn blit(
+    dst: &mut [u8],
+    (dw, dh): (u16, u16),
+    src: &[u8],
+    (sw, sh): (u16, u16),
+    (ox, oy): (i32, i32),
+) {
+    let (dw, dh, sw, sh) = (dw as i32, dh as i32, sw as i32, sh as i32);
+    let x0 = ox.max(0);
+    let x1 = (ox + sw).min(dw);
+    if x1 <= x0 {
+        return;
+    }
+    for y in oy.max(0)..(oy + sh).min(dh) {
+        let s = (((y - oy) * sw + (x0 - ox)) * 3) as usize;
+        let d = ((y * dw + x0) * 3) as usize;
+        let n = ((x1 - x0) * 3) as usize;
+        dst[d..d + n].copy_from_slice(&src[s..s + n]);
+    }
+}
+
 pub struct Desktop {
     conn: RustConnection,
     root: Window,
@@ -635,14 +677,19 @@ pub struct Desktop {
     helper: Window,
     keymap: Keymap,
     shm_available: bool,
-    state: Mutex<Shared>,
+    shm: Option<ShmBuf>,
+    shm_disabled: bool,
+    tracked: HashMap<Window, Tracked>,
+    /// Mapped override-redirect top-level windows -> (owner client base, PID).
+    popups: HashMap<Window, (u32, u32)>,
     abort: Option<String>,
+    /// Relevant UI activity since `prepare_action`, and when it last happened.
+    activity: bool,
+    last_activity: Instant,
     cursors: HashMap<Window, (i32, i32)>,
     hover: HashMap<Window, Window>,
     settle_target: Option<Window>,
-    popups: HashSet<Window>,
-    clipboard: Option<Clipboard>,
-    authorized_windows: Option<(HashSet<Window>, u32)>,
+    live: Option<LiveScope>,
 }
 
 impl Desktop {
@@ -651,23 +698,20 @@ impl Desktop {
         Self::connect_inner(display, None)
     }
 
-    /// Explicit trusted-host consent for specific windows of one process.
-    /// Unlike normal connection, this may target display 0, but cannot discover
-    /// or control any other windows. X11 client metadata is not tamper-proof.
-    pub fn connect_authorized(display: &str, windows: Vec<u32>, pid: u32) -> Result<Self> {
+    /// Explicit live-desktop opt-in (daemon command line only). May target
+    /// display 0, but lists only windows of the allow-listed apps whose
+    /// server-verified PID is known (and in `scope.pids` when given).
+    pub fn connect_live(display: &str, scope: LiveScope) -> Result<Self> {
         display_number(display)?;
-        if windows.is_empty() || windows.contains(&0) || pid == 0 {
+        if scope.apps.is_empty() {
             return Err(invalid(
-                "explicit window IDs and a nonzero process ID are required",
+                "live desktop mode requires at least one --allow-app",
             ));
         }
-        Self::connect_inner(display, Some((windows.into_iter().collect(), pid)))
+        Self::connect_inner(display, Some(scope))
     }
 
-    fn connect_inner(
-        display: &str,
-        authorized_windows: Option<(HashSet<Window>, u32)>,
-    ) -> Result<Self> {
+    fn connect_inner(display: &str, live: Option<LiveScope>) -> Result<Self> {
         let (conn, screen_num) = x11rb::connect(Some(display))
             .with_context(|| format!("connecting to X display {display}"))?;
         let root = conn
@@ -682,6 +726,7 @@ impl Desktop {
             (damage::X11_EXTENSION_NAME, "DAMAGE"),
             (xfixes::X11_EXTENSION_NAME, "XFIXES"),
             (xinput::X11_EXTENSION_NAME, "XInputExtension"),
+            (res::X11_EXTENSION_NAME, "X-Resource"),
         ] {
             if conn.extension_information(name)?.is_none() {
                 return Err(xerr(
@@ -695,6 +740,13 @@ impl Desktop {
             return Err(xerr(
                 "unsupported_extension",
                 "Composite >= 0.2 required for NameWindowPixmap",
+            ));
+        }
+        let rv = conn.res_query_version(1, 2)?.reply()?;
+        if (rv.server_major, rv.server_minor) < (1, 2) {
+            return Err(xerr(
+                "unsupported_extension",
+                "X-Resource >= 1.2 required for server-verified client PIDs",
             ));
         }
         conn.xfixes_query_version(5, 0)?.reply()?;
@@ -743,7 +795,7 @@ impl Desktop {
         .check()
         .context("selecting root substructure events")?;
 
-        // Invisible helper: timestamps and clipboard ownership. Never mapped.
+        // Invisible helper for server timestamps. Never mapped.
         let helper = conn.generate_id()?;
         conn.create_window(
             0,
@@ -766,26 +818,97 @@ impl Desktop {
         let keymap = Keymap::load(&conn)?;
         conn.flush()?;
 
-        Ok(Desktop {
+        let mut desktop = Desktop {
             conn,
             root,
             atoms,
             helper,
             keymap,
             shm_available,
-            state: Mutex::new(Shared::default()),
+            shm: None,
+            shm_disabled: false,
+            tracked: HashMap::new(),
+            popups: HashMap::new(),
             abort: None,
+            activity: false,
+            last_activity: Instant::now(),
             cursors: HashMap::new(),
             hover: HashMap::new(),
             settle_target: None,
-            popups: HashSet::new(),
-            clipboard: None,
-            authorized_windows,
-        })
+            live,
+        };
+        desktop.scan_popups()?;
+        Ok(desktop)
     }
 
-    fn shared(&self) -> MutexGuard<'_, Shared> {
-        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    // ----- client identity -------------------------------------------------
+
+    /// The X server's ownership rule: the client that created a resource is
+    /// encoded in the XID bits outside the resource-id mask (this is the
+    /// value X-Resource reports as ClientXID).
+    fn client_base(&self, xid: u32) -> u32 {
+        xid & !self.conn.setup().resource_id_mask
+    }
+
+    /// X-Resource identity of the clients that own `wins`: `(client base,
+    /// PID)`, with PID 0 when the server cannot report it. `None` when the
+    /// owning client is gone.
+    fn owners(&self, wins: &[Window]) -> Result<Vec<Option<(u32, u32)>>> {
+        if wins.is_empty() {
+            return Ok(Vec::new());
+        }
+        let specs: Vec<res::ClientIdSpec> = wins
+            .iter()
+            .map(|&w| res::ClientIdSpec {
+                client: w,
+                mask: res::ClientIdMask::CLIENT_XID | res::ClientIdMask::LOCAL_CLIENT_PID,
+            })
+            .collect();
+        let reply = self.conn.res_query_client_ids(&specs)?.reply()?;
+        let mut present = HashSet::new();
+        let mut pids = HashMap::new();
+        for id in reply.ids {
+            let mask = u32::from(id.spec.mask);
+            if mask == u32::from(res::ClientIdMask::CLIENT_XID) {
+                present.insert(id.spec.client);
+            } else if mask == u32::from(res::ClientIdMask::LOCAL_CLIENT_PID) {
+                if let Some(&pid) = id.value.first() {
+                    pids.insert(id.spec.client, pid);
+                }
+            }
+        }
+        Ok(wins
+            .iter()
+            .map(|&w| {
+                let base = self.client_base(w);
+                present
+                    .contains(&base)
+                    .then(|| (base, pids.get(&base).copied().unwrap_or(0)))
+            })
+            .collect())
+    }
+
+    /// Records override-redirect windows that were mapped before we connected.
+    fn scan_popups(&mut self) -> Result<()> {
+        let tree = self.conn.query_tree(self.root)?.reply()?;
+        let cookies: Vec<_> = tree
+            .children
+            .iter()
+            .map(|&w| (w, self.conn.get_window_attributes(w)))
+            .collect();
+        let mut found = Vec::new();
+        for (w, c) in cookies {
+            let Ok(a) = c?.reply() else { continue };
+            if w != self.helper && a.override_redirect && a.map_state == MapState::VIEWABLE {
+                found.push(w);
+            }
+        }
+        for (w, owner) in found.iter().zip(self.owners(&found)?) {
+            if let Some(o) = owner {
+                self.popups.insert(*w, o);
+            }
+        }
+        Ok(())
     }
 
     // ----- window enumeration ---------------------------------------------
@@ -816,13 +939,6 @@ impl Desktop {
     /// Candidate client windows: `_NET_CLIENT_LIST` when an EWMH window
     /// manager publishes it, otherwise a walk of root's mapped children.
     fn candidates(&self) -> Result<Vec<Window>> {
-        if let Some((windows, _)) = &self.authorized_windows {
-            return Ok(windows
-                .iter()
-                .copied()
-                .filter(|w| *w != self.root && *w != self.helper)
-                .collect());
-        }
         let r = self
             .conn
             .get_property(
@@ -879,20 +995,18 @@ impl Desktop {
                     .get_property(false, w, a._NET_WM_NAME, a.UTF8_STRING, 0, 4096)?,
                 self.conn
                     .get_property(false, w, AtomEnum::WM_NAME, AtomEnum::ANY, 0, 4096)?,
-                self.conn
-                    .get_property(false, w, a._NET_WM_PID, AtomEnum::CARDINAL, 0, 1)?,
             ));
         }
+        let owners = self.owners(wins)?;
         let mut out = Vec::new();
-        for (w, attrs, geom, class, net_name, name, pid) in pending {
+        for ((w, attrs, geom, class, net_name, name), owner) in pending.into_iter().zip(owners) {
             let (Ok(attrs), Ok(geom)) = (attrs.reply(), geom.reply()) else {
-                let _ = (class.reply(), net_name.reply(), name.reply(), pid.reply());
+                let _ = (class.reply(), net_name.reply(), name.reply());
                 continue;
             };
             let class = class.reply().ok();
             let net_name = net_name.reply().ok();
             let name = name.reply().ok();
-            let pid = pid.reply().ok();
             if attrs.map_state != MapState::VIEWABLE
                 || attrs.class != WindowClass::INPUT_OUTPUT
                 || geom.width == 0
@@ -926,47 +1040,36 @@ impl Desktop {
                     })
                     .unwrap_or_default(),
             };
-            let pid = pid
-                .and_then(|r| r.value32().and_then(|mut v| v.next()))
-                .unwrap_or(0);
-            if self
-                .authorized_windows
-                .as_ref()
-                .is_some_and(|(_, expected)| pid != *expected)
-            {
-                continue;
-            }
-            out.push(WindowInfo {
+            let info = WindowInfo {
                 window_id: w,
                 title,
                 app_id,
-                pid,
+                pid: owner.map(|o| o.1).unwrap_or(0),
                 width: geom.width,
                 height: geom.height,
-            });
+            };
+            if self.live.as_ref().is_some_and(|l| !l.admits(&info)) {
+                continue;
+            }
+            out.push(info);
         }
         Ok(out)
     }
 
-    pub fn list_windows(&self) -> Result<Vec<WindowInfo>> {
+    pub fn list_windows(&mut self) -> Result<Vec<WindowInfo>> {
         let wins = self.candidates()?;
         let infos = self.describe(&wins)?;
-        // Drop damage objects for windows that are gone or no longer listed.
-        let live: HashSet<Window> = infos.iter().map(|i| i.window_id).collect();
-        let mut st = self.shared();
-        let stale: Vec<Window> = st
-            .damage
-            .keys()
-            .copied()
-            .filter(|w| !live.contains(w) && !self.popups.contains(w) && *w != self.root)
+        // Stop tracking windows that are gone or no longer listed.
+        let live: HashMap<Window, u32> = infos.iter().map(|i| (i.window_id, i.pid)).collect();
+        let stale: Vec<Window> = self
+            .tracked
+            .iter()
+            .filter(|(w, t)| !self.popups.contains_key(w) && live.get(w) != Some(&t.pid))
+            .map(|(w, _)| *w)
             .collect();
         for w in stale {
-            if let Some(d) = st.damage.remove(&w) {
-                let _ = self.conn.damage_destroy(d);
-            }
-            st.redirected.remove(&w);
+            self.untrack(w);
         }
-        drop(st);
         let _ = self.conn.flush();
         Ok(infos)
     }
@@ -985,37 +1088,128 @@ impl Desktop {
             .ok_or_else(|| xerr("window_not_found", format!("window {id} is not viewable")))
     }
 
+    // ----- composite tracking ----------------------------------------------
+
+    /// Eagerly redirects and damage-tracks an authorized window, so its
+    /// backing pixmap holds the client's own pixels by the time it is read.
+    pub fn track(&mut self, w: &WindowInfo) -> Result<()> {
+        self.track_window(w.window_id, w.pid)?;
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    fn track_window(&mut self, win: Window, pid: u32) -> Result<()> {
+        match self.tracked.get(&win) {
+            Some(t) if t.pid == pid => return Ok(()),
+            Some(_) => self.untrack(win),
+            None => {}
+        }
+        // Damage first, so the repaint triggered below is observed.
+        let damage = self.conn.generate_id()?;
+        self.conn
+            .damage_create(damage, win, damage::ReportLevel::NON_EMPTY)?;
+        // Resizes invalidate the backing pixmap; destruction ends tracking.
+        self.conn.change_window_attributes(
+            win,
+            &xproto::ChangeWindowAttributesAux::new().event_mask(EventMask::STRUCTURE_NOTIFY),
+        )?;
+        // BadAccess means a compositor holds a manual redirection; the window
+        // then already has a backing pixmap. Errors arrive asynchronously.
+        self.conn
+            .composite_redirect_window(win, composite::Redirect::AUTOMATIC)?;
+        // A fresh backing pixmap is initialised from the parent, including
+        // pixels of overlapping windows. Exposures make the client repaint
+        // all of it (the redirected window counts as fully visible).
+        self.conn.clear_area(true, win, 0, 0, 0, 0)?;
+        // Empty the damage region now: with NON_EMPTY reporting, damage that
+        // stays pending until the next pump would swallow the repaint's notify.
+        self.conn.damage_subtract(damage, NONE, NONE)?;
+        let geom = self.conn.get_geometry(win)?.reply()?;
+        // Damage at or after this sequence number is the client's repaint.
+        let fence = self.conn.get_input_focus()?.sequence_number();
+        self.tracked.insert(
+            win,
+            Tracked {
+                pid,
+                damage,
+                repaint_after: Some(fence),
+                last_damage: Instant::now(),
+                size: (geom.width, geom.height),
+            },
+        );
+        Ok(())
+    }
+
+    fn untrack(&mut self, win: Window) {
+        if let Some(t) = self.tracked.remove(&win) {
+            let _ = self.conn.damage_destroy(t.damage);
+            let _ = self
+                .conn
+                .composite_unredirect_window(win, composite::Redirect::AUTOMATIC);
+            let _ = self.conn.change_window_attributes(
+                win,
+                &xproto::ChangeWindowAttributesAux::new().event_mask(EventMask::NO_EVENT),
+            );
+        }
+    }
+
+    /// Waits (bounded) until pending client repaints of `wins` (after a fresh
+    /// redirect or a resize) arrived and went quiet. Windows without a
+    /// pending repaint cost nothing, even if they animate.
+    fn await_repaint(&mut self, wins: &[Window]) -> Result<()> {
+        self.pump()?;
+        let pending: Vec<Window> = wins
+            .iter()
+            .copied()
+            .filter(|w| {
+                self.tracked
+                    .get(w)
+                    .is_some_and(|t| t.repaint_after.is_some())
+            })
+            .collect();
+        let start = Instant::now();
+        while !pending.is_empty() {
+            let now = Instant::now();
+            let waiting = pending
+                .iter()
+                .filter_map(|w| self.tracked.get(w))
+                .map(|t| match t.repaint_after {
+                    Some(_) => REPAINT_WAIT,
+                    None => REPAINT_QUIET.saturating_sub(now - t.last_damage),
+                })
+                .max()
+                .unwrap_or_default();
+            let left = REPAINT_WAIT.saturating_sub(now - start);
+            if waiting.is_zero() || left.is_zero() {
+                return Ok(());
+            }
+            self.wait_readable(waiting.min(left))?;
+            self.pump()?;
+        }
+        Ok(())
+    }
+
+    /// Mapped popups of the window's client, bottom to top.
+    fn client_popups(&self, win: Window) -> Result<Vec<(Window, u32)>> {
+        let base = self.client_base(win);
+        let mine: HashMap<Window, u32> = self
+            .popups
+            .iter()
+            .filter(|(_, (b, _))| *b == base)
+            .map(|(w, (_, pid))| (*w, *pid))
+            .collect();
+        if mine.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tree = self.conn.query_tree(self.root)?.reply()?;
+        Ok(tree
+            .children
+            .into_iter()
+            .filter_map(|c| mine.get(&c).map(|&pid| (c, pid)))
+            .collect())
+    }
+
     // ----- capture ---------------------------------------------------------
-
-    fn ensure_damage(&self, win: Window) {
-        let mut st = self.shared();
-        if st.damage.contains_key(&win) {
-            return;
-        }
-        if let Ok(id) = self.conn.generate_id() {
-            if self
-                .conn
-                .damage_create(id, win, damage::ReportLevel::NON_EMPTY)
-                .is_ok()
-            {
-                st.damage.insert(win, id);
-            }
-        }
-    }
-
-    fn ensure_redirect(&self, win: Window) {
-        let mut st = self.shared();
-        if st.redirected.insert(win) {
-            // BadAccess means another client (a compositor) owns a manual
-            // redirection; the window then already has a backing pixmap.
-            if let Ok(c) = self
-                .conn
-                .composite_redirect_window(win, composite::Redirect::AUTOMATIC)
-            {
-                let _ = c.check();
-            }
-        }
-    }
 
     fn visual_masks(&self, visual: u32) -> Option<(u32, u32, u32)> {
         self.conn
@@ -1062,111 +1256,142 @@ impl Desktop {
         })
     }
 
-    /// Reads a drawable as RGB, preferring MIT-SHM and falling back to core
-    /// GetImage on any SHM failure.
+    /// Reads a `w`x`h` rectangle at `(x, y)` of a drawable as RGB, preferring
+    /// MIT-SHM and falling back to core GetImage on any SHM failure.
     fn read_drawable(
-        &self,
+        &mut self,
         drawable: u32,
-        w: u16,
-        h: u16,
+        (x, y, w, h): (i16, i16, u16, u16),
         layout: &PixelLayout,
     ) -> Result<Vec<u8>> {
         let needed = layout.stride * h as usize;
-        if self.shm_available {
-            let mut st = self.shared();
-            if !st.shm_disabled {
-                if st.shm.as_ref().map(|b| b.len < needed).unwrap_or(true) {
-                    if let Some(old) = st.shm.take() {
-                        let _ = self.conn.shm_detach(old.seg);
-                    }
-                    let len = needed.div_ceil(1 << 20) * (1 << 20);
-                    match ShmBuf::create(&self.conn, len) {
-                        Ok(b) => st.shm = Some(b),
-                        Err(_) => st.shm_disabled = true,
+        if self.shm_available && !self.shm_disabled {
+            if self.shm.as_ref().map(|b| b.len < needed).unwrap_or(true) {
+                if let Some(old) = self.shm.take() {
+                    let _ = self.conn.shm_detach(old.seg);
+                }
+                let len = needed.div_ceil(1 << 20) * (1 << 20);
+                match ShmBuf::create(&self.conn, len) {
+                    Ok(b) => self.shm = Some(b),
+                    Err(_) => self.shm_disabled = true,
+                }
+            }
+            if let Some(buf) = self.shm.as_ref() {
+                let r = self
+                    .conn
+                    .shm_get_image(
+                        drawable,
+                        x,
+                        y,
+                        w,
+                        h,
+                        !0,
+                        ImageFormat::Z_PIXMAP.into(),
+                        buf.seg,
+                        0,
+                    )
+                    .map_err(anyhow::Error::from)
+                    .and_then(|c| c.reply().map_err(anyhow::Error::from));
+                if let Ok(reply) = r {
+                    if reply.size as usize >= needed {
+                        return to_rgb(
+                            buf.bytes(reply.size as usize),
+                            w as usize,
+                            h as usize,
+                            layout,
+                        );
                     }
                 }
-                if let Some(buf) = st.shm.as_ref() {
-                    let r = self
-                        .conn
-                        .shm_get_image(
-                            drawable,
-                            0,
-                            0,
-                            w,
-                            h,
-                            !0,
-                            ImageFormat::Z_PIXMAP.into(),
-                            buf.seg,
-                            0,
-                        )
-                        .map_err(anyhow::Error::from)
-                        .and_then(|c| c.reply().map_err(anyhow::Error::from));
-                    if let Ok(reply) = r {
-                        if reply.size as usize >= needed {
-                            return to_rgb(
-                                buf.bytes(reply.size as usize),
-                                w as usize,
-                                h as usize,
-                                layout,
-                            );
-                        }
-                    }
-                    // Fall through to the core path for this capture only.
-                }
+                // Fall through to the core path for this capture only.
             }
         }
         let reply = self
             .conn
-            .get_image(ImageFormat::Z_PIXMAP, drawable, 0, 0, w, h, !0)?
+            .get_image(ImageFormat::Z_PIXMAP, drawable, x, y, w, h, !0)?
             .reply()
             .map_err(|e| xerr("capture_failed", format!("GetImage failed: {e}")))?;
         to_rgb(&reply.data, w as usize, h as usize, layout)
     }
 
-    fn capture(&self, win: Window) -> Result<(u16, u16, Vec<u8>)> {
-        self.ensure_redirect(win);
-        self.ensure_damage(win);
+    /// Reads a redirected window's own pixels from its Composite backing
+    /// pixmap (never from the screen, so occluding windows cannot leak in).
+    fn read_window(&mut self, win: Window) -> Result<(u16, u16, Vec<u8>)> {
         let attrs = self.conn.get_window_attributes(win)?.reply()?;
+        let geom = self.conn.get_geometry(win)?.reply().map_err(|e| {
+            xerr(
+                "capture_failed",
+                format!("window geometry unavailable: {e}"),
+            )
+        })?;
         let pixmap = self.conn.generate_id()?;
-        let named = self
+        if self
             .conn
             .composite_name_window_pixmap(win, pixmap)?
             .check()
-            .is_ok();
-        if !named {
+            .is_err()
+        {
             return Err(xerr(
                 "capture_failed",
                 "Composite backing pixmap unavailable; refusing an occlusion-sensitive capture",
             ));
         }
-        let drawable = pixmap;
-        let result = (|| {
-            let geom = self.conn.get_geometry(drawable)?.reply().map_err(|e| {
-                xerr(
-                    "capture_failed",
-                    format!("window geometry unavailable: {e}"),
-                )
-            })?;
-            let layout = self.layout_for(geom.depth, geom.width, attrs.visual)?;
-            let rgb = self.read_drawable(drawable, geom.width, geom.height, &layout)?;
-            Ok((geom.width, geom.height, rgb))
-        })();
-        if named {
-            let _ = self.conn.free_pixmap(pixmap);
-            let _ = self.conn.flush();
-        }
-        result
+        // The backing pixmap includes the border.
+        let bw = geom.border_width as i16;
+        let result = self
+            .layout_for(geom.depth, geom.width, attrs.visual)
+            .and_then(|layout| {
+                self.read_drawable(pixmap, (bw, bw, geom.width, geom.height), &layout)
+            });
+        let _ = self.conn.free_pixmap(pixmap);
+        let _ = self.conn.flush();
+        Ok((geom.width, geom.height, result?))
     }
 
-    pub fn screenshot(&self, id: u32) -> Result<Value> {
-        self.window(id)?;
-        let (w, h, rgb) = self.capture(id)?;
-        let png = encode_png(&rgb, w, h)?;
+    /// The window's pixels with its client's mapped popups (menus, dropdowns,
+    /// tooltips) composited on top, clipped to the window.
+    fn capture(&mut self, w: &WindowInfo) -> Result<(u16, u16, Vec<u8>)> {
+        let win = w.window_id;
+        self.track_window(win, w.pid)?;
+        let popups = self.client_popups(win)?;
+        for &(p, pid) in &popups {
+            self.track_window(p, pid)?;
+        }
+        let mut all: Vec<Window> = popups.iter().map(|p| p.0).collect();
+        all.push(win);
+        self.await_repaint(&all)?;
+        let (width, height, mut rgb) = self.read_window(win)?;
+        for (p, _) in popups {
+            // A popup can vanish between listing and reading.
+            let Ok((pw, ph, prgb)) = self.read_window(p) else {
+                continue;
+            };
+            let Ok(o) = self
+                .conn
+                .translate_coordinates(p, win, 0, 0)
+                .map_err(anyhow::Error::from)
+                .and_then(|c| c.reply().map_err(anyhow::Error::from))
+            else {
+                continue;
+            };
+            blit(
+                &mut rgb,
+                (width, height),
+                &prgb,
+                (pw, ph),
+                (o.dst_x as i32, o.dst_y as i32),
+            );
+        }
+        Ok((width, height, rgb))
+    }
+
+    pub fn screenshot(&mut self, w: &WindowInfo) -> Result<Value> {
+        let (width, height, rgb) = self.capture(w)?;
+        let png = encode_png(&rgb, width, height)?;
         Ok(json!({
             "data": base64::engine::general_purpose::STANDARD.encode(png),
             "mimeType": "image/png",
-            "width": w,
-            "height": h,
+            "width": width,
+            "height": height,
         }))
     }
 
@@ -1178,103 +1403,102 @@ impl Desktop {
         }
     }
 
-    fn relevant_drawable(&self, d: Window) -> bool {
+    /// Whether `d` belongs to the current settle target: the window itself
+    /// or a popup (or any window) of the same X client.
+    fn relevant(&self, d: Window) -> bool {
         match self.settle_target {
-            Some(t) => d == t || self.popups.contains(&d),
-            None => true,
+            Some(t) => d == t || self.client_base(d) == self.client_base(t),
+            None => false,
         }
     }
 
-    /// Handles one event; returns whether it counts as activity for settling.
-    fn handle(&mut self, ev: Event) -> Result<bool> {
-        Ok(match ev {
+    fn note_activity(&mut self) {
+        self.activity = true;
+        self.last_activity = Instant::now();
+    }
+
+    fn handle(&mut self, ev: Event, seq: u64) -> Result<()> {
+        match ev {
             Event::XinputRawKeyPress(e) => {
-                self.latch(format!("physical key press from device {}", e.sourceid));
-                false
+                self.latch(format!("physical key press from device {}", e.sourceid))
             }
             Event::XinputRawButtonPress(e) => {
-                self.latch(format!("physical button press from device {}", e.sourceid));
-                false
+                self.latch(format!("physical button press from device {}", e.sourceid))
             }
-            Event::XinputRawMotion(e) => {
-                self.latch(format!(
-                    "physical pointer motion from device {}",
-                    e.sourceid
-                ));
-                false
-            }
+            Event::XinputRawMotion(e) => self.latch(format!(
+                "physical pointer motion from device {}",
+                e.sourceid
+            )),
             Event::XinputRawTouchBegin(e) => {
-                self.latch(format!("physical touch from device {}", e.sourceid));
-                false
+                self.latch(format!("physical touch from device {}", e.sourceid))
             }
             Event::DamageNotify(e) => {
                 let _ = self.conn.damage_subtract(e.damage, NONE, NONE);
-                self.relevant_drawable(e.drawable)
-            }
-            Event::MapNotify(e) if e.event == self.root => {
-                if e.override_redirect {
-                    self.popups.insert(e.window);
-                    self.ensure_damage(e.window);
-                }
-                true
-            }
-            Event::UnmapNotify(e) if e.event == self.root => {
-                let was_popup = self.popups.remove(&e.window);
-                if was_popup {
-                    if let Some(d) = self.shared().damage.remove(&e.window) {
-                        let _ = self.conn.damage_destroy(d);
+                if let Some(t) = self.tracked.get_mut(&e.drawable) {
+                    t.last_damage = Instant::now();
+                    if t.repaint_after.is_some_and(|fence| seq >= fence) {
+                        t.repaint_after = None;
                     }
                 }
-                was_popup || self.settle_target.is_none()
+                if self.relevant(e.drawable) {
+                    self.note_activity();
+                }
             }
-            Event::DestroyNotify(e) if e.event == self.root => {
-                let was_popup = self.popups.remove(&e.window);
-                self.shared().damage.remove(&e.window);
-                was_popup
+            Event::MapNotify(e) if e.event == self.root => {
+                if e.override_redirect && e.window != self.helper {
+                    if let Some(owner) = self.owners(&[e.window])?[0] {
+                        self.popups.insert(e.window, owner);
+                        // Popups of clients we read are redirected right away.
+                        let base = owner.0;
+                        if self.tracked.keys().any(|&w| self.client_base(w) == base) {
+                            self.track_window(e.window, owner.1)?;
+                        }
+                    }
+                }
+                if self.relevant(e.window) {
+                    self.note_activity();
+                }
+            }
+            Event::UnmapNotify(e) if e.event == self.root => {
+                if self.popups.remove(&e.window).is_some() {
+                    self.untrack(e.window);
+                }
+                if self.relevant(e.window) {
+                    self.note_activity();
+                }
+            }
+            Event::DestroyNotify(e) if e.event == self.root || e.event == e.window => {
+                // The server frees damage objects with their drawable.
+                self.popups.remove(&e.window);
+                self.tracked.remove(&e.window);
+            }
+            Event::ConfigureNotify(e) if e.event == e.window => {
+                if let Some(t) = self.tracked.get_mut(&e.window) {
+                    if t.size != (e.width, e.height) {
+                        t.size = (e.width, e.height);
+                        let _ = self.conn.damage_subtract(t.damage, NONE, NONE);
+                        // The resized pixmap is valid once the client repaints.
+                        t.repaint_after = Some(seq);
+                    }
+                }
             }
             Event::MappingNotify(e) => {
                 if e.request != xproto::Mapping::POINTER {
                     self.keymap = Keymap::load(&self.conn)?;
                 }
-                false
-            }
-            Event::SelectionRequest(e) => {
-                self.serve_selection(e)?;
-                false
-            }
-            Event::SelectionClear(e) => {
-                if e.selection == self.atoms.CLIPBOARD {
-                    self.clipboard = None;
-                }
-                false
             }
             // Asynchronous errors from unchecked requests on vanished windows.
-            Event::Error(_) => false,
-            _ => false,
-        })
+            _ => {}
+        }
+        Ok(())
     }
 
-    fn pump(&mut self) -> Result<bool> {
-        let mut activity = false;
-        while let Some(ev) = self.conn.poll_for_event()? {
-            activity |= self.handle(ev)?;
-        }
-        if let Some(c) = &self.clipboard {
-            if Instant::now() >= c.expires {
-                self.clipboard = None;
-                let owner = self
-                    .conn
-                    .get_selection_owner(self.atoms.CLIPBOARD)?
-                    .reply()?
-                    .owner;
-                if owner == self.helper {
-                    self.conn
-                        .set_selection_owner(NONE, self.atoms.CLIPBOARD, CURRENT_TIME)?;
-                }
-            }
+    fn pump(&mut self) -> Result<()> {
+        while let Some((ev, seq)) = self.conn.poll_for_event_with_sequence()? {
+            self.handle(ev, seq)?;
         }
         self.conn.flush()?;
-        Ok(activity)
+        Ok(())
     }
 
     fn wait_readable(&self, timeout: Duration) -> Result<()> {
@@ -1294,12 +1518,6 @@ impl Desktop {
         Ok(())
     }
 
-    /// Round trip so that everything sent so far has been processed.
-    fn sync(&self) -> Result<()> {
-        self.conn.get_input_focus()?.reply()?;
-        Ok(())
-    }
-
     /// A real server timestamp (via a zero-length property append).
     fn server_time(&mut self) -> Result<u32> {
         self.conn.change_property8(
@@ -1311,13 +1529,13 @@ impl Desktop {
         )?;
         self.conn.flush()?;
         loop {
-            let ev = self.conn.wait_for_event()?;
+            let (ev, seq) = self.conn.wait_for_event_with_sequence()?;
             if let Event::PropertyNotify(e) = &ev {
                 if e.window == self.helper && e.atom == self.atoms._LINUX_CUA_TIME {
                     return Ok(e.time);
                 }
             }
-            self.handle(ev)?;
+            self.handle(ev, seq)?;
         }
     }
 
@@ -1338,40 +1556,80 @@ impl Desktop {
         Ok(())
     }
 
-    /// Arm damage monitoring before semantic actions as well as X11 input.
-    pub fn prepare_action(&mut self, id: u32) -> Result<()> {
+    /// Forgets per-turn input state: abort latch, virtual cursors, hover
+    /// windows and the settle target.
+    pub fn end_turn(&mut self) -> Result<()> {
+        self.clear_input_abort()?;
+        self.cursors.clear();
+        self.hover.clear();
+        self.settle_target = None;
+        Ok(())
+    }
+
+    /// Arms activity tracking for the action that follows (semantic or X11).
+    pub fn prepare_action(&mut self, w: &WindowInfo) -> Result<()> {
         self.check_user_input()?;
-        self.window(id)?;
-        self.ensure_damage(id);
-        self.settle_target = Some(id);
+        self.track_window(w.window_id, w.pid)?;
+        self.settle_target = Some(w.window_id);
+        self.activity = false;
         self.conn.flush()?;
         Ok(())
     }
 
-    /// Waits until the last action's window (and popups it opened) produced
-    /// no damage for `quiet`, bounded by `cap`. Returns false on timeout or
-    /// when user input latched an abort while waiting.
-    pub fn settle(&mut self, quiet: Duration, cap: Duration) -> Result<bool> {
-        self.sync()?;
+    /// Two-phase settle after an action. Phase 1 waits up to `react` for the
+    /// first sign that the app reacted: damage on its window or popups, a
+    /// window of the same client (un)mapping, or `external()` reporting an
+    /// accessibility event of the app. Activity seen while the action ran
+    /// counts. Phase 2 waits until that activity has been quiet for `quiet`.
+    /// Everything is bounded by `cap`; a latched user-input abort ends early.
+    pub fn settle(
+        &mut self,
+        react: Duration,
+        quiet: Duration,
+        cap: Duration,
+        external: &mut dyn FnMut() -> bool,
+    ) -> Result<Settled> {
+        // Round trip: everything we sent has been processed by the server.
+        self.conn.get_input_focus()?.reply()?;
         let start = Instant::now();
-        let mut last = start;
         loop {
-            if self.pump()? {
-                last = Instant::now();
+            self.pump()?;
+            if external() {
+                self.note_activity();
             }
             if self.abort.is_some() {
-                return Ok(false);
+                return Ok(Settled {
+                    reacted: self.activity,
+                    quiet: false,
+                });
             }
             let now = Instant::now();
-            let quiet_for = now - last;
             let elapsed = now - start;
-            if quiet_for >= quiet {
-                return Ok(true);
-            }
+            let left = if self.activity {
+                let quiet_for = now - self.last_activity.max(start);
+                if quiet_for >= quiet {
+                    return Ok(Settled {
+                        reacted: true,
+                        quiet: true,
+                    });
+                }
+                quiet - quiet_for
+            } else {
+                if elapsed >= react {
+                    return Ok(Settled {
+                        reacted: false,
+                        quiet: true,
+                    });
+                }
+                react - elapsed
+            };
             if elapsed >= cap {
-                return Ok(false);
+                return Ok(Settled {
+                    reacted: self.activity,
+                    quiet: false,
+                });
             }
-            self.wait_readable((quiet - quiet_for).min(cap - elapsed))?;
+            self.wait_readable(left.min(cap - elapsed).min(POLL_SLICE))?;
         }
     }
 
@@ -1383,25 +1641,41 @@ impl Desktop {
         self.cursors.get(&id).copied()
     }
 
-    fn ensure_no_abort(&mut self) -> Result<()> {
-        self.pump()?;
-        if let Some(what) = &self.abort {
-            return Err(xerr(
-                "user_input_abort",
-                format!("user input detected: {what}"),
-            ));
-        }
-        Ok(())
-    }
-
-    /// Finds the deepest mapped subwindow of `client` at a window-local point.
-    fn hit_test(&self, client: Window, x: i32, y: i32) -> Result<Target> {
+    /// Finds the deepest mapped subwindow at a window-local point, looking at
+    /// the client's popups (topmost first) before the window itself. Points
+    /// outside both, and subwindows owned by another X client (XEmbed or
+    /// reparented foreign windows), are refused.
+    fn hit_test(&self, info: &WindowInfo, x: i32, y: i32) -> Result<Target> {
+        let client = info.window_id;
+        let (x16, y16) = (clamp16(x), clamp16(y));
         let r = self
             .conn
-            .translate_coordinates(client, self.root, x as i16, y as i16)?
+            .translate_coordinates(client, self.root, x16, y16)?
             .reply()?;
         let (rdx, rdy) = (r.dst_x as i32 - x, r.dst_y as i32 - y);
-        let (mut win, mut lx, mut ly) = (client, x, y);
+        let mut start = None;
+        for (p, _) in self.client_popups(client)?.into_iter().rev() {
+            let (Ok(g), Ok(t)) = (
+                self.conn.get_geometry(p)?.reply(),
+                self.conn
+                    .translate_coordinates(client, p, x16, y16)?
+                    .reply(),
+            ) else {
+                continue;
+            };
+            let (px, py) = (t.dst_x as i32, t.dst_y as i32);
+            if (0..g.width as i32).contains(&px) && (0..g.height as i32).contains(&py) {
+                start = Some((p, px, py));
+                break;
+            }
+        }
+        let (mut win, mut lx, mut ly) = match start {
+            Some(s) => s,
+            None => {
+                check_in_window(x, y, info)?;
+                (client, x, y)
+            }
+        };
         for _ in 0..32 {
             let t = self
                 .conn
@@ -1417,6 +1691,17 @@ impl Desktop {
             win = t.child;
             lx = c.dst_x as i32;
             ly = c.dst_y as i32;
+        }
+        if win != client {
+            let owners = self.owners(&[client, win])?;
+            if owners[0].is_none() || owners[0].map(|o| o.0) != owners[1].map(|o| o.0) {
+                return Err(xerr(
+                    "input_refused",
+                    format!(
+                        "point ({x}, {y}) is over window {win:#x}, which belongs to another X client (embedded or reparented); refusing input"
+                    ),
+                ));
+            }
         }
         Ok(Target {
             win,
@@ -1491,8 +1776,16 @@ impl Desktop {
     }
 
     /// Moves the virtual cursor (enter/leave + motion) and returns the target.
-    fn move_to(&mut self, client: Window, x: i32, y: i32, time: u32, state: u16) -> Result<Target> {
-        let t = self.hit_test(client, x, y)?;
+    fn move_to(
+        &mut self,
+        info: &WindowInfo,
+        x: i32,
+        y: i32,
+        time: u32,
+        state: u16,
+    ) -> Result<Target> {
+        let client = info.window_id;
+        let t = self.hit_test(info, x, y)?;
         let prev = self.hover.get(&client).copied();
         if prev != Some(t.win) {
             if let Some(old) = prev {
@@ -1626,84 +1919,16 @@ impl Desktop {
         Ok(())
     }
 
-    fn serve_selection(&mut self, e: xproto::SelectionRequestEvent) -> Result<()> {
-        let a = &self.atoms;
-        let prop = if e.property == NONE {
-            e.target
-        } else {
-            e.property
-        };
-        let mut reply_prop = NONE;
-        if e.selection == a.CLIPBOARD && e.owner == self.helper {
-            if let Some(clip) = self.clipboard.as_mut() {
-                let max = self.conn.maximum_request_bytes().saturating_sub(64);
-                if e.target == a.TARGETS {
-                    let targets = [a.TARGETS, a.UTF8_STRING, AtomEnum::STRING.into(), a.TEXT];
-                    self.conn.change_property32(
-                        PropMode::REPLACE,
-                        e.requestor,
-                        prop,
-                        AtomEnum::ATOM,
-                        &targets,
-                    )?;
-                    reply_prop = prop;
-                } else if (e.target == a.UTF8_STRING || e.target == a.TEXT)
-                    && clip.text.len() <= max
-                {
-                    self.conn.change_property8(
-                        PropMode::REPLACE,
-                        e.requestor,
-                        prop,
-                        a.UTF8_STRING,
-                        clip.text.as_bytes(),
-                    )?;
-                    clip.served += 1;
-                    reply_prop = prop;
-                } else if e.target == u32::from(AtomEnum::STRING) && clip.text.len() <= max {
-                    let latin1: Vec<u8> = clip
-                        .text
-                        .chars()
-                        .map(|c| if (c as u32) < 256 { c as u8 } else { b'?' })
-                        .collect();
-                    self.conn.change_property8(
-                        PropMode::REPLACE,
-                        e.requestor,
-                        prop,
-                        AtomEnum::STRING,
-                        &latin1,
-                    )?;
-                    clip.served += 1;
-                    reply_prop = prop;
-                }
-            }
-        }
-        let notify = xproto::SelectionNotifyEvent {
-            response_type: xproto::SELECTION_NOTIFY_EVENT,
-            sequence: 0,
-            time: e.time,
-            requestor: e.requestor,
-            selection: e.selection,
-            target: e.target,
-            property: reply_prop,
-        };
-        self.conn
-            .send_event(false, e.requestor, EventMask::NO_EVENT, notify)?;
-        self.conn.flush()?;
-        Ok(())
-    }
-
-    /// Window-bound input. Supported methods: click, drag, scroll,
-    /// type_text, press_key, paste. Semantic methods (set_value,
-    /// perform_secondary_action) and element_index targeting belong to the
+    /// Window-bound X11 input for a window the caller already resolved and
+    /// authorized (`prepare_action` first). Supported methods: click, drag,
+    /// scroll, press_key. Text input and element targets belong to the
     /// accessibility layer and are rejected here.
-    pub fn action(&mut self, id: u32, method: &str, p: &Value) -> Result<()> {
+    pub fn action(&mut self, info: &WindowInfo, method: &str, p: &Value) -> Result<()> {
         let allowed: &[&str] = match method {
             "click" => &["window_id", "x", "y", "button", "click_count"],
             "drag" => &["window_id", "from", "to"],
             "scroll" => &["window_id", "x", "y", "direction", "pixels"],
-            "type_text" => &["window_id", "text"],
             "press_key" => &["window_id", "key"],
-            "paste" => &["window_id", "text"],
             other => {
                 return Err(xerr(
                     "unsupported",
@@ -1723,22 +1948,16 @@ impl Desktop {
             return Err(invalid(format!("unsupported parameter {k:?} for {method}")));
         }
         if let Some(w) = obj.get("window_id") {
-            if w.as_u64() != Some(id as u64) {
+            if w.as_u64() != Some(info.window_id as u64) {
                 return Err(invalid("window_id parameter does not match target window"));
             }
         }
-        self.ensure_no_abort()?;
-        let info = self.window(id)?;
-        self.ensure_damage(id);
-        self.settle_target = Some(id);
         let mut time = self.server_time()?;
         let res = match method {
-            "click" => self.do_click(&info, p, &mut time),
-            "drag" => self.do_drag(&info, p, &mut time),
-            "scroll" => self.do_scroll(&info, p, &mut time),
-            "type_text" => self.do_type(&info, p, &mut time),
-            "press_key" => self.do_key(&info, p, &mut time),
-            "paste" => self.do_paste(&info, p, &mut time),
+            "click" => self.do_click(info, p, &mut time),
+            "drag" => self.do_drag(info, p, &mut time),
+            "scroll" => self.do_scroll(info, p, &mut time),
+            "press_key" => self.do_key(info, p, &mut time),
             _ => unreachable!(),
         };
         self.conn.flush()?;
@@ -1746,7 +1965,7 @@ impl Desktop {
     }
 
     fn do_click(&mut self, info: &WindowInfo, p: &Value, time: &mut u32) -> Result<()> {
-        let (x, y) = point(p, "x", "y", info)?;
+        let (x, y) = point(p, "x", "y")?;
         let button = match p.get("button") {
             None => 1u8,
             Some(v) => match v.as_str() {
@@ -1764,7 +1983,7 @@ impl Desktop {
             },
         };
         let mask = 0x80u16 << button; // Button1Mask = 0x100
-        let t = self.move_to(info.window_id, x, y, *time, 0)?;
+        let t = self.move_to(info, x, y, *time, 0)?;
         for _ in 0..count {
             *time = time.wrapping_add(10);
             self.send(
@@ -1781,10 +2000,12 @@ impl Desktop {
     }
 
     fn do_drag(&mut self, info: &WindowInfo, p: &Value, time: &mut u32) -> Result<()> {
-        let (x0, y0) = pair(p, "from", info)?;
-        let (x1, y1) = pair(p, "to", info)?;
+        let (x0, y0) = pair(p, "from")?;
+        let (x1, y1) = pair(p, "to")?;
+        // The end point must lie on the window or one of its popups too.
+        self.hit_test(info, x1, y1)?;
         const B1: u16 = 0x100;
-        let t = self.move_to(info.window_id, x0, y0, *time, 0)?;
+        let t = self.move_to(info, x0, y0, *time, 0)?;
         *time = time.wrapping_add(10);
         self.send(
             t.win,
@@ -1803,7 +2024,7 @@ impl Desktop {
                 self.pointer_event(xproto::MOTION_NOTIFY_EVENT, 0, *time, &t, cx, cy, B1),
             )?;
             self.conn.flush()?;
-            if let Err(e) = self.ensure_no_abort() {
+            if let Err(e) = self.check_user_input() {
                 aborted = Some(e);
                 break;
             }
@@ -1821,7 +2042,7 @@ impl Desktop {
     }
 
     fn do_scroll(&mut self, info: &WindowInfo, p: &Value, time: &mut u32) -> Result<()> {
-        let (x, y) = point(p, "x", "y", info)?;
+        let (x, y) = point(p, "x", "y")?;
         let button = match p.get("direction").and_then(Value::as_str) {
             Some("up") => 4u8,
             Some("down") => 5,
@@ -1840,7 +2061,7 @@ impl Desktop {
                 ))
             })? as u32;
         let notches = pixels.div_ceil(SCROLL_PIXELS_PER_NOTCH);
-        let t = self.move_to(info.window_id, x, y, *time, 0)?;
+        let t = self.move_to(info, x, y, *time, 0)?;
         let release_mask = if button <= 5 { 0x80u16 << button } else { 0 };
         for _ in 0..notches {
             *time = time.wrapping_add(5);
@@ -1864,67 +2085,6 @@ impl Desktop {
         Ok(())
     }
 
-    fn do_type(&mut self, info: &WindowInfo, p: &Value, time: &mut u32) -> Result<()> {
-        let text = text_param(p)?;
-        // Resolve everything first: never send partial text for unmappable input.
-        let mut plan = Vec::with_capacity(text.len());
-        let mut missing = Vec::new();
-        let mut prev_cr = false;
-        for c in text.chars() {
-            if c == '\n' && prev_cr {
-                prev_cr = false;
-                continue;
-            }
-            prev_cr = c == '\r';
-            let sym = char_keysym(c);
-            let hit = sym
-                .and_then(|s| self.resolve_keysym(s))
-                .or_else(|| legacy_keysym(c).and_then(|s| self.resolve_keysym(s)));
-            match hit {
-                Some(k) => plan.push(k),
-                None => {
-                    if !missing.contains(&c) {
-                        missing.push(c)
-                    }
-                }
-            }
-        }
-        if !missing.is_empty() {
-            let list: String = missing
-                .iter()
-                .take(20)
-                .map(|c| format!("{:?} ", c))
-                .collect();
-            return Err(xerr(
-                "unsupported",
-                format!(
-                    "characters not in the display keyboard map (use paste instead): {}",
-                    list.trim_end()
-                ),
-            ));
-        }
-        let o = self.key_origin(info.window_id)?;
-        let shift_kc = self.resolve_keysym(XK_SHIFT_L).map(|k| k.0);
-        for (i, (kc, state)) in plan.into_iter().enumerate() {
-            let shift = shift_kc.filter(|_| state & SHIFT != 0);
-            if let Some(skc) = shift {
-                self.key_event(&o, true, skc, 0, *time)?;
-            }
-            *time = time.wrapping_add(1);
-            self.key_event(&o, true, kc, state, *time)?;
-            *time = time.wrapping_add(1);
-            self.key_event(&o, false, kc, state, *time)?;
-            if let Some(skc) = shift {
-                self.key_event(&o, false, skc, SHIFT, *time)?;
-            }
-            if i % 32 == 31 {
-                self.conn.flush()?;
-                self.ensure_no_abort()?;
-            }
-        }
-        Ok(())
-    }
-
     fn do_key(&mut self, info: &WindowInfo, p: &Value, time: &mut u32) -> Result<()> {
         let key = p
             .get("key")
@@ -1938,59 +2098,6 @@ impl Desktop {
             ));
         }
         self.send_combo(info.window_id, &mods, sym, time)
-    }
-
-    fn do_paste(&mut self, info: &WindowInfo, p: &Value, time: &mut u32) -> Result<()> {
-        let text = text_param(p)?;
-        let max = self.conn.maximum_request_bytes().saturating_sub(64);
-        if text.len() > max {
-            return Err(invalid(format!(
-                "paste text exceeds {max} bytes (INCR transfers unsupported)"
-            )));
-        }
-        let clip_atom = self.atoms.CLIPBOARD;
-        self.conn
-            .set_selection_owner(self.helper, clip_atom, *time)?;
-        if self.conn.get_selection_owner(clip_atom)?.reply()?.owner != self.helper {
-            return Err(xerr(
-                "input_failed",
-                "could not acquire CLIPBOARD ownership",
-            ));
-        }
-        self.clipboard = Some(Clipboard {
-            text: text.to_string(),
-            expires: Instant::now() + CLIPBOARD_LIFETIME,
-            served: 0,
-        });
-        // Conversions that happened before the keystroke do not count.
-        self.pump()?;
-        if let Some(c) = self.clipboard.as_mut() {
-            c.served = 0;
-        }
-        self.send_combo(info.window_id, &[Modifier::Ctrl], 'v' as u32, time)?;
-        self.conn.flush()?;
-        let deadline = Instant::now() + PASTE_CONSUME_TIMEOUT;
-        loop {
-            self.ensure_no_abort()?;
-            match &self.clipboard {
-                Some(c) if c.served > 0 => return Ok(()),
-                Some(_) => {}
-                None => {
-                    return Err(xerr(
-                        "input_failed",
-                        "clipboard ownership lost before paste completed",
-                    ))
-                }
-            }
-            let now = Instant::now();
-            if now >= deadline {
-                return Err(xerr(
-                    "input_failed",
-                    "target did not request the clipboard after synthetic Ctrl+V; it may ignore synthetic key events",
-                ));
-            }
-            self.wait_readable(deadline - now)?;
-        }
     }
 }
 
@@ -2007,54 +2114,36 @@ fn int(v: &Value) -> Option<i64> {
         .map(|f| f as i64)
 }
 
-fn check_in_window(x: i64, y: i64, info: &WindowInfo) -> Result<(i32, i32)> {
-    if x < 0 || y < 0 || x >= info.width as i64 || y >= info.height as i64 {
+fn check_in_window(x: i32, y: i32, info: &WindowInfo) -> Result<()> {
+    if x < 0 || y < 0 || x >= info.width as i32 || y >= info.height as i32 {
         return Err(invalid(format!(
-            "point ({x}, {y}) is outside window {} ({}x{})",
+            "point ({x}, {y}) is outside window {} ({}x{}) and its popups",
             info.window_id, info.width, info.height
         )));
     }
-    Ok((x as i32, y as i32))
+    Ok(())
 }
 
-fn point(p: &Value, kx: &str, ky: &str, info: &WindowInfo) -> Result<(i32, i32)> {
-    let x = p
-        .get(kx)
-        .and_then(int)
-        .ok_or_else(|| invalid(format!("{kx} must be an integer")))?;
-    let y = p
-        .get(ky)
-        .and_then(int)
-        .ok_or_else(|| invalid(format!("{ky} must be an integer")))?;
-    check_in_window(x, y, info)
+/// Window-local coordinate. Bounds are checked by hit-testing, because
+/// popups may extend beyond the window.
+fn coord(v: Option<&Value>, name: &str) -> Result<i32> {
+    v.and_then(int)
+        .filter(|n| (i16::MIN as i64..=i16::MAX as i64).contains(n))
+        .map(|n| n as i32)
+        .ok_or_else(|| invalid(format!("{name} must be an integer")))
 }
 
-fn pair(p: &Value, key: &str, info: &WindowInfo) -> Result<(i32, i32)> {
+fn point(p: &Value, kx: &str, ky: &str) -> Result<(i32, i32)> {
+    Ok((coord(p.get(kx), kx)?, coord(p.get(ky), ky)?))
+}
+
+fn pair(p: &Value, key: &str) -> Result<(i32, i32)> {
     let arr = p
         .get(key)
         .and_then(Value::as_array)
         .filter(|a| a.len() == 2)
         .ok_or_else(|| invalid(format!("{key} must be [x, y]")))?;
-    match (int(&arr[0]), int(&arr[1])) {
-        (Some(x), Some(y)) => check_in_window(x, y, info),
-        _ => Err(invalid(format!("{key} must contain integers"))),
-    }
-}
-
-fn text_param(p: &Value) -> Result<&str> {
-    let t = p
-        .get("text")
-        .and_then(Value::as_str)
-        .ok_or_else(|| invalid("text must be a string"))?;
-    if t.is_empty() {
-        return Err(invalid("text must not be empty"));
-    }
-    if t.chars().count() > MAX_TEXT_CHARS {
-        return Err(invalid(format!(
-            "text longer than {MAX_TEXT_CHARS} characters"
-        )));
-    }
-    Ok(t)
+    Ok((coord(arr.first(), key)?, coord(arr.get(1), key)?))
 }
 
 #[cfg(test)]
@@ -2171,20 +2260,31 @@ mod tests {
             height: 50,
         };
         assert_eq!(
-            point(&json!({"x": 10, "y": 49}), "x", "y", &info).unwrap(),
+            point(&json!({"x": 10, "y": 49}), "x", "y").unwrap(),
             (10, 49)
         );
-        assert!(point(&json!({"x": 100, "y": 0}), "x", "y", &info).is_err());
-        assert!(point(&json!({"x": -1, "y": 0}), "x", "y", &info).is_err());
-        assert!(point(&json!({"x": 1.5, "y": 0}), "x", "y", &info).is_err());
-        assert_eq!(
-            pair(&json!({"from": [1.0, 2]}), "from", &info).unwrap(),
-            (1, 2)
-        );
-        assert!(pair(&json!({"from": [1]}), "from", &info).is_err());
-        assert!(text_param(&json!({"text": ""})).is_err());
+        assert!(check_in_window(10, 49, &info).is_ok());
+        assert!(check_in_window(100, 0, &info).is_err());
+        assert!(check_in_window(-1, 0, &info).is_err());
+        // Negative coordinates parse (popups can extend left of the window).
+        assert_eq!(point(&json!({"x": -1, "y": 0}), "x", "y").unwrap(), (-1, 0));
+        assert!(point(&json!({"x": 1.5, "y": 0}), "x", "y").is_err());
+        assert!(point(&json!({"x": 40000, "y": 0}), "x", "y").is_err());
+        assert_eq!(pair(&json!({"from": [1.0, 2]}), "from").unwrap(), (1, 2));
+        assert!(pair(&json!({"from": [1]}), "from").is_err());
         assert_eq!(char_keysym('é'), Some(0xe9));
         assert_eq!(char_keysym('ж'), Some(0x0100_0436));
         assert_eq!(char_keysym('\u{7}'), None);
+    }
+
+    #[test]
+    fn popup_blit_clips_to_window() {
+        // 3x2 black window, 2x2 white popup at (2, -1): only (2, 0) changes.
+        let mut dst = vec![0u8; 3 * 2 * 3];
+        blit(&mut dst, (3, 2), &[255u8; 2 * 2 * 3], (2, 2), (2, -1));
+        let white: Vec<usize> = (0..6).filter(|i| dst[i * 3] == 255).collect();
+        assert_eq!(white, vec![2]);
+        blit(&mut dst, (3, 2), &[7u8; 3], (1, 1), (-5, 0));
+        assert!(!dst.contains(&7));
     }
 }
