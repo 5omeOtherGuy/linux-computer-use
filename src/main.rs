@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use x11::{Desktop, WindowInfo};
+use x11::{Desktop, HitArea, WindowInfo};
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -310,28 +310,42 @@ impl Engine {
             return self.observe(&w, &wins, 0.0).await;
         }
 
+        let mut warnings: Vec<Value> = Vec::new();
         if matches!(method, "press_key" | "type_text" | "paste") {
             if let Some(ax) = self.ax.as_mut() {
-                if let Some(reason) = ax.key_input_blocked(&w).await {
-                    return Err(x11_error("input_refused", reason));
+                match ax.key_input_gate(&w).await {
+                    Ok(warning) => warnings.extend(warning.map(Value::from)),
+                    Err(reason) => return Err(x11_error("input_refused", reason)),
                 }
             }
         }
         // Baseline for the app's accessibility events, before the action.
         let mut ax_activity = self.ax.as_ref().map(|ax| ax.activity_probe(&w));
         self.desktop.prepare_action(&w)?;
-        let mut warnings: Vec<Value> = Vec::new();
         let element = int_param(p, "element_index");
         match (method, element) {
             ("click", Some(idx)) => {
                 let ax = self.ax.as_mut().context(
                     "Accessibility unavailable: element actions require an isolated AT-SPI bus",
                 )?;
-                match ax.pointer_click_point(&w, idx).await? {
-                    Some((sx, sy)) => {
+                let plan = ax.click_plan(&w, idx).await?;
+                let point = match plan {
+                    ax::ClickPlan::Pointer { x, y, popup } => {
                         let (ox, oy) = self.desktop.origin(w.window_id)?;
-                        self.desktop.click_element_point(&w, sx - ox, sy - oy)?;
+                        let (x, y) = (x - ox, y - oy);
+                        if popup {
+                            Some((x, y, HitArea::Popup))
+                        } else if (0..w.width as i32).contains(&x) && (0..w.height as i32).contains(&y)
+                        {
+                            Some((x, y, HitArea::Window))
+                        } else {
+                            None
+                        }
                     }
+                    ax::ClickPlan::Action => None,
+                };
+                match point {
+                    Some((x, y, area)) => self.desktop.click_element_point(&w, x, y, area)?,
                     None => {
                         Self::with_input_watch(&mut self.desktop, ax.action(&w, method, &r.params))
                             .await?
@@ -353,8 +367,18 @@ impl Engine {
                     // Web inputs in Chromium have no EditableText: focus the
                     // field, select its content and type the value.
                     Some((idx, (sx, sy), text)) => {
+                        self.desktop.check_typeable(text)?;
                         let (ox, oy) = self.desktop.origin(w.window_id)?;
-                        self.desktop.click_element_point(&w, sx - ox, sy - oy)?;
+                        self.desktop.click_element_point(&w, sx - ox, sy - oy, HitArea::Window)?;
+                        // The click may have hit an overlay or a read-only
+                        // input: Ctrl+A and the value would then go to another
+                        // field or trigger page shortcuts.
+                        if !ax.focused_writable(&w, idx).await? {
+                            return Err(x11_error(
+                                "input_refused",
+                                format!("clicking element {idx} did not give it focus as a writable field (covered by another element, or read-only); nothing was typed"),
+                            ));
+                        }
                         let key = if text.is_empty() { "ctrl+a BackSpace" } else { "ctrl+a" };
                         for k in key.split(' ') {
                             self.desktop.action(

@@ -70,6 +70,15 @@ pub struct WindowInfo {
     pub origin: (i32, i32),
 }
 
+/// Where a pointer point may land.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HitArea {
+    /// The window area (as captured), on the window or a popup over it.
+    Window,
+    /// One of the client's popup windows (an open menu), anywhere on screen.
+    Popup,
+}
+
 /// Explicit live-desktop opt-in (daemon command line only). The display is
 /// not checked against :0, but only windows of allow-listed apps (WM_CLASS,
 /// which any client can set) whose server-verified process is one of `pids`
@@ -342,6 +351,46 @@ fn char_keysym(c: char) -> Option<u32> {
         _ if (0x20..=0x7e).contains(&cp) || (0xa0..=0xff).contains(&cp) => Some(cp),
         _ if c.is_control() => None,
         _ => Some(0x0100_0000 | cp),
+    }
+}
+
+/// Keysyms to type `text`, each on the keyboard map; nothing if any is missing.
+fn keysyms_for(km: &Keymap, text: &str) -> Result<Vec<u32>> {
+    let mut syms = Vec::new();
+    let mut missing = Vec::new();
+    for c in text.chars() {
+        // Unicode keysym, else the legacy keysym keyboard maps use for it
+        // (EuroSign on German layouts).
+        let found = char_keysym(c)
+            .into_iter()
+            .chain(legacy_keysym(c))
+            .find(|&s| km.lookup.contains_key(&s));
+        match found {
+            Some(s) => syms.push(s),
+            None => {
+                if !missing.contains(&c) {
+                    missing.push(c)
+                }
+            }
+        }
+    }
+    if !missing.is_empty() {
+        return Err(xerr(
+            "unsupported",
+            format!(
+                "cannot type {:?} as key events (not on the keyboard map) and no accessible text field has focus",
+                missing.iter().take(10).collect::<String>()
+            ),
+        ));
+    }
+    Ok(syms)
+}
+
+/// Pre-Unicode keysyms that keyboard maps still use for some characters.
+fn legacy_keysym(c: char) -> Option<u32> {
+    match c {
+        '€' => Some(0x20ac),
+        _ => None,
     }
 }
 
@@ -661,6 +710,7 @@ impl Target {
     }
 }
 
+#[derive(Clone, Copy)]
 struct KeyOrigin {
     client: Window,
     ex: i16,
@@ -718,8 +768,6 @@ pub struct Desktop {
     hover: HashMap<Window, Window>,
     settle_target: Option<Window>,
     live: Option<LiveScope>,
-    /// Coordinate input limited to the window area (see `hit_test`).
-    clip_input: bool,
 }
 
 impl Desktop {
@@ -867,7 +915,6 @@ impl Desktop {
             hover: HashMap::new(),
             settle_target: None,
             live,
-            clip_input: true,
         };
         desktop.scan_popups()?;
         Ok(desktop)
@@ -1838,7 +1885,7 @@ impl Desktop {
     /// another X client (XEmbed or reparented foreign windows), are refused.
     /// Only `click_element_point` lifts the window clip, for an accessible
     /// element of a popup that extends beyond the window.
-    fn hit_test(&self, info: &WindowInfo, x: i32, y: i32) -> Result<Target> {
+    fn hit_test(&self, info: &WindowInfo, x: i32, y: i32, area: HitArea) -> Result<Target> {
         let client = info.window_id;
         let (x16, y16) = (clamp16(x), clamp16(y));
         let r = self
@@ -1847,8 +1894,8 @@ impl Desktop {
             .reply()?;
         let (rdx, rdy) = (r.dst_x as i32 - x, r.dst_y as i32 - y);
         // Captures show the window area only (popups clipped to it), so
-        // input is limited to the same area.
-        if self.clip_input {
+        // coordinate input is limited to the same area.
+        if area == HitArea::Window {
             check_in_window(x, y, info)?;
         }
         let mut start = None;
@@ -1869,6 +1916,15 @@ impl Desktop {
         }
         let (mut win, mut lx, mut ly) = match start {
             Some(s) => s,
+            // An item of an open menu must be on one of its popups; a point
+            // beside them (an item scrolled out of a long menu) would
+            // otherwise hit the main window.
+            None if area == HitArea::Popup => {
+                return Err(xerr(
+                    "input_refused",
+                    format!("point ({x}, {y}) is not on any open popup of the app (the menu item may be scrolled out of view); refusing the click"),
+                ))
+            }
             None => {
                 check_in_window(x, y, info)?;
                 (client, x, y)
@@ -1981,9 +2037,10 @@ impl Desktop {
         y: i32,
         time: u32,
         state: u16,
+        area: HitArea,
     ) -> Result<Target> {
         let client = info.window_id;
-        let t = self.hit_test(info, x, y)?;
+        let t = self.hit_test(info, x, y, area)?;
         let prev = self.hover.get(&client).copied();
         if prev != Some(t.win) {
             if let Some(old) = prev {
@@ -2081,7 +2138,7 @@ impl Desktop {
     /// Presses modifiers, the key, then releases in reverse order.
     fn send_combo(
         &mut self,
-        client: Window,
+        o: &KeyOrigin,
         mods: &[Modifier],
         sym: u32,
         time: &mut u32,
@@ -2092,7 +2149,7 @@ impl Desktop {
                 format!("keysym {sym:#x} is not in the display's keyboard map"),
             )
         })?;
-        let o = self.key_origin(client)?;
+        let o = *o;
         let mut held: Vec<(u8, u16)> = Vec::new();
         let mut state = 0u16;
         for &m in mods {
@@ -2152,7 +2209,7 @@ impl Desktop {
         }
         let mut time = self.server_time()?;
         let res = match method {
-            "click" => self.do_click(info, p, &mut time),
+            "click" => self.do_click(info, p, &mut time, HitArea::Window),
             "drag" => self.do_drag(info, p, &mut time),
             "scroll" => self.do_scroll(info, p, &mut time),
             "press_key" => self.do_key(info, p, &mut time),
@@ -2166,10 +2223,10 @@ impl Desktop {
     /// which may lie on a popup beyond the window. Used instead of AT-SPI
     /// DoAction where the toolkit would run a nested main loop inside the
     /// accessibility call (GTK menu items opening modal dialogs).
-    pub fn click_element_point(&mut self, info: &WindowInfo, x: i32, y: i32) -> Result<()> {
-        self.clip_input = false;
-        let r = self.action(info, "click", &json!({"x": x, "y": y}));
-        self.clip_input = true;
+    pub fn click_element_point(&mut self, info: &WindowInfo, x: i32, y: i32, area: HitArea) -> Result<()> {
+        let mut time = self.server_time()?;
+        let r = self.do_click(info, &json!({"x": x, "y": y}), &mut time, area);
+        self.conn.flush()?;
         r
     }
 
@@ -2185,38 +2242,31 @@ impl Desktop {
     /// Types text as synthesized key events to the window (fallback when no
     /// accessible editable text has focus). Every character must be on the
     /// display's keyboard map; nothing is sent otherwise.
+    /// Fails, without sending anything, if `text` cannot be typed as key
+    /// events on this display.
+    pub fn check_typeable(&self, text: &str) -> Result<()> {
+        keysyms_for(&self.keymap, text).map(|_| ())
+    }
+
     pub fn type_keys(&mut self, info: &WindowInfo, text: &str) -> Result<()> {
-        let mut syms = Vec::new();
-        let mut missing = Vec::new();
-        for c in text.chars() {
-            match char_keysym(c).filter(|&s| self.resolve_keysym(s).is_some()) {
-                Some(s) => syms.push(s),
-                None => {
-                    if !missing.contains(&c) {
-                        missing.push(c)
-                    }
-                }
-            }
-        }
-        if !missing.is_empty() {
-            return Err(xerr(
-                "unsupported",
-                format!(
-                    "cannot type {:?} as key events (not on the keyboard map) and no accessible text field has focus",
-                    missing.iter().take(10).collect::<String>()
-                ),
-            ));
-        }
+        let syms = keysyms_for(&self.keymap, text)?;
+        let o = self.key_origin(info.window_id)?;
         let mut time = self.server_time()?;
-        for sym in syms {
+        for (i, sym) in syms.into_iter().enumerate() {
+            // Physical input aborts long text between characters too.
+            if i > 0 && i % 16 == 0 {
+                self.conn.flush()?;
+                self.check_user_input()?;
+            }
             time = time.wrapping_add(2);
-            self.send_combo(info.window_id, &[], sym, &mut time)?;
+            self.send_combo(&o, &[], sym, &mut time)?;
         }
         self.conn.flush()?;
         Ok(())
     }
 
-    fn do_click(&mut self, info: &WindowInfo, p: &Value, time: &mut u32) -> Result<()> {
+
+    fn do_click(&mut self, info: &WindowInfo, p: &Value, time: &mut u32, area: HitArea) -> Result<()> {
         let (x, y) = point(p, "x", "y")?;
         let button = match p.get("button") {
             None => 1u8,
@@ -2235,7 +2285,7 @@ impl Desktop {
             },
         };
         let mask = 0x80u16 << button; // Button1Mask = 0x100
-        let t = self.move_to(info, x, y, *time, 0)?;
+        let t = self.move_to(info, x, y, *time, 0, area)?;
         for _ in 0..count {
             *time = time.wrapping_add(10);
             self.send(
@@ -2255,9 +2305,9 @@ impl Desktop {
         let (x0, y0) = pair(p, "from")?;
         let (x1, y1) = pair(p, "to")?;
         // The end point must lie on the window or one of its popups too.
-        self.hit_test(info, x1, y1)?;
+        self.hit_test(info, x1, y1, HitArea::Window)?;
         const B1: u16 = 0x100;
-        let t = self.move_to(info, x0, y0, *time, 0)?;
+        let t = self.move_to(info, x0, y0, *time, 0, HitArea::Window)?;
         *time = time.wrapping_add(10);
         self.send(
             t.win,
@@ -2313,7 +2363,7 @@ impl Desktop {
                 ))
             })? as u32;
         let notches = pixels.div_ceil(SCROLL_PIXELS_PER_NOTCH);
-        let t = self.move_to(info, x, y, *time, 0)?;
+        let t = self.move_to(info, x, y, *time, 0, HitArea::Window)?;
         let release_mask = if button <= 5 { 0x80u16 << button } else { 0 };
         for _ in 0..notches {
             *time = time.wrapping_add(5);
@@ -2349,7 +2399,8 @@ impl Desktop {
                 format!("key {key:?} is not in the display keyboard map"),
             ));
         }
-        self.send_combo(info.window_id, &mods, sym, time)
+        let o = self.key_origin(info.window_id)?;
+        self.send_combo(&o, &mods, sym, time)
     }
 }
 
@@ -2475,6 +2526,9 @@ mod tests {
         assert_eq!(km.lookup[&0x20ac], (13, MOD5));
         assert_eq!(km.level3_mask, MOD5);
         assert!(!km.lookup.contains_key(&0x7a));
+        // Typing falls back to the legacy EuroSign keysym the map uses.
+        assert_eq!(keysyms_for(&km, "a€").unwrap(), vec![0x61, 0x20ac]);
+        assert!(keysyms_for(&km, "az").is_err());
     }
 
     #[test]

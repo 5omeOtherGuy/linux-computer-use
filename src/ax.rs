@@ -55,7 +55,15 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(300);
 const UNRESPONSIVE_RETRY: Duration = Duration::from_secs(3);
 /// Probe of an app's accessibility connection before key input.
 const KEY_PROBE_TIMEOUT: Duration = Duration::from_millis(150);
+/// How long key input waits for a busy (not confirmed blocked) app.
+const KEY_BUSY_WAIT: Duration = Duration::from_millis(1000);
+/// Re-probe of an app marked unresponsive.
+const REPROBE_TIMEOUT: Duration = Duration::from_millis(60);
 const CACHE_MAX_AGE: Duration = Duration::from_secs(5);
+/// After a bulk cache fetch timed out, live traversal for this long.
+const CACHE_RETRY: Duration = Duration::from_secs(10);
+/// Part of the observation budget kept for geometry and element details.
+const RENDER_RESERVE: Duration = Duration::from_millis(150);
 const TOGGLE_VERIFY: Duration = Duration::from_millis(1000);
 const MAX_TREE_NODES: usize = 4000;
 const MAX_LIVE_NODES: usize = 1500;
@@ -150,6 +158,7 @@ const R_REDUNDANT_OBJECT: u32 = 86;
 const R_LIST_BOX: u32 = 98;
 const R_SWITCH: u32 = 130;
 const R_ENTRY: u32 = 79;
+const R_MENU_BAR: u32 = 34;
 const R_PUSH_BUTTON: u32 = 43;
 
 const A11Y_DISABLED: &str = "org.a11y.Status.IsEnabled is false on the session bus; Qt and Electron applications may need QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1 or --force-renderer-accessibility to expose a tree";
@@ -357,6 +366,14 @@ pub struct AxSnapshot {
 }
 
 /// Outcome of a semantic text input (`type_text`, `paste`).
+pub enum ClickPlan {
+    /// Pointer click at a screen point; `popup`: it must land on one of the
+    /// app's popup windows (an open menu).
+    Pointer { x: i32, y: i32, popup: bool },
+    /// AT-SPI action (no visible geometry).
+    Action,
+}
+
 pub enum TextInput {
     /// Inserted through EditableText; warnings such as a verification mismatch.
     Inserted(Vec<String>),
@@ -381,6 +398,9 @@ pub struct Accessibility {
     /// Application buses that recently failed to answer, until when they
     /// are skipped.
     unresponsive: HashMap<String, Instant>,
+    /// Buses where an action call timed out: the app is inside that call
+    /// (a nested main loop) until it answers a probe again.
+    blocked: std::collections::HashSet<String>,
     caches: HashMap<String, Arc<AppCache>>,
     obs: Observations,
 }
@@ -484,6 +504,17 @@ impl Rect {
             h: t.3,
         })
     }
+    fn intersect(&self, o: &Rect) -> Option<Rect> {
+        let (x0, y0) = (self.x.max(o.x), self.y.max(o.y));
+        let x1 = (self.x + self.w).min(o.x + o.w);
+        let y1 = (self.y + self.h).min(o.y + o.h);
+        (x1 > x0 && y1 > y0).then_some(Rect {
+            x: x0,
+            y: y0,
+            w: x1 - x0,
+            h: y1 - y0,
+        })
+    }
     fn outside(&self, w: i32, h: i32) -> bool {
         self.x >= w
             || self.y >= h
@@ -544,8 +575,10 @@ impl EventLog {
 struct AppCache {
     fetched_seq: u64,
     fetched_at: Instant,
-    /// False when the application does not implement the Cache interface.
+    /// False when the application does not implement the Cache interface,
+    /// or its last bulk fetch failed (then until `retry_at`).
     supported: bool,
+    retry_at: Option<Instant>,
     nodes: HashMap<ObjRef, Node>,
     kids: HashMap<ObjRef, Vec<ObjRef>>,
 }
@@ -621,8 +654,8 @@ impl Observations {
             .windows
             .entry(w.window_id)
             .or_insert_with(|| WindowState::new(w.pid));
-        ws.valid = false;
-        ws.elements.clear();
+        // The previous element map stays usable until a new snapshot
+        // succeeds (`snapshot_inner` replaces it at the end).
         ws
     }
 
@@ -654,6 +687,14 @@ impl Observations {
 
     /// The window whose observations issued element `idx` (whether or not
     /// its latest observation still shows it).
+    /// Accessibility bus of element `idx` of a window.
+    fn bus_of(&self, window_id: u32, idx: u32) -> Option<String> {
+        self.windows
+            .get(&window_id)
+            .and_then(|ws| ws.elements.get(&idx))
+            .map(|e| e.r.bus.clone())
+    }
+
     fn window_of(&self, idx: u32) -> Option<u32> {
         self.windows
             .iter()
@@ -1277,6 +1318,7 @@ impl Accessibility {
             setup_warnings,
             pids: HashMap::new(),
             unresponsive: HashMap::new(),
+            blocked: Default::default(),
             caches: HashMap::new(),
             obs: Observations {
                 last_id: first_id.saturating_sub(1),
@@ -1396,10 +1438,8 @@ impl Accessibility {
         match r {
             Ok(text) => Ok(AxSnapshot { text, warnings }),
             Err(e) => {
-                if let Some(ws) = self.obs.windows.get_mut(&window.window_id) {
-                    ws.valid = false;
-                    ws.elements.clear();
-                }
+                // Earlier element IDs stay valid (they are revalidated
+                // before use); only a successful snapshot replaces them.
                 warnings.push(format!("accessibility tree unavailable: {e:#}"));
                 Ok(AxSnapshot {
                     text: String::new(),
@@ -1453,6 +1493,7 @@ impl Accessibility {
     async fn map_window(
         &mut self,
         w: &WindowInfo,
+        deadline: Instant,
         warnings: &mut Vec<String>,
     ) -> Result<(ObjRef, Node)> {
         let apps = self.registry_apps().await?;
@@ -1471,11 +1512,7 @@ impl Accessibility {
         let mut tops: Vec<ObjRef> = Vec::new();
         let mut blocked = 0;
         for app in &mine {
-            if self
-                .unresponsive
-                .get(&app.bus)
-                .is_some_and(|until| Instant::now() < *until)
-            {
+            if self.still_unresponsive(&app.bus).await {
                 blocked += 1;
                 continue;
             }
@@ -1511,8 +1548,13 @@ impl Accessibility {
         }
         if tops.is_empty() && blocked > 0 {
             bail!(
-                "the app's accessibility interface is not responding (it is busy, or blocked in a modal dialog started from inside an accessibility call); skipped for {} s; pointer input still works, and keys work once the app responds",
-                UNRESPONSIVE_RETRY.as_secs()
+                "the app's accessibility interface did not answer within {} ms (busy{}); pointer input still works",
+                PROBE_TIMEOUT.as_millis(),
+                if mine.iter().any(|a| self.blocked.contains(&a.bus)) {
+                    ", and an earlier accessibility action is still running inside it"
+                } else {
+                    ""
+                }
             );
         }
         let conn = &self.conn;
@@ -1523,6 +1565,7 @@ impl Accessibility {
                 (r, n, rect)
             })
             .buffer_unordered(CONCURRENCY)
+            .take_until(tokio::time::sleep_until(deadline.into()))
             .collect()
             .await;
         let title = norm_title(&w.title);
@@ -1637,6 +1680,7 @@ impl Accessibility {
     async fn ensure_cache(
         &mut self,
         bus: &str,
+        deadline: Instant,
         warnings: &mut Vec<String>,
     ) -> Option<Arc<AppCache>> {
         let live = self.invalidation_live();
@@ -1647,7 +1691,7 @@ impl Accessibility {
             .and_then(|l| l.last.get(bus).copied())
             .unwrap_or(0);
         if let Some(c) = self.caches.get(bus) {
-            if !c.supported {
+            if !c.supported && c.retry_at.is_none_or(|t| Instant::now() < t) {
                 return None;
             }
             if live && c.fetched_seq >= last && c.fetched_at.elapsed() < CACHE_MAX_AGE {
@@ -1662,19 +1706,38 @@ impl Accessibility {
             I_CACHE,
             "GetItems",
             &(),
-            BULK_TIMEOUT,
+            BULK_TIMEOUT.min(deadline.saturating_duration_since(Instant::now())),
         )
         .await
         {
             Ok(m) => m,
             Err(e) => {
-                if is_unsupported(&e) {
+                if format!("{e:#}").contains("timed out") {
+                    // A bulk fetch too big for the budget (large web pages):
+                    // live traversal for a while instead of paying it again.
                     self.caches.insert(
                         bus.to_string(),
                         Arc::new(AppCache {
                             fetched_seq: seq_before,
                             fetched_at: Instant::now(),
                             supported: false,
+                            retry_at: Some(Instant::now() + CACHE_RETRY),
+                            nodes: HashMap::new(),
+                            kids: HashMap::new(),
+                        }),
+                    );
+                    warnings.push(format!(
+                        "the app's bulk accessibility cache did not arrive within the observation budget; using a time-bounded live walk (retrying the cache in {} s)",
+                        CACHE_RETRY.as_secs()
+                    ));
+                } else if is_unsupported(&e) {
+                    self.caches.insert(
+                        bus.to_string(),
+                        Arc::new(AppCache {
+                            fetched_seq: seq_before,
+                            fetched_at: Instant::now(),
+                            supported: false,
+                            retry_at: None,
                             nodes: HashMap::new(),
                             kids: HashMap::new(),
                         }),
@@ -1764,6 +1827,7 @@ impl Accessibility {
             fetched_seq: seq_before,
             fetched_at: Instant::now(),
             supported: true,
+            retry_at: None,
             nodes,
             kids,
         });
@@ -1956,15 +2020,20 @@ impl Accessibility {
         let snap_seq = self.event_seq();
         self.obs.begin(w);
 
-        let (frame, frame_node) = self.map_window(w, warnings).await?;
+        let (frame, frame_node) = self.map_window(w, deadline, warnings).await?;
         if self.obs.bind_frame(w.window_id, &frame) {
             warnings.push("window maps to a different accessible frame than before; earlier element IDs are no longer valid".into());
         }
 
-        let cache = self.ensure_cache(&frame.bus, warnings).await;
+        // The tree walk leaves part of the budget for geometry and details.
+        let walk_deadline = deadline
+            .checked_sub(RENDER_RESERVE)
+            .unwrap_or(deadline)
+            .max(Instant::now());
+        let cache = self.ensure_cache(&frame.bus, walk_deadline, warnings).await;
         let cache_ref = cache.as_deref().filter(|c| !c.nodes.is_empty());
         let tree = self
-            .collect_tree(cache_ref, &frame, frame_node, deadline)
+            .collect_tree(cache_ref, &frame, frame_node, walk_deadline)
             .await;
         let conn = &self.conn;
 
@@ -2128,12 +2197,23 @@ impl Accessibility {
     pub async fn action(&mut self, window: &WindowInfo, method: &str, p: &Value) -> Result<()> {
         let idx = Self::element_index(p).ok();
         self.ensure_observed(window, idx).await;
-        match method {
+        let r = match method {
             "click" => self.do_click(window, p).await,
             "set_value" => self.do_set_value(window, p).await,
             "perform_secondary_action" => self.do_secondary(window, p).await,
             other => bail!("accessibility backend does not implement `{other}`"),
+        };
+        // An action call that timed out is still running inside the app (a
+        // nested main loop, e.g. a modal dialog): its accessibility
+        // connection is confirmed blocked until it answers again.
+        if let Err(e) = &r {
+            if format!("{e:#}").contains("timed out") {
+                if let Some(bus) = idx.and_then(|i| self.obs.bus_of(window.window_id, i)) {
+                    self.blocked.insert(bus);
+                }
+            }
         }
+        r
     }
 
     /// Inserts `text` at the focused editable text of the window (or the
@@ -2165,32 +2245,37 @@ impl Accessibility {
         Ok(TextInput::Inserted(warnings))
     }
 
-    /// Screen point to click instead of AT-SPI DoAction, for elements whose
-    /// toolkit action runs inside the accessibility call: GTK menu items
-    /// activate synchronously there, and an item that opens a modal dialog
-    /// (gtk_dialog_run) then blocks the app's accessibility connection, and
-    /// with it all key input, until the dialog closes. A pointer click takes
-    /// the toolkit's normal event path instead. None for other elements.
-    pub async fn pointer_click_point(
-        &mut self,
-        window: &WindowInfo,
-        idx: u32,
-    ) -> Result<Option<(i32, i32)>> {
+    /// How to click element `idx`. A pointer click whenever the element has
+    /// visible geometry: toolkits run DoAction inside the accessibility call,
+    /// and a handler that opens a modal dialog (gtk_dialog_run, as GTK menu
+    /// items and buttons do) then blocks the app's accessibility connection,
+    /// and with it all key input, until the dialog closes. DoAction only for
+    /// elements without visible geometry (scrolled out of view); a menu item
+    /// without geometry is refused, its menu is not open.
+    pub async fn click_plan(&mut self, window: &WindowInfo, idx: u32) -> Result<ClickPlan> {
         self.ensure_observed(window, Some(idx)).await;
         let el = self.resolve(window, idx).await?;
-        if !matches!(el.role, R_MENU_ITEM | R_CHECK_MENU_ITEM | R_RADIO_MENU_ITEM)
-            || !el.has_iface(I_COMPONENT)
-        {
-            return Ok(None);
-        }
         require_enabled(&el, idx)?;
-        let Some(r) = extents(&self.conn, &el.r, COORD_SCREEN).await? else {
-            return Ok(None);
+        let menu_item = matches!(el.role, R_MENU_ITEM | R_CHECK_MENU_ITEM | R_RADIO_MENU_ITEM);
+        let point = if el.has_iface(I_COMPONENT) {
+            visible_center(&self.conn, &el, menu_item).await?
+        } else {
+            None
         };
-        if r.w <= 0 || r.h <= 0 {
-            return Ok(None);
-        }
-        Ok(Some((r.x + r.w / 2, r.y + r.h / 2)))
+        Ok(match point {
+            // Items of an open menu lie on the app's popup windows; an item of
+            // a menu bar lies in the window itself.
+            Some((x, y)) if menu_item => ClickPlan::Pointer {
+                x,
+                y,
+                popup: parent_role(&self.conn, &el.r).await != Some(R_MENU_BAR),
+            },
+            Some((x, y)) => ClickPlan::Pointer { x, y, popup: false },
+            None if menu_item => bail!(
+                "menu item {idx} has no on-screen geometry (its menu is closed or it is scrolled out of view); open or scroll its menu first"
+            ),
+            None => ClickPlan::Action,
+        })
     }
 
     /// Screen centre of a text field that exposes Text but not EditableText
@@ -2219,6 +2304,31 @@ impl Accessibility {
         Ok(Some((r.x + r.w.min(40) / 2, r.y + r.h / 2)))
     }
 
+    /// Whether element `idx` (already resolved for this action) has focus
+    /// and is writable, read live; polls briefly because focus follows a
+    /// click asynchronously.
+    pub async fn focused_writable(&self, w: &WindowInfo, idx: u32) -> Result<bool> {
+        let r = self
+            .obs
+            .windows
+            .get(&w.window_id)
+            .and_then(|ws| ws.elements.get(&idx))
+            .map(|e| e.r.clone())
+            .ok_or_else(|| anyhow!("element {idx} is not in the latest observation"))?;
+        let until = Instant::now() + Duration::from_millis(300);
+        loop {
+            let st: Vec<u32> = call(&self.conn, &r, I_ACC, "GetState", &()).await?;
+            let st = states_from_wire(&st);
+            if has(st, S_FOCUSED) && !has(st, S_READ_ONLY) {
+                return Ok(true);
+            }
+            if Instant::now() >= until {
+                return Ok(false);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// Current text of an element with the Text interface.
     pub async fn element_text(&mut self, window: &WindowInfo, idx: u32) -> Result<String> {
         let el = self.resolve(window, idx).await?;
@@ -2232,30 +2342,78 @@ impl Accessibility {
     /// earlier accessibility call (a modal dialog run from within DoAction),
     /// that call never returns and the app hangs for good. So an app that
     /// does not answer a quick probe gets no key events.
-    pub async fn key_input_blocked(&mut self, w: &WindowInfo) -> Option<String> {
-        let bus = self
+    ///
+    /// Only a confirmed block refuses: an earlier action call to the app timed
+    /// out and the app still does not answer. A merely busy app is probed
+    /// again for up to `KEY_BUSY_WAIT` and then gets the keys (queued) with a
+    /// warning. `Err` is the refusal, `Ok(Some)` a warning.
+    pub async fn key_input_gate(
+        &mut self,
+        w: &WindowInfo,
+    ) -> std::result::Result<Option<String>, String> {
+        let Some(bus) = self
             .obs
             .windows
             .get(&w.window_id)
             .filter(|ws| ws.pid == w.pid)
             .or_else(|| self.obs.windows.values().find(|ws| ws.pid == w.pid && ws.frame.is_some()))
             .and_then(|ws| ws.frame.as_ref())
-            .map(|f| f.bus.clone())?;
-        let app = ObjRef::new(&bus, REGISTRY_ROOT);
-        let probe: Result<Vec<u32>> =
-            call_t(&self.conn, &app, I_ACC, "GetState", &(), KEY_PROBE_TIMEOUT).await;
-        match probe {
+            .map(|f| f.bus.clone())
+        else {
+            return Ok(None);
+        };
+        let confirmed = self.blocked.contains(&bus);
+        let until = Instant::now() + if confirmed { KEY_PROBE_TIMEOUT } else { KEY_BUSY_WAIT };
+        loop {
+            match self.probe(&bus, KEY_PROBE_TIMEOUT).await {
+                Some(true) => return Ok(None),
+                Some(false) if Instant::now() < until => continue,
+                Some(false) => break,
+                None => return Ok(None),
+            }
+        }
+        if confirmed {
+            Err("the app's accessibility connection is blocked: an earlier accessibility action is still running inside it (typically a modal dialog it opened). Key events would deadlock it, so none were sent. Answer the dialog with a pointer click on its buttons (coordinates from a screenshot) first".into())
+        } else {
+            Ok(Some(format!(
+                "the app did not answer accessibility requests for {} ms (busy); the keys were sent and will be handled when it is free",
+                KEY_BUSY_WAIT.as_millis()
+            )))
+        }
+    }
+
+    /// Quick liveness probe of an app's accessibility connection: Some(true)
+    /// answered (clears the unresponsive/blocked marks), Some(false) timed
+    /// out, None another error.
+    async fn probe(&mut self, bus: &str, timeout: Duration) -> Option<bool> {
+        let app = ObjRef::new(bus, REGISTRY_ROOT);
+        let r: Result<Vec<u32>> = call_t(&self.conn, &app, I_ACC, "GetState", &(), timeout).await;
+        match r {
             Ok(_) => {
-                self.unresponsive.remove(&bus);
-                None
+                self.unresponsive.remove(bus);
+                self.blocked.remove(bus);
+                Some(true)
             }
             Err(e) if format!("{e:#}").contains("timed out") => {
                 self.unresponsive
-                    .insert(bus, Instant::now() + UNRESPONSIVE_RETRY);
-                Some("the app's accessibility connection is blocked (typically a modal dialog started from inside an accessibility call); key events would deadlock it, so none were sent. Close or answer the dialog with a pointer click on its buttons (coordinates from a screenshot) first".into())
+                    .insert(bus.to_string(), Instant::now() + UNRESPONSIVE_RETRY);
+                Some(false)
             }
             Err(_) => None,
         }
+    }
+
+    /// Whether an app marked unresponsive is still unresponsive: within the
+    /// mark's window a brief re-probe instead of skipping it outright.
+    async fn still_unresponsive(&mut self, bus: &str) -> bool {
+        if !self
+            .unresponsive
+            .get(bus)
+            .is_some_and(|until| Instant::now() < *until)
+        {
+            return false;
+        }
+        self.probe(bus, REPROBE_TIMEOUT).await == Some(false)
     }
 
     /// Observes the window implicitly when it has no current observation, or
@@ -2280,12 +2438,7 @@ impl Accessibility {
                 self.snapshot_inner(w, deadline, &mut ignored),
             )
             .await;
-            if !matches!(r, Ok(Ok(_))) {
-                if let Some(ws) = self.obs.windows.get_mut(&w.window_id) {
-                    ws.valid = false;
-                    ws.elements.clear();
-                }
-            }
+            let _ = r;
         }
     }
 
@@ -2383,11 +2536,7 @@ impl Accessibility {
                 }
             }
         }
-        if self
-            .unresponsive
-            .get(&el.r.bus)
-            .is_some_and(|until| Instant::now() < *until)
-        {
+        if self.still_unresponsive(&el.r.bus.clone()).await {
             bail!("the app's accessibility interface is not responding; element {idx} cannot be used until it does (pointer input still works)");
         }
         let conn = &self.conn;
@@ -3158,6 +3307,53 @@ fn list_actions(acts: &[(String, String)]) -> String {
         .join(", ")
 }
 
+/// Screen centre of the part of an element that its ancestors leave
+/// visible (scroll panes and viewports clip their children), up to its
+/// top-level. Menu items are not clipped by their parent menu, whose
+/// extents are those of its menu-bar entry rather than of the popup.
+async fn visible_center(conn: &Connection, el: &Elem, menu_item: bool) -> Result<Option<(i32, i32)>> {
+    let Some(mut clip) = extents(conn, &el.r, COORD_SCREEN).await?.filter(|r| r.w > 0 && r.h > 0)
+    else {
+        return Ok(None);
+    };
+    if !menu_item {
+        let mut cur = el.r.clone();
+        for _ in 0..32 {
+            let parent: (String, OwnedObjectPath) = get_prop(conn, &cur, I_ACC, "Parent").await?;
+            let p = ObjRef::from_wire(&parent);
+            if p.is_null() {
+                break;
+            }
+            let role: u32 = call(conn, &p, I_ACC, "GetRole", &()).await?;
+            if role == R_APPLICATION {
+                break;
+            }
+            if let Ok(Some(pr)) = extents(conn, &p, COORD_SCREEN).await {
+                if pr.w > 0 && pr.h > 0 {
+                    match clip.intersect(&pr) {
+                        Some(c) => clip = c,
+                        None => return Ok(None),
+                    }
+                }
+            }
+            if is_toplevel_role(role) {
+                break;
+            }
+            cur = p;
+        }
+    }
+    Ok(Some((clip.x + clip.w / 2, clip.y + clip.h / 2)))
+}
+
+async fn parent_role(conn: &Connection, r: &ObjRef) -> Option<u32> {
+    let parent: (String, OwnedObjectPath) = get_prop(conn, r, I_ACC, "Parent").await.ok()?;
+    let p = ObjRef::from_wire(&parent);
+    if p.is_null() {
+        return None;
+    }
+    call(conn, &p, I_ACC, "GetRole", &()).await.ok()
+}
+
 async fn do_action(conn: &Connection, el: &Elem, i: i32) -> Result<()> {
     let ok: bool = call_t(conn, &el.r, I_ACTION, "DoAction", &(i,), ACTION_TIMEOUT)
         .await
@@ -3453,6 +3649,36 @@ mod tests {
         issued.push(other);
         let unique: std::collections::HashSet<_> = issued.iter().collect();
         assert_eq!(unique.len(), issued.len(), "IDs reused: {issued:?}");
+    }
+
+    /// Regression: starting a snapshot cleared the element map, so a
+    /// snapshot that then ran out of budget (large web pages) left no element
+    /// usable. Only a successful snapshot replaces the map.
+    #[test]
+    fn element_map_survives_a_started_snapshot() {
+        let mut obs = Observations::default();
+        let w = window(9, 1);
+        obs.begin(&w);
+        obs.bind_frame(9, &ObjRef::new(":1.5", "/frame"));
+        let r = ObjRef::new(":1.5", "/ok");
+        let id = obs.id_for(9, &r, 43);
+        let ws = obs.windows.get_mut(&9).unwrap();
+        ws.elements.insert(
+            id,
+            Elem {
+                r,
+                role: 43,
+                name: "OK".into(),
+                ifaces: vec![],
+                states: 0,
+            },
+        );
+        ws.valid = true;
+        obs.begin(&w); // a new snapshot starts (and may fail)
+        let ws = &obs.windows[&9];
+        assert!(ws.valid && ws.elements.contains_key(&id));
+        obs.begin(&window(9, 2)); // a new owner still starts over
+        assert!(obs.windows[&9].elements.is_empty());
     }
 
     #[test]
