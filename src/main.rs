@@ -123,11 +123,14 @@ impl Engine {
             if let Some(protocol) = e.downcast_ref::<ProtocolError>() {
                 return protocol.0.clone();
             }
-            let code = e
-                .downcast_ref::<x11::X11Error>()
-                .map(|e| e.code)
-                .unwrap_or("operation_failed");
-            json!({"code":code,"message":format!("{e:#}")})
+            // The code travels separately; a bare engine error's message
+            // does not repeat it.
+            let (code, message) = match e.downcast_ref::<x11::X11Error>() {
+                Some(x) if e.chain().count() == 1 => (x.code, x.message.clone()),
+                Some(x) => (x.code, format!("{e:#}")),
+                None => ("operation_failed", format!("{e:#}")),
+            };
+            json!({"code":code,"message":message})
         })
     }
 
@@ -261,9 +264,18 @@ impl Engine {
                     format!("app {} has no open windows", app.1),
                 ));
             }
-            let element = int_param(p, "element_index")
-                .and_then(|i| self.ax.as_ref().and_then(|ax| ax.window_of_element(i)))
-                .and_then(|wid| wins.iter().find(|w| w.window_id == wid).cloned());
+            let element = match int_param(p, "element_index").and_then(|i| {
+                self.ax.as_ref().and_then(|ax| ax.window_of_element(i)).map(|wid| (i, wid))
+            }) {
+                Some((i, wid)) => Some(wins.iter().find(|w| w.window_id == wid).cloned().ok_or_else(
+                    || {
+                        x11_error("window_not_found", format!(
+                            "element {i} was in window {wid}, which has closed; the app's current state is in the latest observation, or observe the app again"
+                        ))
+                    },
+                )?),
+                None => None,
+            };
             let pointer = p.contains_key("x") || p.contains_key("from");
             let w = if let Some(w) = element {
                 w
