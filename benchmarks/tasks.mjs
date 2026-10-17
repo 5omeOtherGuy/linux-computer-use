@@ -3,6 +3,7 @@
 // outcome from the filesystem afterwards, independently of the agent's claims.
 import { readFile, readdir, stat } from 'node:fs/promises';
 import { join } from 'node:path';
+import { startPortal, TARGET } from './webform.mjs';
 
 const exists = (p) => stat(p).then(() => true, () => false);
 const read = (p) => readFile(p, 'utf8').catch(() => null);
@@ -104,4 +105,36 @@ const paint = {
   },
 };
 
-export const TASKS = Object.fromEntries([reimburse, xedNote, paint].map((t) => [t.id, t]));
+// A browser form workflow against a local expense portal (benchmarks/webform.mjs):
+// search a paginated list past near-miss names, open the right request, fill
+// a text field, a select, a number field and a checkbox, submit once and read
+// the confirmation. The harness serves the portal and opens it in the browser
+// (`browser: true`); the outcome is the server's own record of the POST.
+const webform = {
+  id: 'webform',
+  description: 'Browser: find an expense request, fill and submit its approval form, report the confirmation number',
+  apps: [],
+  browser: true,
+  allowApps: ['Brave-browser'],
+  setup: ({ out }) => startPortal(out),
+  prompt: (out, { url }) => `The company expense portal is open in the web browser at ${url}
+Find the expense request from Dana Kim for the Lisbon trip and approve it: approved amount 412.80 EUR, cost centre "CC-204 Field Ops", approval note "Approved per policy 7.2", and tick "Receipt checked". Submit the approval once, then report the confirmation number shown by the portal.
+Do not change any other request.`,
+  async verify(out, { final_message = '' } = {}) {
+    const log = JSON.parse((await read(join(out, 'submissions.json'))) ?? '{"submissions":[]}');
+    const s = log.submissions;
+    const sub = s[0] ?? {};
+    const checks = {
+      exactly_one_submission: s.length === 1,
+      request: sub.request_id === TARGET.id,
+      note: sub.note === TARGET.note,
+      cost_centre: sub.cost_centre === TARGET.cost_centre,
+      amount: sub.amount_value === TARGET.amount,
+      receipt_checked: sub.receipt_checked === true,
+      confirmation_reported: !!sub.confirmation && final_message.includes(sub.confirmation),
+    };
+    return { success: Object.values(checks).every(Boolean), checks, rejected_posts: log.rejected?.length ?? 0 };
+  },
+};
+
+export const TASKS = Object.fromEntries([reimburse, xedNote, paint, webform].map((t) => [t.id, t]));
