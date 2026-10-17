@@ -141,3 +141,11 @@ describe('compactTree', () => {
     ].join('\n'));
   });
 });
+
+describe('workspace', () => {
+  test('agent-desktop env exports become the engine environment', async () => {
+    const { parseWorkspaceEnv } = await import('../src/workspace.js');
+    const p = parseWorkspaceEnv("export DISPLAY=:101\nexport XAUTHORITY='/run/a b/Xauthority'\nexport LABEL='it'\\''s'\nunset WAYLAND_DISPLAY TMUX\n");
+    assert.deepEqual(p, { set: { DISPLAY: ':101', XAUTHORITY: '/run/a b/Xauthority', LABEL: "it's" }, unset: ['WAYLAND_DISPLAY', 'TMUX'] });
+  });
+});

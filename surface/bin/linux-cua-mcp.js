@@ -5,13 +5,16 @@ import { createSurface } from '../src/server.js';
 import { DEFAULT_ENGINE, checkDisplay } from '../src/engine.js';
 import { parseExtensions } from '../src/protocol.js';
 import { DEFAULT_CONFIRMATION_POLICY } from '../src/host.js';
+import { attachWorkspace } from '../src/workspace.js';
 import path from 'node:path';
 
 const log = (msg) => process.stderr.write(`[linux-cua-mcp] ${msg}\n`);
 
 let surface;
+let workspace = null;
 try {
-  const env = process.env;
+  workspace = attachWorkspace(process.env, log);
+  const env = workspace ? workspace.env : process.env;
   const display = checkDisplay(env.CUA_DISPLAY);
   // "Always allow" decisions; without a config location, only turn and session scopes are offered.
   const configHome = env.XDG_CONFIG_HOME || (env.HOME ? path.join(env.HOME, '.config') : null);
@@ -27,8 +30,11 @@ try {
   });
 } catch (err) {
   log(`configuration error: ${err.message}`);
+  workspace?.close();
   process.exit(2);
 }
+// A workspace this server created closes with it.
+process.on('exit', () => workspace?.close());
 
 const shutdown = async () => {
   try {
