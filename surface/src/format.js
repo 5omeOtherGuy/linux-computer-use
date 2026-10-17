@@ -19,10 +19,10 @@ export function fenceUntrusted(label, text, max = MAX_AX_CHARS) {
 
 const DEFAULT_ACTIONS = new Set(['click', 'press', 'activate', 'jump']);
 
-// The engine's tree text made shorter for the model, losing nothing it acts
-// on: no default action (an element ID click uses it), and an action list
-// that repeats on many elements of a role said once in the header.
-// Coordinates stay: models click unnamed tool palettes by position.
+// The engine's tree text without the leading default action (an element ID
+// click uses it). Coordinates and repeated action lists stay: models click
+// unnamed tool palettes by position and choose performSecondaryAction from
+// the actions shown on the element itself (benchmark evidence, eval2/eval3).
 export function compactTree(text) {
   const lines = String(text ?? '').split('\n');
   const out = lines.map((line) => {
@@ -36,22 +36,7 @@ export function compactTree(text) {
     });
     return m[1] + m[2] + rest;
   });
-  const counts = new Map();
-  for (const line of out) {
-    const m = /^\s*\[\d+\] (.*?)(?= "| \(| desc=| value=| text=| @-?\d| actions=\[|$).* (actions=\[[^\]]*\])$/.exec(line);
-    if (m) counts.set(`${m[1]}\t${m[2]}`, (counts.get(`${m[1]}\t${m[2]}`) ?? 0) + 1);
-  }
-  const shared = [...counts].filter(([, n]) => n >= 3).map(([k]) => k.split('\t'));
-  if (!shared.length) return out.join('\n');
-  const strip = new Map(shared);
-  const result = out.map((line) => {
-    const m = /^(\s*\[\d+\] )(.*?)(?= "| \(| desc=| value=| text=| @-?\d| actions=\[|$)(.*) (actions=\[[^\]]*\])$/.exec(line);
-    return m && strip.get(m[2]) === m[4] ? m[1] + m[2] + m[3] : line;
-  });
-  const notes = shared.map(([role, acts]) => `# every ${role} below has ${acts} unless it shows its own`);
-  const at = result[0]?.startsWith('#') ? 1 : 0;
-  result.splice(at, 0, ...notes);
-  return result.join('\n');
+  return out.join('\n');
 }
 
 export function isObservation(v) {

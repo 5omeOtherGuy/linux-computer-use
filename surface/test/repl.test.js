@@ -112,7 +112,7 @@ describe('SandboxRunner', () => {
 });
 
 describe('compactTree', () => {
-  test('drops the default action and states a repeated action list once; keeps coordinates', async () => {
+  test('drops only the leading default action', async () => {
     const { compactTree } = await import('../src/format.js');
     const tree = [
       '# accessibility: 6 elements',
@@ -128,14 +128,13 @@ describe('compactTree', () => {
     ].join('\n');
     assert.equal(compactTree(tree), [
       '# accessibility: 6 elements',
-      '# every table cell below has actions=[Expand or contract, Edit, Activate] unless it shows its own',
       '[1] frame "Files" (active) @0,0 900x700',
       '  [2] button "Undo" @10,4 68x46',
       '  [3] button desc="Swatch" @1,1 5x5 actions=[Customize]',
       '  [4] button @7,7 9x9',
-      '  [5] table cell "a.txt" @1,2 3x4',
-      '  [6] table cell "b.txt" @1,2 3x4',
-      '  [7] table cell "c.txt" (selected) @1,2 3x4',
+      '  [5] table cell "a.txt" @1,2 3x4 actions=[Expand or contract, Edit, Activate]',
+      '  [6] table cell "b.txt" @1,2 3x4 actions=[Expand or contract, Edit, Activate]',
+      '  [7] table cell "c.txt" (selected) @1,2 3x4 actions=[Expand or contract, Edit, Activate]',
       '  [8] table cell "d.txt" @1,2 3x4 actions=[Edit]',
       '  [9] drawing area @0,40 800x600',
     ].join('\n'));
