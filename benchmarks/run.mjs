@@ -31,6 +31,7 @@ import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { TASKS } from './tasks.mjs';
 import { checkCommand } from './shell-policy.mjs';
+import { agentDesktop } from '../surface/src/workspace.js';
 
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const { values: o } = parseArgs({
@@ -47,7 +48,7 @@ const { values: o } = parseArgs({
     record: { type: 'boolean', default: false },
     engine: { type: 'string', default: process.env.CUA_ENGINE || '/data/scratch/linux-cua-build/target/release/linux-cua' },
     'mcp-entry': { type: 'string', default: join(repo, 'surface/bin/linux-cua-mcp.js') },
-    'skill-dir': { type: 'string', default: join(homedir(), 'projects/agent-desktop/skill') },
+    'skill-dir': { type: 'string', default: join(repo, 'desktop/skill') },
     label: { type: 'string', default: '' },
   },
 });
@@ -61,7 +62,7 @@ const GEOMETRY = '1440x900';
 
 // Apps inherit the caller's cwd as their default save/open folder, so launch from the run's output dir.
 let adCwd = process.cwd();
-const ad = (...args) => execFileSync('agent-desktop', args, { encoding: 'utf8', timeout: 120_000, cwd: adCwd }).trim();
+const ad = (...args) => execFileSync(agentDesktop(process.env), args, { encoding: 'utf8', timeout: 120_000, cwd: adCwd }).trim();
 
 function workspaceEnv(ws) {
   const env = {};

@@ -1,8 +1,30 @@
 # Linux CUA
 
-Clean-room Linux computer-use engine and model surfaces. No OpenAI binaries, JavaScript packages, or instruction text are included. The supplied research specification, public AT-SPI/X11 interfaces, and public provider API documentation informed the implementation.
+Linux desktop toolkit: isolated agent workspaces, a clean-room computer-use engine, and model surfaces. No OpenAI binaries, JavaScript packages, or instruction text are included. The supplied research specification, public AT-SPI/X11 interfaces, and public provider API documentation informed the implementation.
 
 **Status: working X11 prototype, not a completed Codex-equivalence claim.** Tested with a GTK3 fixture on a private Xvnc display. The MCP server and both provider adapters have exercised the real engine. Live Claude/GPT inference, Codex reference timings, XWayland, and broad application compatibility remain unverified. Native Wayland is not implemented.
+
+## Repository layout and installation
+
+This repository contains the desktop manager and computer-use engine together. Their histories are preserved; the desktop import also includes the local controller improvements present at migration.
+
+| Path | Component |
+|---|---|
+| `desktop/` | agent-desktop CLI, private workspace lifecycle, native/browser controllers, panel tools and tests |
+| `desktop/skill/` | agent instructions and references; the single source for the installed skill |
+| `src/` | Rust X11/AT-SPI computer-use engine |
+| `surface/` | MCP interfaces and provider adapters |
+| `benchmarks/` | end-to-end agent workloads using the bundled desktop manager |
+
+Build with the commands below, then link the desktop commands and skill from a release or dedicated installation checkout. Links follow that checkout, so installed tools should not point to a worktree being edited:
+
+```sh
+python3 scripts/install-desktop.py
+# To migrate existing command/skill symlinks from a separate checkout:
+python3 scripts/install-desktop.py --replace-links
+```
+
+The installer creates symlinks under `~/.local/bin` and `~/.agents/skills/agent-desktop`; it never replaces regular files or installs packages. The optional owner-facing panel remains in `desktop/panel/`. The MCP server and benchmark harness prefer the bundled CLI; `CUA_AGENT_DESKTOP` overrides that choice. The engine can still use another explicitly owned private X11 session independently.
 
 ## Build
 
@@ -15,13 +37,24 @@ cargo test --locked
 npm test --prefix surface
 ```
 
+Desktop and installer checks that do not connect to a display:
+
+```sh
+python3 -m unittest discover -s tests -p test_install_desktop.py -v
+python3 -m unittest discover -s desktop/tests -p test_ownership.py -v
+python3 -m unittest discover -s desktop/tests -p test_native.py -v
+python3 -m unittest discover -s desktop/tests -p test_browser.py -v
+```
+
+`python3 -m unittest discover -s desktop/tests -p test_fast.py -v` additionally creates and closes its own private fixture desktop. The legacy full desktop suite includes owner-display queries and panel tests; use the targeted checks above on a shared workstation.
+
 On this workstation build artifacts were placed on the HDD with `CARGO_TARGET_DIR=/data/scratch/linux-cua-build/target CARGO_BUILD_JOBS=2`; set `CUA_ENGINE` accordingly.
 
 ## Run on a private desktop
 
 Bring your own private display/session. Never point this at another agent's display. Display 0 and the default owner session/a11y bus paths are refused. No implicit `$DISPLAY` fallback exists.
 
-Example using an installed agent-desktop (creates only this task's workspace; does not modify agent-desktop):
+Example using the bundled agent-desktop commands after installation:
 
 ```sh
 W=$(agent-desktop new --label 'Linux CUA' --geometry 1024x768 --a11y)
@@ -34,7 +67,7 @@ node surface/bin/linux-cua-mcp.js
 agent-desktop close "$W"
 ```
 
-Configure any MCP stdio client to launch `node /absolute/path/surface/bin/linux-cua-mcp.js` with `CUA_ENGINE`, `CUA_DISPLAY`, `XAUTHORITY`, the private `DBUS_SESSION_BUS_ADDRESS`, and optionally `AT_SPI_BUS_ADDRESS`. On a workstation with agent-desktop, `CUA_WORKSPACE=new` replaces those: the server creates a private workspace with accessibility (`CUA_WORKSPACE_LABEL`, `CUA_WORKSPACE_GEOMETRY`), owned by the server process and closed when it exits, and apps started with `cua.launchApp` run in it; `CUA_WORKSPACE=NAME` attaches to an existing workspace instead and leaves it open. The server finds `agent-desktop` on `PATH` or in `~/.local/bin` (MCP clients such as Codex start servers with a reduced environment); `CUA_AGENT_DESKTOP` sets its path explicitly. The client must support form elicitation, or apps must be explicitly allowed by the trusted operator. Denials always win. Nothing is installed into your Amp/Claude configuration automatically.
+Configure any MCP stdio client to launch `node /absolute/path/surface/bin/linux-cua-mcp.js` with `CUA_ENGINE`, `CUA_DISPLAY`, `XAUTHORITY`, the private `DBUS_SESSION_BUS_ADDRESS`, and optionally `AT_SPI_BUS_ADDRESS`. On a workstation with agent-desktop, `CUA_WORKSPACE=new` replaces those: the server creates a private workspace with accessibility (`CUA_WORKSPACE_LABEL`, `CUA_WORKSPACE_GEOMETRY`), owned by the server process and closed when it exits, and apps started with `cua.launchApp` run in it; `CUA_WORKSPACE=NAME` attaches to an existing workspace instead and leaves it open. The server uses `desktop/bin/agent-desktop` from this checkout, falling back to `PATH` or `~/.local/bin` for a standalone surface installation (MCP clients such as Codex start servers with a reduced environment); `CUA_AGENT_DESKTOP` sets its path explicitly. The client must support form elicitation, or apps must be explicitly allowed by the trusted operator. Denials always win. Nothing is installed into your Amp/Claude configuration automatically.
 
 ## Live demos on your own desktop (explicit opt-in)
 
@@ -51,9 +84,9 @@ CUA_DISPLAY=:0 linux-cua --live-desktop --allow-app gnome-calculator [--allow-ap
 - The per-app approval, deny lists and hard denies still apply. The AT-SPI bus check is unchanged: the owner's default session and accessibility buses are refused, so semantic actions work only for apps started on a private bus (as the demo bridge does); coordinate input and capture work either way.
 - The former `CUA_AUTHORIZED_WINDOW_IDS`/`CUA_AUTHORIZED_PID` variables are rejected at startup.
 
-## Merged with agent-desktop
+## Integration and benchmark results
 
-This tree is the merge of linux-cua and the workstation's agent-desktop controllers (`~/projects/agent-desktop`, unchanged and still used for its workspaces):
+The following measurements cover the earlier controller integration. Both components now live in this repository, with the workspace manager under `desktop/`:
 
 | From | What |
 |---|---|

@@ -1,3 +1,4 @@
+import { fileURLToPath } from 'node:url';
 // REPL semantics and sandbox limits, using SandboxRunner with a stub host.
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -142,6 +143,11 @@ describe('compactTree', () => {
 });
 
 describe('workspace', () => {
+  test('bundled desktop is selected with a reduced environment and can be overridden', async () => {
+    const { agentDesktop } = await import('../src/workspace.js');
+    assert.equal(agentDesktop({}), fileURLToPath(new URL('../../desktop/bin/agent-desktop', import.meta.url)));
+    assert.equal(agentDesktop({ CUA_AGENT_DESKTOP: '/custom/controller' }), '/custom/controller');
+  });
   test('agent-desktop env exports become the engine environment', async () => {
     const { parseWorkspaceEnv } = await import('../src/workspace.js');
     const p = parseWorkspaceEnv("export DISPLAY=:101\nexport XAUTHORITY='/run/a b/Xauthority'\nexport LABEL='it'\\''s'\nunset WAYLAND_DISPLAY TMUX\n");

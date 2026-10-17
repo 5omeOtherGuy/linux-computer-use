@@ -1,0 +1,25 @@
+#!/bin/sh
+# xfce4-genmon-plugin command: shows the number of live agent workspaces in the
+# panel; clicking opens agent-desktop-menu. Prints nothing when there are none.
+# Cheap by design (runs every few seconds): no python, no X queries.
+R="${AGENT_DESKTOP_RUNTIME:-${XDG_RUNTIME_DIR:-/tmp/agent-desktop-$(id -u)}/agent-desktop}"
+MENU="$(dirname "$(readlink -f "$0")")/agent-desktop-menu"
+n=0
+tip=""
+for s in "$R"/ws/*/state.json; do
+    [ -f "$s" ] || continue
+    d=$(sed -n 's/.*"display": *\([0-9]*\).*/\1/p' "$s" | head -n 1)
+    [ -n "$d" ] && [ -S "/tmp/.X11-unix/X$d" ] || continue
+    name=$(basename "$(dirname "$s")")
+    label=$(sed -n 's/.*"label": *"\([^"]*\)".*/\1/p' "$s" | head -n 1 | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g')
+    n=$((n + 1))
+    tip="$tip
+$name  :$d  $label"
+done
+if [ "$n" -eq 0 ]; then
+    echo "<txt></txt><tool>No agent workspaces</tool>"
+    exit 0
+fi
+echo "<txt> 🖥 $n </txt>"
+echo "<tool>Agent workspaces (click to watch):$tip</tool>"
+echo "<txtclick>$MENU</txtclick>"

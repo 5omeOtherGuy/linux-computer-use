@@ -1,0 +1,1059 @@
+#!/usr/bin/env python3
+"""agent-desktop: isolated, ephemeral X11 desktops for agents.
+
+Each workspace is its own headless X server (TigerVNC Xvnc on display :100-:199)
+with openbox, a private D-Bus session bus and private XDG dirs. Nothing is ever
+drawn on, or sent to, the owner's display. The owner can watch a workspace
+through a VNC viewer attached to the workspace's unix socket.
+"""
+import argparse
+import fcntl
+import json
+import os
+import re
+import secrets
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+UID = os.getuid()
+RUNTIME = Path(os.environ.get("AGENT_DESKTOP_RUNTIME")
+               or os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/agent-desktop-{UID}",
+                               "agent-desktop"))
+CACHE = Path(os.environ.get("AGENT_DESKTOP_CACHE")
+             or os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
+                             "agent-desktop"))
+WS_ROOT = RUNTIME / "ws"
+MAX_WS = int(os.environ.get("AGENT_DESKTOP_MAX", "3"))
+MIN_AVAIL_MIB = int(os.environ.get("AGENT_DESKTOP_MIN_AVAIL_MIB", "1229"))  # 1.2 GiB
+DEFAULT_IDLE_MIN = float(os.environ.get("AGENT_DESKTOP_IDLE_MIN", "60"))
+DISPLAYS = range(100, 200)
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,31}$")
+OWNER_COMMS = set(os.environ.get("AGENT_DESKTOP_OWNER_COMMS",
+                                 "claude codex p1 opencode .opencode pi amp").split())
+REAPER_PERIOD = 5
+
+EXIT_ERR, EXIT_USAGE, EXIT_REFUSED, EXIT_TIMEOUT = 1, 2, 3, 4
+
+
+class Fail(Exception):
+    def __init__(self, msg, code=EXIT_ERR):
+        super().__init__(msg)
+        self.code = code
+
+
+# ---------------------------------------------------------------- helpers
+
+def now():
+    return time.time()
+
+
+def mem_available_mib():
+    with open("/proc/meminfo") as f:
+        for line in f:
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) // 1024
+    return 0
+
+
+def ram_guard(force=False):
+    avail = mem_available_mib()
+    if avail < MIN_AVAIL_MIB and not force:
+        raise Fail(f"refused: MemAvailable {avail} MiB < guard {MIN_AVAIL_MIB} MiB", EXIT_REFUSED)
+
+
+def proc_start(pid):
+    """Start time of pid in clock ticks, or None if it does not exist (guards pid reuse)."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            data = f.read()
+    except OSError:
+        return None
+    fields = data[data.rfind(")") + 2:].split()
+    if fields[0] == "Z":
+        return None
+    return int(fields[19])
+
+
+def alive(pid, start=None):
+    if not pid:
+        return False
+    s = proc_start(pid)
+    return s is not None and (start is None or s == start)
+
+
+def comm(pid):
+    try:
+        return Path(f"/proc/{pid}/comm").read_text().strip()
+    except OSError:
+        return ""
+
+
+def ppid(pid):
+    try:
+        data = Path(f"/proc/{pid}/stat").read_text()
+        return int(data[data.rfind(")") + 2:].split()[1])
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
+def find_owner_session():
+    """Nearest ancestor that is an agent harness (claude, codex, p1, ...)."""
+    pid = os.getppid()
+    while pid > 1:
+        if comm(pid) in OWNER_COMMS:
+            return pid
+        pid = ppid(pid)
+    return None
+
+
+def creator_identity():
+    """Identify the calling harness, independently of the cleanup --owner-pid.
+
+    Without a recognized harness, bind to the invoking process (e.g. a shell).
+    Start ticks prevent a recycled PID from acquiring an old workspace. Codex
+    can host multiple threads in one process, so bind to its thread as well.
+    """
+    pid = find_owner_session() or os.getppid()
+    start = proc_start(pid)
+    if start is None:
+        raise Fail("refused: cannot identify workspace creator", EXIT_REFUSED)
+    identity = {"pid": pid, "start": start}
+    if comm(pid) == "codex" and os.environ.get("CODEX_THREAD_ID"):
+        identity["codex_thread_id"] = os.environ["CODEX_THREAD_ID"]
+    return identity
+
+
+def created_by(w, identity):
+    # Legacy state has no creator: never infer ownership from its cleanup PID.
+    return w.state.get("creator") == identity
+
+
+def pss_kib(pid):
+    try:
+        with open(f"/proc/{pid}/smaps_rollup") as f:
+            for line in f:
+                if line.startswith("Pss:"):
+                    return int(line.split()[1])
+    except OSError:
+        pass
+    return 0
+
+
+def marked_pids(ws_id):
+    """Our processes that carry this workspace's marker in their environment."""
+    needle = f"AGENT_DESKTOP_ID={ws_id}".encode()
+    me = os.getpid()
+    out = []
+    for d in os.listdir("/proc"):
+        if not d.isdigit() or int(d) == me:
+            continue
+        try:
+            if os.stat(f"/proc/{d}").st_uid != UID:
+                continue
+            with open(f"/proc/{d}/environ", "rb") as f:
+                env = f.read()
+        except OSError:
+            continue
+        if needle + b"\0" in env or env.endswith(needle):
+            if proc_start(int(d)) is not None:
+                out.append(int(d))
+    return out
+
+
+class Lock:
+    def __init__(self, path):
+        self.path = path
+
+    def __enter__(self):
+        RUNTIME.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.f = open(self.path, "w")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *a):
+        fcntl.flock(self.f, fcntl.LOCK_UN)
+        self.f.close()
+
+
+def log_event(msg):
+    try:
+        CACHE.mkdir(parents=True, exist_ok=True)
+        p = CACHE / "events.log"
+        if p.exists() and p.stat().st_size > 1 << 20:
+            p.write_text("")
+        with open(p, "a") as f:
+            f.write(time.strftime("%Y-%m-%dT%H:%M:%S ") + msg + "\n")
+    except OSError:
+        pass
+
+
+def notify_owner(summary, body):
+    """Desktop notification plus sound on the owner's session; fire and forget."""
+    if os.environ.get("AGENT_DESKTOP_NOTIFY", "1") == "0":
+        return
+    run = f"/run/user/{UID}"
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("PULSE_SERVER", "AGENT_DESKTOP_ID")}
+    # The owner's session bus and Pulse/PipeWire socket, even when called with a workspace env.
+    env.update({"DBUS_SESSION_BUS_ADDRESS": f"unix:path={run}/bus", "XDG_RUNTIME_DIR": run})
+    sound = "/usr/share/sounds/freedesktop/stereo/message-new-instant.oga"
+    for cmd in (["notify-send", "--app-name=agent-desktop", "--icon=video-display", summary, body],
+                ["paplay", sound]):
+        if shutil.which(cmd[0]):
+            subprocess.Popen(cmd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def fmt_age(sec):
+    sec = int(sec)
+    if sec < 90:
+        return f"{sec}s"
+    if sec < 5400:
+        return f"{sec // 60}m"
+    return f"{sec // 3600}h{(sec % 3600) // 60:02d}m"
+
+
+# ---------------------------------------------------------------- workspace
+
+class Workspace:
+    def __init__(self, name):
+        if not NAME_RE.match(name):
+            raise Fail(f"bad workspace name {name!r}: use [a-z0-9-], at most 32 chars", EXIT_USAGE)
+        self.name = name
+        self.dir = WS_ROOT / name
+        self.files = CACHE / "ws" / name
+        self._state = None
+
+    @property
+    def state(self):
+        if self._state is None:
+            try:
+                self._state = json.loads((self.dir / "state.json").read_text())
+            except (OSError, ValueError):
+                raise Fail(f"no such workspace: {self.name}", EXIT_USAGE)
+        return self._state
+
+    def exists(self):
+        return (self.dir / "state.json").exists()
+
+    @property
+    def display(self):
+        n = int(self.state["display"])
+        if n not in DISPLAYS:  # never :0 or any display we did not allocate
+            raise Fail(f"refusing display :{n}", EXIT_ERR)
+        return f":{n}"
+
+    def touch(self):
+        try:
+            os.utime(self.dir / "touch")
+        except OSError:
+            pass
+
+    def last_used(self):
+        try:
+            return (self.dir / "touch").stat().st_mtime
+        except OSError:
+            return self.state.get("created", 0)
+
+    def server_alive(self):
+        s = self.state
+        return alive(s["pids"]["server"], s["starts"]["server"])
+
+    def env(self, audio=None):
+        s = self.state
+        env = dict(os.environ)
+        for k in ("WAYLAND_DISPLAY", "SESSION_MANAGER", "DESKTOP_STARTUP_ID", "XDG_ACTIVATION_TOKEN",
+                  "GIO_LAUNCHED_DESKTOP_FILE", "GIO_LAUNCHED_DESKTOP_FILE_PID", "TMUX", "TMUX_PANE",
+                  "XDG_SESSION_ID", "XDG_SEAT", "XDG_VTNR", "XDG_SESSION_PATH", "XDG_SEAT_PATH",
+                  "AT_SPI_BUS_ADDRESS"):
+            env.pop(k, None)
+        env.update({
+            "DISPLAY": self.display,
+            "XAUTHORITY": str(self.dir / "Xauthority"),
+            "DBUS_SESSION_BUS_ADDRESS": f"unix:path={self.dir / 'bus'}",
+            "XDG_RUNTIME_DIR": str(self.dir / "run"),
+            "NO_AT_BRIDGE": "0" if s.get("a11y") else "1",
+            "GDK_BACKEND": "x11",
+            "QT_QPA_PLATFORM": "xcb",
+            "XDG_SESSION_TYPE": "x11",
+            "AGENT_DESKTOP": self.name,
+            "AGENT_DESKTOP_ID": s["id"],
+            "AGENT_DESKTOP_RUNTIME": str(RUNTIME),
+            "AGENT_DESKTOP_CACHE": str(CACHE),
+        })
+        if s.get("a11y"):
+            env["GTK_MODULES"] = "atk-bridge"
+        if not s.get("share_home"):
+            h = self.files / "home"
+            env.update({"XDG_CONFIG_HOME": str(h / "config"), "XDG_DATA_HOME": str(h / "data"),
+                        "XDG_CACHE_HOME": str(h / "cache"), "XDG_STATE_HOME": str(h / "state"),
+                        # Claude Code's updater installs into XDG_DATA_HOME but relinks the real
+                        # ~/.local/bin/claude; close then deletes the target (2026-10-05).
+                        "DISABLE_AUTOUPDATER": "1"})
+        if not (s.get("audio") if audio is None else audio):
+            env["PULSE_SERVER"] = "unix:/nonexistent-agent-desktop"
+        return env
+
+    def x(self, *args, check=True, capture=True, timeout=30):
+        """Run an X client (xdotool, wmctrl, ...) against this workspace only."""
+        self.touch()
+        r = subprocess.run(list(args), env=self.env(), stdin=subprocess.DEVNULL,
+                           capture_output=capture, text=True, timeout=timeout)
+        if check and r.returncode != 0:
+            raise Fail(f"{args[0]} failed ({r.returncode}): {(r.stderr or '').strip()}")
+        return r.stdout if capture else ""
+
+
+def all_workspaces():
+    if not WS_ROOT.is_dir():
+        return []
+    ws = (Workspace(d.name) for d in sorted(WS_ROOT.iterdir()) if NAME_RE.match(d.name))
+    return [w for w in ws if w.exists()]
+
+
+def terminate(pids, grace=3.0):
+    pids = [p for p in pids if alive(p)]
+    for p in pids:
+        try:
+            os.kill(p, signal.SIGTERM)
+        except OSError:
+            pass
+    deadline = now() + grace
+    while now() < deadline and any(alive(p) for p in pids):
+        time.sleep(0.1)
+    for p in pids:
+        if alive(p):
+            try:
+                os.kill(p, signal.SIGKILL)
+            except OSError:
+                pass
+
+
+def close_ws(w, reason, keep_files=False):
+    s = w.state
+    infra = {k: p for k, p in s["pids"].items() if alive(p, s["starts"].get(k))}
+    try:  # owner viewers first, so they close quietly instead of reporting a lost connection
+        viewers = [v.split() for v in (w.dir / "viewers").read_text().split("\n") if v]
+        terminate([int(p) for p, st in viewers if alive(int(p), int(st))], grace=1.0)
+    except (OSError, ValueError):
+        pass
+    terminate([p for p in marked_pids(s["id"]) if p not in infra.values()])  # apps first
+    terminate([infra[k] for k in ("wm", "dbus") if k in infra])
+    terminate([infra[k] for k in ("server",) if k in infra])                  # server last
+    leftover = marked_pids(s["id"])
+    terminate(leftover, grace=1.0)
+    assert w.dir.parent == WS_ROOT and w.dir.name == w.name
+    shutil.rmtree(w.dir, ignore_errors=True)
+    if not keep_files:
+        assert w.files.parent == CACHE / "ws" and w.files.name == w.name
+        shutil.rmtree(w.files, ignore_errors=True)
+    log_event(f"close {w.name} display={s['display']} reason={reason}")
+
+
+def gc():
+    """Close dead, idle and orphaned workspaces. Returns the number still live."""
+    live = 0
+    with Lock(RUNTIME / "lock"):
+        for w in all_workspaces():
+            try:
+                s = w.state
+            except Fail:
+                continue
+            reason = None
+            if not w.server_alive():
+                reason = "server-exited"
+            elif s.get("idle_timeout") and now() - w.last_used() > s["idle_timeout"]:
+                reason = "idle"
+            elif s.get("owner_pid") and not alive(s["owner_pid"], s.get("owner_start")):
+                reason = "owner-exited"
+            if reason:
+                close_ws(w, reason)
+            else:
+                live += 1
+    return live
+
+
+def spawn_reaper():
+    subprocess.Popen([sys.executable, os.path.abspath(__file__), "_reaper"],
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True, close_fds=True)
+
+
+def pick_display():
+    for n in DISPLAYS:
+        if not os.path.exists(f"/tmp/.X{n}-lock") and not os.path.exists(f"/tmp/.X11-unix/X{n}"):
+            return n
+    raise Fail("no free display in :100-:199", EXIT_REFUSED)
+
+
+def openbox_rc(path, maximize):
+    try:
+        rc = Path("/etc/xdg/openbox/rc.xml").read_text()
+    except OSError:
+        return None
+    rc = re.sub(r"<number>\d+</number>", "<number>1</number>", rc, count=1)
+    if maximize:
+        rc = rc.replace("<applications>", '<applications>\n<application class="*">'
+                        "<decor>no</decor><maximized>true</maximized></application>", 1)
+    path.write_text(rc)
+    return path
+
+
+def default_label():
+    pane = os.environ.get("TMUX_PANE")
+    if pane and shutil.which("tmux"):
+        try:
+            r = subprocess.run(["tmux", "display", "-p", "-t", pane, "#{@pane-label}"],
+                               capture_output=True, text=True, timeout=3)
+            if r.stdout.strip():
+                return r.stdout.strip()
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return os.path.basename(os.getcwd())
+
+
+def wait_for(pred, timeout, step=0.05):
+    deadline = now() + timeout
+    while now() < deadline:
+        if pred():
+            return True
+        time.sleep(step)
+    return pred()
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_new(a):
+    creator = creator_identity()
+    gc()
+    for tool in ("Xvnc", "openbox", "dbus-daemon", "xauth", "xdotool"):
+        if not shutil.which(tool):
+            raise Fail(f"missing {tool}; see REPORT.md install section")
+    m = re.match(r"^(\d{3,4})x(\d{3,4})$", a.geometry)
+    if not m:
+        raise Fail("--geometry must be WIDTHxHEIGHT, e.g. 1280x800", EXIT_USAGE)
+    with Lock(RUNTIME / "lock"):
+        live = all_workspaces()
+        if len(live) >= MAX_WS:
+            raise Fail(f"refused: {len(live)} workspaces live, cap {MAX_WS} "
+                       f"({', '.join(w.name for w in live)})", EXIT_REFUSED)
+        ram_guard()
+        name = a.name or f"ws-{secrets.token_hex(2)}"
+        w = Workspace(name)
+        if w.exists() or w.dir.exists():
+            raise Fail(f"workspace {name} already exists", EXIT_USAGE)
+        n = pick_display()
+        ws_id = secrets.token_hex(8)
+        w.dir.mkdir(parents=True, mode=0o700)
+        (w.dir / "run").mkdir(mode=0o700)
+        (w.dir / "touch").touch()
+        logs = w.files / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        (w.files / "shots").mkdir(exist_ok=True)
+        xauth = w.dir / "Xauthority"
+        xauth.touch(mode=0o600)
+        subprocess.run(["xauth", "-q", "-f", str(xauth), "add", f":{n}", "MIT-MAGIC-COOKIE-1",
+                        secrets.token_hex(16)], check=True)
+        owner = None
+        if a.owner_pid == "auto":
+            owner = find_owner_session()
+        elif a.owner_pid not in ("none", "0"):
+            owner = int(a.owner_pid)
+            if not alive(owner):
+                raise Fail(f"--owner-pid {owner} is not running", EXIT_USAGE)
+        # Partial state first so env() works while starting.
+        w._state = {
+            "name": name, "id": ws_id, "display": n, "geometry": a.geometry,
+            "label": a.label or default_label(), "created": now(),
+            "creator": creator,
+            "idle_timeout": int(a.idle * 60), "owner_pid": owner,
+            "owner_start": proc_start(owner) if owner else None,
+            "owner_comm": comm(owner) if owner else None,
+            "share_home": a.share_home, "audio": a.audio, "glx": a.glx,
+            "a11y": getattr(a, "a11y", False),
+            "pids": {}, "starts": {},
+        }
+        env = w.env()
+        sock = w.dir / "vnc.sock"
+        server = [
+            "Xvnc", f":{n}", "-geometry", a.geometry, "-depth", "24", "-dpi", "96",
+            "-auth", str(xauth), "-nolisten", "tcp", "-rfbport", "-1",
+            "-rfbunixpath", str(sock), "-rfbunixmode", "0600", "-SecurityTypes", "None",
+            "-AlwaysShared", "-AcceptSetDesktopSize=0",
+            "-desktop", f"agent:{name} ({w._state['label']})",
+        ]
+        if not a.glx:
+            server += ["-extension", "GLX"]
+        procs = {}
+        try:
+            procs["server"] = subprocess.Popen(
+                server, env=env, stdin=subprocess.DEVNULL, stdout=open(logs / "server.log", "w"),
+                stderr=subprocess.STDOUT, start_new_session=True)
+            ok = wait_for(lambda: os.path.exists(f"/tmp/.X11-unix/X{n}") and sock.exists()
+                          and procs["server"].poll() is None, 10)
+            if not ok:
+                raise Fail("Xvnc did not start: " + (logs / "server.log").read_text()[-600:])
+            procs["dbus"] = subprocess.Popen(
+                ["dbus-daemon", "--session", "--nofork", "--nopidfile",
+                 f"--address=unix:path={w.dir / 'bus'}"],
+                env=env, stdin=subprocess.DEVNULL, stdout=open(logs / "dbus.log", "w"),
+                stderr=subprocess.STDOUT, start_new_session=True)
+            ob = ["openbox"]
+            rc = openbox_rc(w.dir / "openbox-rc.xml", a.maximize)
+            if rc:
+                ob += ["--config-file", str(rc)]
+            procs["wm"] = subprocess.Popen(
+                ob, env=env, stdin=subprocess.DEVNULL, stdout=open(logs / "wm.log", "w"),
+                stderr=subprocess.STDOUT, start_new_session=True)
+            wait_for(lambda: (w.dir / "bus").exists(), 5)
+            # openbox is ready once it owns the EWMH check window
+            wait_for(lambda: subprocess.run(
+                ["xprop", "-root", "_NET_SUPPORTING_WM_CHECK"], env=env,
+                capture_output=True, text=True).stdout.find("window id") >= 0, 5, 0.1)
+        except BaseException:
+            for p in procs.values():
+                p.kill()
+            shutil.rmtree(w.dir, ignore_errors=True)
+            shutil.rmtree(w.files, ignore_errors=True)
+            raise
+        for k, p in procs.items():
+            w._state["pids"][k] = p.pid
+            w._state["starts"][k] = proc_start(p.pid)
+        tmp = w.dir / "state.json.tmp"
+        tmp.write_text(json.dumps(w._state, indent=1))
+        tmp.rename(w.dir / "state.json")
+    log_event(f"new {name} display=:{n} owner={owner} label={w._state['label']!r}")
+    spawn_reaper()
+    notify_owner(f"Agent desktop {name} started",
+                 f"{w._state['owner_comm'] or 'agent'}: {w._state['label']} (display :{n})")
+    out = {"name": name, "display": f":{n}", "geometry": a.geometry,
+           "idle_timeout_min": a.idle, "owner_pid": owner, "files": str(w.files)}
+    if a.json:
+        print(json.dumps(out))
+    else:
+        print(name)
+        print(f"# display :{n}  {a.geometry}  owner-pid={owner}  idle-close={a.idle:g}m  "
+              f"files={w.files}", file=sys.stderr)
+
+
+def ws_info(w):
+    s = w.state
+    pids = marked_pids(s["id"])
+    infra = set(s["pids"].values())
+    return {
+        "name": w.name, "display": f":{s['display']}", "label": s.get("label"),
+        "geometry": s["geometry"], "age_s": int(now() - s["created"]),
+        "idle_s": int(now() - w.last_used()),
+        "idle_timeout_s": s.get("idle_timeout"), "owner_pid": s.get("owner_pid"),
+        "creator": s.get("creator"),
+        "owner_comm": s.get("owner_comm"),
+        "apps": len([p for p in pids if p not in infra]),
+        "pss_mib": round(sum(pss_kib(p) for p in pids) / 1024, 1),
+        "vnc_socket": str(w.dir / "vnc.sock"), "files": str(w.files),
+    }
+
+
+def cmd_list(a):
+    gc()
+    rows = [ws_info(w) for w in all_workspaces()]
+    if a.json:
+        print(json.dumps(rows))
+        return
+    if not rows:
+        print("no agent workspaces")
+        return
+    print(f"{'NAME':<16} {'DISPLAY':<8} {'AGE':>6} {'IDLE':>6} {'APPS':>4} {'PSS':>7}  LABEL")
+    for r in rows:
+        print(f"{r['name']:<16} {r['display']:<8} {fmt_age(r['age_s']):>6} {fmt_age(r['idle_s']):>6} "
+              f"{r['apps']:>4} {r['pss_mib']:>5.0f}Mi  {r['label']}")
+
+
+def get_ws(name):
+    w = Workspace(name)
+    w.state
+    if not w.server_alive():
+        gc()
+        raise Fail(f"workspace {name} has exited", EXIT_USAGE)
+    return w
+
+
+def cmd_info(a):
+    w = get_ws(a.ws)
+    info = ws_info(w)
+    loc = w.x("xdotool", "getmouselocation", "--shell", check=False)
+    info["mouse"] = dict(l.split("=", 1) for l in loc.split() if "=" in l)
+    print(json.dumps(info, indent=1))
+
+
+def cmd_env(a):
+    w = get_ws(a.ws)
+    env = w.env()
+    keys = ["AGENT_DESKTOP_RUNTIME", "AGENT_DESKTOP_CACHE", "DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR", "AGENT_DESKTOP",
+            "AGENT_DESKTOP_ID", "NO_AT_BRIDGE", "GTK_MODULES", "GDK_BACKEND", "QT_QPA_PLATFORM", "PULSE_SERVER",
+            "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "DISABLE_AUTOUPDATER"]
+    for k in keys:
+        if k in env:
+            print(f"export {k}={shlex.quote(env[k])}")
+    print("unset WAYLAND_DISPLAY SESSION_MANAGER TMUX TMUX_PANE AT_SPI_BUS_ADDRESS")
+
+
+def cmd_run(a):
+    w = get_ws(a.ws)
+    if not a.cmd:
+        raise Fail("usage: agent-desktop run WS [--wait] -- COMMAND [ARGS...]", EXIT_USAGE)
+    cmd = a.cmd
+    ram_guard(a.force)
+    w.touch()
+    log = w.files / "logs" / f"run-{int(now() * 1000)}.log"
+    env = w.env()
+    for k in ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"):
+        if k in env:
+            os.makedirs(env[k], exist_ok=True)
+    try:
+        p = subprocess.Popen(cmd, env=env, cwd=a.cwd or None, stdin=subprocess.DEVNULL,
+                             stdout=open(log, "w"), stderr=subprocess.STDOUT,
+                             start_new_session=True)
+    except OSError as e:
+        raise Fail(f"cannot start {cmd[0]}: {e}")
+    if not a.wait:
+        print(json.dumps({"pid": p.pid, "program": Path(cmd[0]).name, "log": str(log)}))
+        return
+    try:
+        rc = p.wait(timeout=a.timeout)
+    except subprocess.TimeoutExpired:
+        print(json.dumps({"pid": p.pid, "log": str(log), "timeout": True}))
+        raise Fail(f"still running after {a.timeout}s (pid {p.pid} left running)", EXIT_TIMEOUT)
+    sys.stdout.write(log.read_text(errors="replace"))
+    w.touch()
+    sys.exit(rc)
+
+
+def cmd_screenshot(a):
+    w = get_ws(a.ws)
+    try:
+        from PIL import ImageGrab
+    except ImportError:
+        raise Fail("python3-pil is required for screenshots")
+    os.environ["XAUTHORITY"] = str(w.dir / "Xauthority")
+    w.touch()
+    img = ImageGrab.grab(xdisplay=w.display)
+    box = None
+    if a.window:
+        geo = w.x("xdotool", "getwindowgeometry", "--shell", a.window)
+        g = dict(l.split("=", 1) for l in geo.split() if "=" in l)
+        x, y, wd, ht = int(g["X"]), int(g["Y"]), int(g["WIDTH"]), int(g["HEIGHT"])
+        box = (x, y, x + wd, y + ht)
+    elif a.region:
+        x, y, wd, ht = (int(v) for v in a.region.split(","))
+        box = (x, y, x + wd, y + ht)
+    if box:
+        img = img.crop(box)
+    if a.scale and a.scale != 1:
+        img = img.resize((max(1, int(img.width * a.scale)), max(1, int(img.height * a.scale))))
+    out = Path(a.output) if a.output else w.files / "shots" / time.strftime(f"%H%M%S-{int(now()*1000)%1000:03d}.png")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    img.convert("RGB").save(out, "PNG", optimize=False, compress_level=1)
+    print(out.resolve())
+
+
+def cmd_native(a):
+    from agent_desktop_native import run_cli
+    run_cli(a, get_ws(a.ws), Fail)
+
+
+def cmd_browser(a):
+    from agent_desktop_browser import run_cli
+    run_cli(a, get_ws(a.ws), Fail, cmd_run)
+
+
+def cmd_batch(a):
+    from agent_desktop_fast import run_cli
+    run_cli(a, get_ws(a.ws), Fail, cmd_screenshot, cmd_wait, cmd_focus)
+
+
+def cmd_click(a):
+    w = get_ws(a.ws)
+    args = ["xdotool", "mousemove"]
+    if a.window:
+        args += ["--window", a.window]
+    args += [str(a.x), str(a.y), "click"]
+    if a.double:
+        args += ["--repeat", "2", "--delay", "80"]
+    args.append(str(a.button))
+    w.x(*args)
+
+
+def cmd_move(a):
+    w = get_ws(a.ws)
+    w.x("xdotool", "mousemove", str(a.x), str(a.y))
+
+
+def cmd_drag(a):
+    w = get_ws(a.ws)
+    b = str(a.button)
+    w.x("xdotool", "mousemove", str(a.x1), str(a.y1), "mousedown", b, "sleep", "0.1",
+        "mousemove", str(a.x2), str(a.y2), "sleep", "0.1", "mouseup", b)
+
+
+def cmd_scroll(a):
+    w = get_ws(a.ws)
+    button = {"up": "4", "down": "5", "left": "6", "right": "7"}[a.direction]
+    args = ["xdotool"]
+    if a.at:
+        args += ["mousemove", str(a.at[0]), str(a.at[1])]
+    args += ["click", "--repeat", str(a.amount), "--delay", "30", button]
+    w.x(*args)
+
+
+def cmd_type(a):
+    w = get_ws(a.ws)
+    text = sys.stdin.read() if a.stdin else a.text
+    if text is None:
+        raise Fail("give TEXT or --stdin", EXIT_USAGE)
+    # Characters outside the keymap make xdotool remap a spare keycode per character; at
+    # short delays the client reads the keymap after it is restored and drops the character.
+    for seg in re.findall(r"[\x20-\x7e\t\n]+|[^\x20-\x7e\t\n]+", text):
+        delay = a.delay if seg.isascii() else max(a.delay, 80)
+        w.x("xdotool", "type", "--clearmodifiers", "--delay", str(delay), "--", seg,
+            timeout=max(30, len(seg) * delay / 1000 + 10))
+
+
+def cmd_key(a):
+    w = get_ws(a.ws)
+    w.x("xdotool", "key", "--clearmodifiers", "--delay", "40", "--", *a.keys)
+
+
+def list_windows(w):
+    out = w.x("wmctrl", "-lGpx", check=False)
+    rows = []
+    for line in out.splitlines():
+        parts = line.split(None, 9)
+        if len(parts) < 9:
+            continue
+        rows.append({"id": parts[0], "desktop": int(parts[1]), "pid": int(parts[2]),
+                     "x": int(parts[3]), "y": int(parts[4]), "w": int(parts[5]), "h": int(parts[6]),
+                     "class": parts[7], "title": parts[9] if len(parts) > 9 else ""})
+    return rows
+
+
+def cmd_windows(a):
+    w = get_ws(a.ws)
+    rows = list_windows(w)
+    if a.json:
+        print(json.dumps(rows))
+        return
+    for r in rows:
+        print(f"{r['id']}  {r['x']},{r['y']} {r['w']}x{r['h']}  pid={r['pid']}  {r['class']}  {r['title']}")
+
+
+def search_args(a):
+    if a.name:
+        return ["--name", a.name]
+    if a.cls:
+        return ["--class", a.cls]
+    if a.pid:
+        return ["--pid", str(a.pid)]
+    raise Fail("give --name, --class or --pid", EXIT_USAGE)
+
+
+def cmd_wait(a):
+    w = get_ws(a.ws)
+    crit = search_args(a)
+    deadline = now() + a.timeout
+    while True:
+        out = w.x("xdotool", "search", "--onlyvisible", *crit, check=False).split()
+        if out:
+            wid = out[-1]
+            print(f"{wid} 0x{int(wid):08x}")
+            return
+        if now() >= deadline:
+            raise Fail(f"no visible window matching {' '.join(crit)} after {a.timeout}s", EXIT_TIMEOUT)
+        time.sleep(0.2)
+
+
+def cmd_focus(a):
+    w = get_ws(a.ws)
+    wid = a.window
+    if not wid:
+        out = w.x("xdotool", "search", "--onlyvisible", *search_args(a), check=False).split()
+        if not out:
+            raise Fail("no matching window", EXIT_USAGE)
+        wid = out[-1]
+    r = subprocess.run(["xdotool", "windowactivate", "--sync", wid], env=w.env(),
+                       capture_output=True, text=True, timeout=10)
+    if r.returncode != 0:
+        w.x("xdotool", "windowfocus", "--sync", wid)
+    print(wid)
+
+
+def cmd_view(a):
+    w = get_ws(a.ws)
+    if not a.owner:
+        print("view opens a window on the owner's desktop; agents must not run it.\n"
+              "Owner: use the panel menu, or run:\n"
+              f"  agent-desktop view {w.name} --owner", file=sys.stderr)
+        sys.exit(EXIT_USAGE)
+    viewer = shutil.which("vncviewer") or shutil.which("xtigervncviewer")
+    if not viewer:
+        raise Fail("vncviewer missing: sudo apt-get install tigervnc-viewer")
+    env = dict(os.environ)
+    if a.display:
+        env["DISPLAY"] = a.display
+    args = [viewer, "-Shared", "-RemoteResize=0", "-DotWhenNoCursor=1"]
+    if not a.control:
+        args.append("-ViewOnly")
+    args.append(str(w.dir / "vnc.sock"))
+    log = w.files / "logs" / "viewer.log"
+    p = subprocess.Popen(args, env=env, stdin=subprocess.DEVNULL, stdout=open(log, "a"),
+                         stderr=subprocess.STDOUT, start_new_session=True)
+    with open(w.dir / "viewers", "a") as f:
+        f.write(f"{p.pid} {proc_start(p.pid)}\n")
+    print(json.dumps({"viewer_pid": p.pid, "control": a.control}))
+
+
+def cmd_close(a):
+    if a.all and a.ws:
+        raise Fail("give workspace names or --all, not both", EXIT_USAGE)
+    if not a.all and not a.ws:
+        raise Fail("give workspace names or --all", EXIT_USAGE)
+    creator = creator_identity()
+    rc = 0
+    with Lock(RUNTIME / "lock"):
+        names = ([w.name for w in all_workspaces() if created_by(w, creator)]
+                 if a.all else a.ws)
+        for n in names:
+            w = Workspace(n)
+            if not w.exists():
+                print(f"no such workspace: {n}", file=sys.stderr)
+                rc = max(rc, EXIT_USAGE)
+                continue
+            if not created_by(w, creator):
+                print(f"refused: {n} was not created by this agent session "
+                      "(or has no verifiable creator)", file=sys.stderr)
+                rc = EXIT_REFUSED
+                continue
+            close_ws(w, "close", keep_files=a.keep_files)
+            print(f"closed {n}")
+    sys.exit(rc)
+
+
+def cmd_gc(a):
+    print(f"{gc()} live")
+
+
+def cmd_reaper(a):
+    RUNTIME.mkdir(parents=True, exist_ok=True, mode=0o700)
+    f = open(RUNTIME / "reaper.lock", "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return
+    (RUNTIME / "reaper.pid").write_text(str(os.getpid()))
+    empty_since = None
+    while True:
+        try:
+            live = gc()
+        except Exception as e:  # keep reaping; record the fault
+            log_event(f"reaper error: {e!r}")
+            live = 1
+        if live == 0:
+            empty_since = empty_since or now()
+            if now() - empty_since > 30:
+                return
+        else:
+            empty_since = None
+        time.sleep(REAPER_PERIOD)
+
+
+# ---------------------------------------------------------------- main
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="agent-desktop", description=__doc__.split("\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("new", help="create a workspace; prints its name")
+    p.add_argument("--name")
+    p.add_argument("--label", help="shown to the owner in the panel menu")
+    p.add_argument("--geometry", default="1280x800")
+    p.add_argument("--idle", type=float, default=DEFAULT_IDLE_MIN,
+                   help="close after this many idle minutes; 0 disables (default %(default)s)")
+    p.add_argument("--owner-pid", default="auto",
+                   help="close when this pid exits; 'auto' = nearest claude/codex/p1 ancestor; 'none'")
+    p.add_argument("--maximize", action="store_true", help="maximize every window, no decorations")
+    p.add_argument("--share-home", action="store_true",
+                   help="use the owner's XDG config/data dirs instead of private ones")
+    p.add_argument("--a11y", action="store_true", help="enable private native accessibility controls")
+    p.add_argument("--audio", action="store_true", help="allow sound on the owner's speakers")
+    p.add_argument("--glx", action="store_true", help="enable server GLX (+~45 MiB)")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_new)
+
+    p = sub.add_parser("list", help="list live workspaces")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_list)
+
+    p = sub.add_parser("info", help="workspace details as JSON")
+    p.add_argument("ws")
+    p.set_defaults(fn=cmd_info)
+
+    p = sub.add_parser("env", help="print shell exports for using X tools directly")
+    p.add_argument("ws")
+    p.set_defaults(fn=cmd_env)
+
+    p = sub.add_parser("run", help="launch a program inside the workspace")
+    p.add_argument("ws")
+    p.add_argument("--wait", action="store_true", help="wait, print output, exit with its code")
+    p.add_argument("--timeout", type=float, help="with --wait: give up waiting after N seconds")
+    p.add_argument("--cwd")
+    p.add_argument("--force", action="store_true", help="skip the RAM guard (tiny programs only)")
+    p.add_argument("cmd", nargs="*", help="after --: the program and its arguments")
+    p.set_defaults(fn=cmd_run)
+
+    p = sub.add_parser("screenshot", help="save a PNG and print its path")
+    p.add_argument("ws")
+    p.add_argument("-o", "--output")
+    p.add_argument("--window", help="crop to this window id")
+    p.add_argument("--region", help="crop to X,Y,W,H")
+    p.add_argument("--scale", type=float, help="resize factor, e.g. 0.5")
+    p.set_defaults(fn=cmd_screenshot)
+
+    p = sub.add_parser("native", help="persistent native accessibility observations and controls")
+    p.add_argument("ws")
+    p.add_argument("actions", nargs="?", help="JSON operations; default stdin")
+    p.set_defaults(fn=cmd_native)
+
+    p = sub.add_parser("browser", help="structured private-browser observations and input")
+    p.add_argument("ws")
+    p.add_argument("actions", nargs="?", help="JSON operations; default stdin")
+    p.add_argument("--start", action="store_true", help="launch a dedicated private browser")
+    p.add_argument("--url", help="initial URL with --start")
+    p.add_argument("--app", choices=("browser", "signal"), default="browser", help="dedicated Chromium browser or Signal desktop")
+    p.set_defaults(fn=cmd_browser)
+
+    for command in ("batch", "session"):
+        p = sub.add_parser(command, help="fast native action batch" if command == "batch"
+                           else "persistent JSON-lines action runner; EOF closes runner")
+        p.add_argument("ws")
+        if command == "batch":
+            p.add_argument("actions", nargs="?", help="JSON action array; default: stdin")
+        p.add_argument("--no-screenshot", action="store_true")
+        p.add_argument("-o", "--output")
+        p.add_argument("--region")
+        p.add_argument("--scale", type=float)
+        p.set_defaults(fn=cmd_batch, session=(command == "session"), window=None)
+
+    p = sub.add_parser("paste", help="paste UTF-8 text using the workspace clipboard")
+    p.add_argument("ws")
+    p.add_argument("text", nargs="?")
+    p.add_argument("--stdin", action="store_true")
+    p.add_argument("--key", default="ctrl+v", help="paste shortcut; terminals: ctrl+shift+v")
+    p.set_defaults(fn=cmd_batch, session=False, paste=True, no_screenshot=True,
+                   output=None, region=None, scale=None, window=None)
+
+    p = sub.add_parser("click", help="click at X Y")
+    p.add_argument("ws")
+    p.add_argument("x", type=int)
+    p.add_argument("y", type=int)
+    p.add_argument("--button", type=int, default=1, help="1 left, 2 middle, 3 right")
+    p.add_argument("--double", action="store_true")
+    p.add_argument("--window", help="coordinates relative to this window id")
+    p.set_defaults(fn=cmd_click)
+
+    p = sub.add_parser("move", help="move the pointer to X Y")
+    p.add_argument("ws")
+    p.add_argument("x", type=int)
+    p.add_argument("y", type=int)
+    p.set_defaults(fn=cmd_move)
+
+    p = sub.add_parser("drag", help="drag from X1 Y1 to X2 Y2")
+    p.add_argument("ws")
+    for k in ("x1", "y1", "x2", "y2"):
+        p.add_argument(k, type=int)
+    p.add_argument("--button", type=int, default=1)
+    p.set_defaults(fn=cmd_drag)
+
+    p = sub.add_parser("scroll", help="scroll up|down|left|right")
+    p.add_argument("ws")
+    p.add_argument("direction", choices=["up", "down", "left", "right"])
+    p.add_argument("amount", type=int, nargs="?", default=3)
+    p.add_argument("--at", type=int, nargs=2, metavar=("X", "Y"))
+    p.set_defaults(fn=cmd_scroll)
+
+    p = sub.add_parser("type", help="type text into the focused window")
+    p.add_argument("ws")
+    p.add_argument("text", nargs="?")
+    p.add_argument("--stdin", action="store_true", help="read the text from stdin")
+    p.add_argument("--delay", type=int, default=12, help="ms between keystrokes")
+    p.set_defaults(fn=cmd_type)
+
+    p = sub.add_parser("key", help="press keys, xdotool syntax: ctrl+l Return")
+    p.add_argument("ws")
+    p.add_argument("keys", nargs="+")
+    p.set_defaults(fn=cmd_key)
+
+    p = sub.add_parser("windows", help="list windows")
+    p.add_argument("ws")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_windows)
+
+    for nm, fn, hlp in (("wait", cmd_wait, "wait for a visible window; prints its id"),
+                        ("focus", cmd_focus, "raise and focus a window")):
+        p = sub.add_parser(nm, help=hlp)
+        p.add_argument("ws")
+        if nm == "focus":
+            p.add_argument("window", nargs="?")
+        p.add_argument("--name", help="title regex")
+        p.add_argument("--class", dest="cls", help="WM_CLASS regex")
+        p.add_argument("--pid", type=int)
+        if nm == "wait":
+            p.add_argument("--timeout", type=float, default=30)
+        p.set_defaults(fn=fn)
+
+    p = sub.add_parser("view", help="(owner) open a VNC viewer on the owner's desktop")
+    p.add_argument("ws")
+    p.add_argument("--owner", action="store_true", help="confirm the owner asked for the window")
+    p.add_argument("--control", action="store_true", help="allow the viewer to send input")
+    p.add_argument("--display", help="viewer display (default: $DISPLAY)")
+    p.set_defaults(fn=cmd_view)
+
+    p = sub.add_parser("close", help="close only workspaces created by this agent session")
+    p.add_argument("ws", nargs="*")
+    p.add_argument("--all", action="store_true", help="close all workspaces created by this session")
+    p.add_argument("--keep-files", action="store_true", help="keep screenshots and logs")
+    p.set_defaults(fn=cmd_close)
+
+    p = sub.add_parser("gc", help="close dead, idle and orphaned workspaces")
+    p.set_defaults(fn=cmd_gc)
+
+    p = sub.add_parser("_reaper")
+    p.set_defaults(fn=cmd_reaper)
+
+    argv = list(sys.argv[1:] if argv is None else argv)
+    cmd = None
+    if argv and argv[0] == "run" and "--" in argv:  # the program's own options stay untouched
+        i = argv.index("--")
+        argv, cmd = argv[:i], argv[i + 1:]
+    if argv and argv[0] in sub.choices:
+        # intermixed: options may follow optional positionals (type WS --delay 50 TEXT)
+        a = sub.choices[argv[0]].parse_intermixed_args(argv[1:])
+    else:
+        a = ap.parse_args(argv)
+    if cmd is not None:
+        a.cmd = cmd
+    try:
+        a.fn(a)
+    except Fail as e:
+        print(f"agent-desktop: {e}", file=sys.stderr)
+        sys.exit(e.code)
+    except subprocess.TimeoutExpired as e:
+        print(f"agent-desktop: timed out: {e}", file=sys.stderr)
+        sys.exit(EXIT_TIMEOUT)
+
+
+if __name__ == "__main__":
+    main()

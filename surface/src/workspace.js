@@ -6,12 +6,18 @@
 import { execFileSync } from 'node:child_process';
 import { accessSync, constants } from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { CuaError } from './errors.js';
 
-// MCP clients may start servers with a reduced PATH (Codex does), so the
-// installed location is tried when agent-desktop is not on it.
-function agentDesktop(env) {
+// Prefer the bundled controller so desktop and surface versions stay together.
+// Standalone surface installations can still use an installed controller.
+export function agentDesktop(env) {
   if (env.CUA_AGENT_DESKTOP) return env.CUA_AGENT_DESKTOP;
+  const bundled = fileURLToPath(new URL('../../desktop/bin/agent-desktop', import.meta.url));
+  try {
+    accessSync(bundled, constants.X_OK);
+    return bundled;
+  } catch {}
   const dirs = [...String(env.PATH || '').split(':').filter(Boolean), ...(env.HOME ? [path.join(env.HOME, '.local', 'bin')] : [])];
   for (const d of dirs) {
     const p = path.join(d, 'agent-desktop');
