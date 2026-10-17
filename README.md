@@ -51,6 +51,31 @@ CUA_DISPLAY=:0 linux-cua --live-desktop --allow-app gnome-calculator [--allow-ap
 - The per-app approval, deny lists and hard denies still apply. The AT-SPI bus check is unchanged: the owner's default session and accessibility buses are refused, so semantic actions work only for apps started on a private bus (as the demo bridge does); coordinate input and capture work either way.
 - The former `CUA_AUTHORIZED_WINDOW_IDS`/`CUA_AUTHORIZED_PID` variables are rejected at startup.
 
+## Merged with agent-desktop
+
+This tree is the merge of linux-cua and the workstation's agent-desktop controllers (`~/projects/agent-desktop`, unchanged and still used for its workspaces):
+
+| From | What |
+|---|---|
+| linux-cua | Rust X11/AT-SPI engine with an event-maintained tree mirror; MCP `js` REPL in the shape of OpenAI's `cua` API; per-app approval, frame checks and fail-closed text entry; diffs; provider adapters |
+| agent-desktop | private workspaces (`CUA_WORKSPACE=new` creates one owned by the server); CDP browser control (`cua.getBrowser()`: AX snapshot, `setValue` with exact readback, click with scroll-into-view and occlusion check, `waitFor`, `read`, `goto`); locate-and-act in one request (`{role, name, text, states}` locators wherever an element ID is accepted, `app.find`) |
+| new in the merge | settle that waits for the app's CPU after shortcuts and button clicks (a dialog the shortcut opens is ready for the next action of the cell); `getApp("Brave-browser")` returns the CDP tab when a browser is configured; one-time hint showing how to fill a dialog in the cell that opens it |
+
+Measured with `benchmarks/run.mjs` (fresh private desktop per run, outcome verified from disk, GPT-6.1 Sol through `codex exec`, Opus 5.5 through `claude -p`, both at low effort, 3 runs per cell unless noted; median wall seconds, all runs passed). agent-desktop ran as a shell controller with its skill documentation (`--controller agent-desktop`); its native and paint rows ran earlier the same day (label `eval-ad`), all other rows interleaved (label `eval4`):
+
+| task | model | agent-desktop | linux-cua 5201954 | merged e81dc9d |
+|---|---|---|---|---|
+| reimburse (Calculator, Xed, Thunar) | GPT | 60.7 | 56.8 | 53.7 |
+| reimburse | Opus | 64.8 | 64.0 | 36.1 |
+| xed-note | GPT | 34.2 | 27.2 | 24.7 |
+| xed-note | Opus | 41.6 | 24.0 | 21.3 |
+| webform (local web app, Brave) | GPT | 28.6 | 38.7 | 28.2 |
+| webform | Opus | 42.5 | 30.5 (n=9) | 23.0 (n=9) |
+| paint (GNOME Drawing) | GPT | 112.6 | 36.1 (n=9) | 32.8 (n=9) |
+| paint | Opus | 42.3 | 38.2 | 27.9 |
+
+Run-to-run spread is large (one merged paint run took 77.9 s); medians of 3 runs differ by several seconds between rounds. GPT's `service_tier="fast"` (Codex `-c service_tier="fast"`) cut reimburse from 48.1 to 38.4 s median over 3 interleaved pairs (2.2-2.3 s per model turn instead of 2.5-3.5 s); its effect on subscription usage was not measured.
+
 ## One engine, three surfaces
 
 - **MCP JS:** persistent QuickJS/WASM context in a separate restricted process. `js {title,code,timeout_ms}`, `js_reset`, `turn_ended`. Top-level await and bindings persist. No model filesystem, shell, module loader, or network API.
