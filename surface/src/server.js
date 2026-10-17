@@ -6,6 +6,7 @@ import { CuaError, toCuaError } from './errors.js';
 import { HostApi, DEFAULT_CONFIRMATION_POLICY } from './host.js';
 import { toolInputSchema } from './protocol.js';
 import { SandboxRunner } from './sandbox/runner.js';
+import { BrowserHost } from './browser/browser.js';
 import { fenceUntrusted, resultContent } from './format.js';
 
 export const VERSION = '0.1.0';
@@ -50,6 +51,9 @@ function jsDescription(policyText) {
     '                                             // holds a click or pressKey; rightClick(id), doubleClick(id), moveMouse(target) hovers',
     '  await app.getScreenshot();                 // PNG bytes; shown to you automatically',
     '  const {state, screenshot} = await app.getAXStateAndScreenshot(); // one call for both',
+    '  const tab = await cua.getBrowser();        // the web page (over CDP) with its state; getAXState, find, click, setValue',
+    '                                             // (exact readback), typeText, pressKey, getScreenshot as for apps, plus',
+    '                                             // goto(url), waitFor({url} | {text} | {role, name}), read(id) -> {text, links}, url, title',
     '  await cua.clipboard.write(text); await cua.clipboard.read(); // the desktop clipboard; cua.help() prints this again',
     '  await app.drag({path: [[x,y], [x2,y2], [x3,y3], ...]}); // ONE continuous stroke through ALL points, left button held',
     'For canvas work, getApp and getScreenshot together in your first cell. Inspect the canvas, choose a tool',
@@ -128,7 +132,7 @@ export function formatCell(title, r) {
   return content;
 }
 
-export function createSurface({ engineOptions, engine, extensions = new Set(), policyText = DEFAULT_CONFIRMATION_POLICY, approvalsFile, toolTimeoutMs = 30_000, sandboxMemoryMb = 128, log = () => {} } = {}) {
+export function createSurface({ engineOptions, engine, extensions = new Set(), policyText = DEFAULT_CONFIRMATION_POLICY, approvalsFile, toolTimeoutMs = 30_000, sandboxMemoryMb = 128, browserCdp = process.env.CUA_BROWSER_CDP, log = () => {} } = {}) {
   const server = new Server(
     { name: 'linux-cua', version: VERSION },
     {
@@ -166,7 +170,8 @@ export function createSurface({ engineOptions, engine, extensions = new Set(), p
   };
 
   const host = new HostApi({ engine, engineOptions, elicit, extensions, policyText, approvalsFile, log });
-  const runner = new SandboxRunner({ host, memoryLimitMb: sandboxMemoryMb, log, help: jsDescription(policyText) });
+  const browser = new BrowserHost({ endpoint: browserCdp, log });
+  const runner = new SandboxRunner({ host, browser, memoryLimitMb: sandboxMemoryMb, log, help: jsDescription(policyText) });
   const methods = host.methods;
   // The sandbox process and the daemon start now, not inside the first call.
   runner.warm();
@@ -234,6 +239,7 @@ export function createSurface({ engineOptions, engine, extensions = new Set(), p
 
   const close = async () => {
     await runner.close();
+    browser.close();
     await host.close();
   };
   return { server, host, runner, close };

@@ -218,15 +218,13 @@ export function preludeSource() {
   const holdOf = (o) => o.durationMs ?? o.holdMs ?? o.duration_ms ?? o.hold_ms;
   const CLICK_OPTS = ['mouseButton', 'button', 'clickCount', ...MOD_OPTS, ...HOLD_OPTS];
 
-  // An App object for a window the host resolved ({window, app}).
-  const makeApp = (info) => {
-    const window_id = info.window.id;
-    // Matches of a locator in the app's current window, waiting up to waitMs
-    // for at least one.
+  // Locator lookup over fresh element lists from fetch() ({elements, partial}):
+  // findAll waits up to waitMs for at least one match; resolve needs exactly one.
+  const locate = (fetch, where) => {
     const findAll = async (loc, waitMs) => {
       const until = Date.now() + waitMs;
       for (;;) {
-        const r = await call('get_ax_state', { window_id, app: true }, 'elements');
+        const r = await fetch();
         const found = matchElements(r.elements, loc);
         if (found.length || Date.now() >= until) return { found, partial: r.partial };
         await nativeSleep(150);
@@ -236,10 +234,17 @@ export function preludeSource() {
       const { found, partial } = await findAll(loc, LOCATOR_WAIT_MS);
       if (found.length === 1) return found[0].id;
       if (found.length === 0) {
-        throw new CuaError('element_not_found', what + ': no element matches ' + describeLocator(loc) + ' in the app\\'s active window' + (partial ? ' (the observation was partial)' : ''));
+        throw new CuaError('element_not_found', what + ': no element matches ' + describeLocator(loc) + ' ' + where + (partial ? ' (the observation was partial)' : ''));
       }
       throw new CuaError('ambiguous_element', what + ': ' + found.length + ' elements match ' + describeLocator(loc) + ': ' + found.slice(0, 8).map(describeElement).join('; ') + (found.length > 8 ? '; …' : '') + '. Add role, name or text, or use an ID');
     };
+    return { findAll, resolve };
+  };
+
+  // An App object for a window the host resolved ({window, app}).
+  const makeApp = (info) => {
+    const window_id = info.window.id;
+    const { findAll, resolve } = locate(() => call('get_ax_state', { window_id, app: true }, 'elements'), 'in the app\\'s active window');
     const act = async (method, params) => {
       if (params.locator !== undefined) {
         const { locator, ...rest } = params;
@@ -398,6 +403,118 @@ export function preludeSource() {
     return app;
   };
 
+  // The browser tab (cua.getBrowser()): the App methods that make sense for a
+  // web page, over CDP. Element IDs are the page's node IDs from its state.
+  const makeTab = (tabInfo) => {
+    let meta = tabInfo || { url: '', title: '' };
+    const b = async (method, params, opts) => {
+      const r = await call(method, params || {}, 'browser', opts);
+      if (r && r.$tab !== undefined) {
+        if (r.$tab) meta = r.$tab;
+        return r.value === null ? undefined : r.value;
+      }
+      return r;
+    };
+    const { findAll, resolve } = locate(() => b('elements'), 'on the page');
+    const target = async (t, what) => {
+      const p = at(t, what);
+      if (p.locator === undefined) return p;
+      return { element_index: await resolve(p.locator, what) };
+    };
+    const tab = {
+      get url() { return meta.url; },
+      get title() { return meta.title; },
+      getAXState(o = {}) {
+        o = options(o, ['emit', 'query', 'disableDiffing'], 'getAXState');
+        if (o.query !== undefined && typeof o.query !== 'string') throw new CuaError('invalid_params', 'getAXState: query must be a string');
+        return b('observe', o.query !== undefined ? { query: o.query } : {}, { emit: o.emit !== false });
+      },
+      getScreenshot(o = {}) {
+        o = options(o, ['emit'], 'getScreenshot');
+        return call('screenshot', {}, 'browser', emitOpt(o));
+      },
+      async find(loc, o = {}) {
+        if (!isObj(loc) || !LOCATOR_KEYS.some((k) => loc[k] !== undefined)) throw new CuaError('invalid_params', 'find expects a locator such as {role: "button", name: "Save"}');
+        o = options(o, ['timeoutMs'], 'find');
+        return (await findAll(loc, Math.max(0, Number(o.timeoutMs) || 0))).found;
+      },
+      // click(id | [x, y] | {x, y} | {role, name}, {clickCount, mouseButton, modifiers}); scrolls the element into view first.
+      async click(t, o = {}) {
+        if (isObj(t) && isObj(o) && Object.keys(o).length === 0) o = pick(t, CLICK_OPTS);
+        o = options(o, ['mouseButton', 'button', 'clickCount', ...MOD_OPTS], 'click');
+        const p = await target(t, 'click');
+        const button = o.mouseButton !== undefined ? o.mouseButton : o.button;
+        if (button !== undefined && button !== 'left') p.button = button;
+        if (o.clickCount !== undefined && o.clickCount !== 1) p.click_count = o.clickCount;
+        const mods = modsOf(o, 'click');
+        if (mods) p.modifiers = mods;
+        return b('click', p);
+      },
+      doubleClick(t, o) { return tab.click(t, Object.assign({}, o || {}, { clickCount: 2 })); },
+      rightClick(t, o) { return tab.click(t, Object.assign({}, o || {}, { mouseButton: 'right' })); },
+      // setValue(id | locator, text): replaces the field's text and checks it reads back exactly; picks a <select> option by label.
+      async setValue(element, value) {
+        if (isObj(element) && value === undefined) {
+          value = element.value;
+          if (elementOf(element) !== undefined) element = elementOf(element);
+          else { const { value: _, ...loc } = element; element = loc; }
+        }
+        if (typeof value === 'number' || typeof value === 'boolean') value = String(value);
+        const p = await target(isLocator(element) ? element : { element }, 'setValue');
+        if (p.element_index === undefined) throw new CuaError('invalid_params', 'setValue: target must be an element ID or a locator');
+        return b('set_value', { element_index: p.element_index, value });
+      },
+      typeText(text) {
+        if (isObj(text)) text = text.text;
+        if (typeof text !== 'string') throw new CuaError('invalid_params', 'typeText(text) expects a string');
+        return b('type_text', { text });
+      },
+      pressKey(key) {
+        if (isObj(key)) key = key.key ?? key.keys;
+        return b('press_key', { key: keyName(key) });
+      },
+      // goto(url): http(s) or file URL; returns {url, title} once the document has loaded.
+      goto(url, o = {}) {
+        if (isObj(url)) { o = pick(url, ['timeoutMs']); url = url.url; }
+        o = options(o, ['timeoutMs'], 'goto');
+        return b('goto', o.timeoutMs !== undefined ? { url, timeout_ms: o.timeoutMs } : { url });
+      },
+      // waitFor({url}) (substring or RegExp, document loaded), waitFor({text}) or
+      // waitFor({role, name}); both kinds may combine. Returns the matches or {url, title}.
+      async waitFor(cond, o = {}) {
+        if (typeof cond === 'string' || cond instanceof RegExp) cond = { text: cond };
+        if (!isObj(cond)) throw new CuaError('invalid_params', 'waitFor expects {url}, {text} or {role, name}');
+        for (const k of Object.keys(cond)) if (![...LOCATOR_KEYS, 'url', 'timeoutMs'].includes(k)) throw new CuaError('invalid_params', 'waitFor: unknown key ' + k + ' (use url, text, role, name, states, timeoutMs)');
+        o = options(o, ['timeoutMs'], 'waitFor');
+        const timeout = Number(cond.timeoutMs ?? o.timeoutMs ?? 10000);
+        const loc = pick(cond, LOCATOR_KEYS);
+        const hasLoc = Object.keys(loc).length > 0;
+        if (!hasLoc && cond.url === undefined) throw new CuaError('invalid_params', 'waitFor expects {url}, {text} or {role, name}');
+        const urlOk = (u) => cond.url instanceof RegExp ? (cond.url.lastIndex = 0, cond.url.test(u)) : u.includes(String(cond.url));
+        const until = Date.now() + timeout;
+        for (;;) {
+          let info = null;
+          if (cond.url !== undefined) info = await b('info');
+          if (!info || (urlOk(info.url) && info.ready !== 'loading')) {
+            if (!hasLoc) return { url: info.url, title: info.title };
+            const found = matchElements((await b('elements')).elements, loc);
+            if (found.length) return found;
+          }
+          if (Date.now() >= until) throw new CuaError('timeout', 'waitFor: ' + describeLocator(pick(cond, [...LOCATOR_KEYS, 'url'])) + ' not reached within ' + timeout + ' ms');
+          await nativeSleep(150);
+        }
+      },
+      // read(id | locator, {row}): the element's rendered text and links ({row: true}: its list item or table row).
+      async read(t, o = {}) {
+        o = options(o, ['row', 'emit'], 'read');
+        const p = await target(isLocator(t) ? t : { element: t }, 'read');
+        if (p.element_index === undefined) throw new CuaError('invalid_params', 'read: target must be an element ID or a locator');
+        return b('read', o.row ? { element_index: p.element_index, row: true } : { element_index: p.element_index }, { emit: o.emit !== false });
+      },
+    };
+    return Object.freeze(tab);
+  };
+
   const cua = Object.create(null);
   cua.CuaError = CuaError;
   cua.listWindows = (o) => call('list_windows', {}, 'windows', emitOpt(options(o, ['emit'], 'listWindows')));
@@ -427,6 +544,13 @@ export function preludeSource() {
     if (typeof name !== 'string' || !name.trim()) throw new CuaError('invalid_params', 'launchApp(name) expects the application\\'s name or desktop entry ID');
     return makeApp(await call('launch_app', { app: name }, 'launch', emitOpt(o)));
   };
+  // The page tab of the configured browser, with its state (like getApp).
+  cua.getBrowser = async (o) => {
+    o = options(o, ['emit'], 'getBrowser');
+    const r = await call('open', {}, 'browser', emitOpt(o));
+    return makeTab(r && r.$tab);
+  };
+  cua.getTab = cua.getBrowser;
   // The desktop's clipboard (plain text).
   cua.clipboard = Object.freeze({
     write(text) {

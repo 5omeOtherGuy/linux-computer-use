@@ -17,7 +17,7 @@ import { fork } from 'node:child_process';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { CuaError, toCuaError } from '../errors.js';
-import { appInfos, fenceUntrusted, isScreenshot, windowInfo } from '../format.js';
+import { appInfos, compactTree, fenceUntrusted, isScreenshot, windowInfo } from '../format.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const SURFACE_ROOT = path.resolve(here, '..', '..');
@@ -28,17 +28,21 @@ const MAX_HELD_IMAGE_CHARS = 64_000_000;
 const MAX_CELL_IMAGES = 16;
 const STDERR_TAIL = 4000;
 const MAX_EMITTED_IMAGE_CHARS = 16_000_000;
-const VIEWS = ['windows', 'apps', 'state', 'getApp', 'ax', 'elements', 'screenshot', 'action', 'launch', 'clipboard'];
+const VIEWS = ['windows', 'apps', 'state', 'getApp', 'ax', 'elements', 'screenshot', 'action', 'launch', 'clipboard', 'browser'];
 // Actions whose target window depends on what the model last saw.
 const FRAMED = ['click', 'drag', 'scroll', 'type_text', 'paste', 'mouse_move'];
 const ACTIONS = ['click', 'drag', 'scroll', 'type_text', 'press_key', 'paste', 'set_value', 'perform_secondary_action', 'mouse_move'];
 const KILL_GRACE_MS = 1500;
+const DIALOG_HINT = 'hint: a dialog opened. Next time, fill and confirm a dialog in the cell that opens it, without a turn to read its IDs: '
+  + 'await app.pressKey("ctrl+shift+s"); await app.setValue({role: "text", states: ["focused"]}, "name.txt"); await app.click({role: "button", name: "Save"});';
 const CANCEL_GRACE_MS = 750;
 
 export class SandboxRunner {
   // `help`: the API description `cua.help()` prints again inside the VM.
-  constructor({ host, memoryLimitMb = 128, log = () => {}, help = '' }) {
+  // `browser`: the BrowserHost behind cua.getBrowser() (null: none configured).
+  constructor({ host, browser = null, memoryLimitMb = 128, log = () => {}, help = '' }) {
     this.host = host;
+    this.browser = browser;
     this.memoryLimitMb = memoryLimitMb;
     this.help = String(help);
     this.log = log;
@@ -271,7 +275,7 @@ export class SandboxRunner {
         this.#observed(obs);
         this.#sawWindow(obs?.window?.window_id, params.window_id);
         const query = typeof opts.query === 'string' && opts.query.trim() ? opts.query.trim() : null;
-        let text = query ? queryTree(obs.accessibility, query) : this.host.axView(obs, { diff: !opts.disableDiffing, commit: emit });
+        let text = query ? queryTree(compactTree(obs.accessibility), query) : this.host.axView(obs, { diff: !opts.disableDiffing, commit: emit });
         if (query && text.startsWith('# no element matches')) {
           // The query searches the observed tree, which may be partial.
           const cut = (obs.warnings || []).map(String).filter((w) => /truncat|not traversed|not fetched|showing \d|budget|unavailable/i.test(w));
@@ -365,6 +369,26 @@ export class SandboxRunner {
         }
         return undefined;
       }
+      case 'browser': {
+        // The browser tab (surface/src/browser): the host validates the
+        // request and returns fenced outputs; input marks the tab's state
+        // for the end of the cell, like an app action.
+        if (!this.browser) throw new CuaError('browser_unavailable', 'no browser is configured (CUA_BROWSER_CDP)');
+        const r = await this.browser.call(method, params, { signal: cell.controller.signal, deadline: cell.deadline, emit });
+        if (cell.finished) throw new CuaError('cell_finished', 'the cell finished before this call completed');
+        cell.calls.push(`browser.${method}`);
+        for (const text of r.outputs || []) this.#emitText(cell, text);
+        // A state already shown is not repeated as the cell's value.
+        if (r.outputs?.length && typeof r.value === 'string') cell.emitted.add(r.value);
+        if (r.acted) cell.browserPending = true;
+        else if (r.observed) cell.browserPending = false;
+        if (r.screenshot) {
+          const id = this.#storeImage(r.screenshot);
+          if (emit) cell.outputs.push({ type: 'image', id });
+          return { $bytes: r.screenshot.data, $image: id };
+        }
+        return { $tab: r.tab ?? null, value: r.value ?? null };
+      }
       default:
         throw new CuaError('invalid_params', 'unknown result view');
     }
@@ -423,6 +447,14 @@ export class SandboxRunner {
         if (cell.pending.observed === false) cell.pending = { ...cell.pending, accessibility: `(the state after the last action could not be observed: ${toCuaError(err).message})` };
       }
     }
+    if (cell.browserPending && !msg.reason && Date.now() < cell.deadline) {
+      try {
+        const r = await this.browser.call('observe', {}, { signal: cell.controller.signal, deadline: Math.min(cell.deadline, Date.now() + 5000), emit: true });
+        this.#emitText(cell, `browser state after the last action: ${r.outputs[0]}`);
+      } catch (err) {
+        this.#emitText(cell, `(the browser state after the last action could not be observed: ${toCuaError(err).message})`);
+      }
+    }
     this.#complete(cell, msg);
   }
 
@@ -441,6 +473,12 @@ export class SandboxRunner {
     if (cell.pending) {
       const obs = cell.pending;
       observation = { header: observationHeader(this.#visible(obs)), accessibility: this.host.axView(obs, { diff: true, shortest: true, commit: true }) };
+      // GPT ends a cell when a dialog opens and reads its element IDs in the
+      // next turn; once per session, show how the same cell can go on.
+      if (Number.isInteger(obs.window?.transient_for) && !this.hintsShown.has(DIALOG_HINT)) {
+        this.hintsShown.add(DIALOG_HINT);
+        observation.header += `\n${DIALOG_HINT}`;
+      }
       // The end-of-cell state is what the model sees next.
       this.#observed(obs);
       this.#sawWindow(obs.window?.window_id, obs.window?.window_id);
@@ -553,7 +591,6 @@ function observationHeader(obs) {
     const list = others.map((o) => `${o.window_id} ${JSON.stringify(String(o.title ?? '')).slice(0, 80)}`).join('; ');
     lines.push(`other windows of this app: ${fenceUntrusted('windows', list)}`);
   }
-  if (obs.timing) lines.push(`timing: settle_ms=${round(obs.timing.settle_ms)} observation_ms=${round(obs.timing.observation_ms)}`);
   if (Array.isArray(obs.warnings) && obs.warnings.length) lines.push(`warnings: ${fenceUntrusted('warnings', obs.warnings.map(String).join('\n'))}`);
   return lines.join('\n');
 }

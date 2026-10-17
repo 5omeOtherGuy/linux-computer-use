@@ -36,6 +36,7 @@ MCP client configuration (stdio):
 | `CUA_CONFIRMATION_POLICY` | Replaces the default confirmation-policy text shown in tool descriptions, server instructions and approval prompts. |
 | `CUA_TOOL_TIMEOUT_MS` | Timeout for discrete tools (default 30000). |
 | `CUA_SANDBOX_MEMORY_MB` | QuickJS heap limit (default 128). |
+| `CUA_BROWSER_CDP` | Debugging endpoint of a Chromium-family browser for `cua.getBrowser()`, e.g. `http://127.0.0.1:9333` (start it with `--remote-debugging-address=127.0.0.1 --remote-debugging-port=9333 --password-store=basic` and a disposable `--user-data-dir`). Only loopback endpoints are accepted. Unset: browser calls fail with `browser_unavailable`. |
 
 The daemon's stderr is forwarded to the server's stderr. stdout carries only MCP. The sandbox process (about 250 ms to fork Node and initialise QuickJS) and the daemon start when the server starts, so the first `js` cell does not pay for them.
 
@@ -76,6 +77,24 @@ console.log(...); display(png); await sleep(250);   // aliases and helpers
 
 Observation and discovery calls (`getAXState`, `getScreenshot`, `getAXStateAndScreenshot`, `cua.getState`, `getApp`, `listApps`, `listWindows`) add their result to the cell output; pass `{emit: false}` to suppress it. Accessibility diffs are always relative to the last tree the model actually received for that window (the last emitted one, including the post-action state shown at the end of a cell), never to an internal observation inside a cell. Actions resolve to `undefined`; their warnings are emitted. The VM has no `require`, `process`, `fetch`, `import()`, `WebAssembly`, timers or filesystem. `cua`, `nodeRepl` and the helpers are frozen, non-writable globals. Raw `window_id` methods are not exposed to model code.
 
+### Browser tab (CDP)
+
+`cua.getBrowser()` (alias `cua.getTab()`) drives the first page tab of the browser at `CUA_BROWSER_CDP` over the DevTools protocol (`src/browser/`), porting agent-desktop's browser controller. The tab has the App methods that make sense for a page, with the same argument shapes and locators:
+
+```js
+const tab = await cua.getBrowser();          // emits the page state, like getApp
+await tab.goto('https://example.org/');       // http(s) and file URLs only; resolves when the document loaded
+await tab.setValue({role: 'textbox', name: 'Search'}, 'query'); // focus, select all, insert, exact readback (else value_mismatch); <select>: option by label
+await tab.click({role: 'button', name: 'Go'});  // or click(id) / click([x, y]); scrolls into view, refuses covered or hidden elements
+await tab.pressKey('Return'); await tab.typeText('more');
+await tab.waitFor({url: '/results'});         // substring or RegExp; also {text}, {role, name}; timeoutMs (default 10000)
+await tab.read(id, {row: true});              // {tag, text, href?, links: [{text, url}]} of the element or its list item/table row
+await tab.find({role: 'link', text: /issue/}); await tab.getAXState({query: 'Save'}); await tab.getScreenshot();
+tab.url; tab.title;                           // as of the last call
+```
+
+Observations come from `Accessibility.getFullAXTree` plus one `DOMSnapshot` for boxes, rendered in the native line format: IDs are the nodes' `backendDOMNodeId` (stable for a document), coordinates are viewport CSS pixels (omitted on named widgets; `(offscreen)` below the fold), ignored nodes and unnamed wrappers are dissolved, text that repeats a name is dropped and text-only containers show `text="…"`. A state is capped at 16,000 characters with a note pointing to `getAXState({query})` and `find()`. After a cell that acted on the tab, its state is emitted once at the end. Input waits 60 ms and, if a navigation started, for its DOMContentLoaded (at most 10 s).
+
 ## Security model
 
 - Isolation. Model code runs in QuickJS compiled to WebAssembly (`quickjs-emscripten`), not in Node and not in Node's `vm` module, which is not a security boundary. The only capabilities are three native functions: host call, output and sleep. The prelude captures them and then deletes them from the global object. As a second layer, the VM runs in a separate Node process started with `--permission`, read access only to `surface/`, no write, child process, worker, addon or WASI permission, `--disallow-code-generation-from-strings`, a 256 MB V8 heap and an empty environment. The process holds no credentials and no daemon handle. It only talks to the trusted host over IPC.
@@ -83,6 +102,7 @@ Observation and discovery calls (`getAXState`, `getScreenshot`, `getAXStateAndSc
 - Authorization. The daemon decides when approval is needed and answers `approval_required {app_id, window_id, title}`. The host then sends an MCP form elicitation with a `decision` field: allow for this turn, allow for this session, always allow (only when an approvals file location exists), or deny. Only an explicit allow leads to `approve_app {window_id, app_id}`. Session and always approvals are re-granted to the daemon after `turn_ended` without asking again; "always" is written to `CUA_APPROVALS_FILE`. A decline is remembered until `turn_ended`, while a dismissal is not remembered. Daemon deny lists and hard denies win over every approval. A client without elicitation support gets `approval_unavailable`, so approval fails closed. Approval prompts show the window title sanitized and labelled as untrusted. Deny lists stay with the daemon.
 - Cancellation and timeouts. Engine requests are serialized. Cancellation kills the issuing daemon to stop further dispatch, but cannot recall events already delivered to an app: outcomes may be partial or unknown. The next request restarts the daemon with current-turn approvals; it does not replay the interrupted action. Unawaited calls are cancelled at cell end. Calls from finished cells are rejected. QuickJS interrupts overdue cells, with a hard process-kill backstop that reports lost REPL state.
 - Untrusted content. Accessibility text, diffs, window titles and other daemon data are wrapped in `<<<UNTRUSTED label nonce=…>>> … <<<END_UNTRUSTED nonce=…>>>`. Each fence gets a fresh random nonce, and fence-like sequences inside the content are neutralized.
+- Browser. Only the operator's loopback `CUA_BROWSER_CDP` endpoint is used, and the page socket must be on that host and port. Model code gets no page JavaScript: the host runs only fixed functions (click point and occlusion check, edit target, readback, read) in an isolated world, with model strings as arguments. Navigation accepts http, https and file URLs. Page text, URLs and titles reach the model inside untrusted fences. The browser needs no per-app approval: configuring the endpoint is the operator's grant, so point it at a disposable profile, never one with the owner's logins.
 - Confirmation policy. The policy text is surfaced in the server instructions, the tool descriptions and the approval prompts. It is advisory: the server does not try to classify actions as consequential.
 
 ## Provider adapters
@@ -164,6 +184,7 @@ The tests use `test/fake-engine.js`, an NDJSON test double with daemon-side appr
 - Timeout and MCP cancellation, proving via the engine log that the pending action never completed. Approval replay after a restart.
 - Sandbox memory limit, the hard kill of an unresponsive sandbox, output caps, and the sandbox process flags and empty environment.
 - Held modifiers, press durations, hover and relative moves, mouse buttons, the one-request tree-plus-screenshot, `launchApp`, the clipboard and `cua.help()`.
+- The browser tab: AX rendering and pruning against a recorded tree (`test/fixtures/browser-ax.json`, from `test/fixtures/browser-page.js`), locator resolution in the sandbox, key, URL and endpoint validation; with `CUA_BROWSER_CDP` set, a real browser fills, submits and reads that page.
 - Both provider adapters: definitions, coordinate transforms, image limits, batch halting and validation, zoom, modifiers and click variants, held keys, moves, safety checks and key normalization.
 
 ## Limitations
