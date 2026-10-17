@@ -533,6 +533,15 @@ export function preludeSource() {
       else if (typeof target.id === 'string') q = { appId: target.id };
     }
     if (!q) throw new CuaError('invalid_params', 'getApp requires an app id ("xed"), {appId}, or {windowId} (a WindowInfo id)');
+    // A Chromium-family browser by name is its page tab over CDP when a
+    // browser is configured: models reach for getApp("Brave-browser").
+    if (q.appId !== undefined && /^(brave|chrom|google-chrome)/i.test(q.appId)) {
+      try {
+        return await cua.getBrowser(o);
+      } catch (e) {
+        if (!(e instanceof CuaError) || e.code !== 'browser_unavailable') throw e;
+      }
+    }
     return makeApp(await call('list_windows', q, 'getApp', emitOpt(o)));
   };
   // launchApp("drawing"): starts an installed application (desktop entry ID

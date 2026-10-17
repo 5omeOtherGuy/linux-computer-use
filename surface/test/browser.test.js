@@ -164,6 +164,14 @@ describe('browser tab in the sandbox', () => {
     assert.equal(res.outputs.length, 1);
   });
 
+  test('getApp of a Chromium-family browser is its tab when a browser is configured', async () => {
+    browser.calls.length = 0;
+    const res = await r.eval({ code: 'const b = await cua.getApp("Brave-browser", {emit: false}); [typeof b.goto, b.url]', timeoutMs: 5000 });
+    assert.equal(res.ok, true, res.error);
+    assert.match(res.value, /"function",\s*"http:\/\/127.0.0.1\/"/);
+    assert.equal(browser.calls[0].method, 'open');
+  });
+
   test('without a configured browser, getBrowser fails clearly', async () => {
     const plain = new SandboxRunner({ host: NO_ENGINE, browser: new BrowserHost({ endpoint: undefined }), memoryLimitMb: 32 });
     try {

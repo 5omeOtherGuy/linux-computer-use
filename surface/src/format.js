@@ -17,17 +17,12 @@ export function fenceUntrusted(label, text, max = MAX_AX_CHARS) {
   return [`<<<UNTRUSTED ${label} nonce=${nonce}>>>`, body, `<<<END_UNTRUSTED nonce=${nonce}>>>`].join('\n');
 }
 
-// Roles whose element ID is the way to act on them: a named one needs no
-// coordinates in the text (canvases, images, containers keep theirs).
-const WIDGET_ROLES = new Set(['button', 'toggle button', 'push button menu', 'radio button', 'check box', 'switch', 'menu',
-  'menu item', 'check menu item', 'radio menu item', 'table cell', 'list item', 'tree item', 'page tab', 'combo box',
-  'text', 'entry', 'password text', 'spin button', 'link', 'label', 'table column header', 'table row header', 'heading']);
 const DEFAULT_ACTIONS = new Set(['click', 'press', 'activate', 'jump']);
 
 // The engine's tree text made shorter for the model, losing nothing it acts
-// on: no coordinates on named widgets, no default action (an element ID click
-// uses it), and an action list that repeats on many elements of a role said
-// once in the header.
+// on: no default action (an element ID click uses it), and an action list
+// that repeats on many elements of a role said once in the header.
+// Coordinates stay: models click unnamed tool palettes by position.
 export function compactTree(text) {
   const lines = String(text ?? '').split('\n');
   const out = lines.map((line) => {
@@ -39,7 +34,6 @@ export function compactTree(text) {
       if (acts.length && DEFAULT_ACTIONS.has(acts[0].toLowerCase())) acts.shift();
       return acts.length ? ` actions=[${acts.join(', ')}]` : '';
     });
-    if (WIDGET_ROLES.has(m[2]) && /^ "|desc=/.test(rest)) rest = rest.replace(/ @-?\d+,-?\d+ \d+x\d+/, '');
     return m[1] + m[2] + rest;
   });
   const counts = new Map();
