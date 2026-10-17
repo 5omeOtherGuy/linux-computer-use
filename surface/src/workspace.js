@@ -4,9 +4,24 @@
 // XAUTHORITY, its D-Bus and accessibility buses, its process marker) goes to
 // the engine and so to every app it launches.
 import { execFileSync } from 'node:child_process';
+import { accessSync, constants } from 'node:fs';
+import path from 'node:path';
 import { CuaError } from './errors.js';
 
-const run = (args) => execFileSync('agent-desktop', args, { encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+// MCP clients may start servers with a reduced PATH (Codex does), so the
+// installed location is tried when agent-desktop is not on it.
+function agentDesktop(env) {
+  if (env.CUA_AGENT_DESKTOP) return env.CUA_AGENT_DESKTOP;
+  const dirs = [...String(env.PATH || '').split(':').filter(Boolean), ...(env.HOME ? [path.join(env.HOME, '.local', 'bin')] : [])];
+  for (const d of dirs) {
+    const p = path.join(d, 'agent-desktop');
+    try {
+      accessSync(p, constants.X_OK);
+      return p;
+    } catch {}
+  }
+  return 'agent-desktop';
+}
 
 // `agent-desktop env NAME` prints shell exports and one unset line.
 export function parseWorkspaceEnv(text) {
@@ -26,6 +41,10 @@ export function parseWorkspaceEnv(text) {
 export function attachWorkspace(env, log = () => {}) {
   const want = env.CUA_WORKSPACE;
   if (!want) return null;
+  const bin = agentDesktop(env);
+  // agent-desktop keeps its workspaces under XDG_RUNTIME_DIR.
+  const adEnv = { ...env, XDG_RUNTIME_DIR: env.XDG_RUNTIME_DIR || `/run/user/${process.getuid()}` };
+  const run = (args) => execFileSync(bin, args, { encoding: 'utf8', timeout: 60_000, env: adEnv, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
   let name = want;
   let owned = false;
   if (want === 'new') {
