@@ -48,11 +48,13 @@ const LAUNCH_WAIT: Duration = Duration::from_secs(10);
 const SETTLE_REACT: Duration = Duration::from_millis(200);
 /// Quiet interval after the last reaction.
 const SETTLE_QUIET: Duration = Duration::from_millis(35);
-/// Quiet interval after a shortcut or a button click, which may open a
-/// dialog: GTK builds a file chooser for 100-300 ms before any of it shows,
-/// while the focused window's own redraw (its text cursor) already counts
-/// as the reaction, so 35 ms let the next action reach the main window.
-const SETTLE_QUIET_OPENING: Duration = Duration::from_millis(150);
+/// After a shortcut or a button click, which may open a dialog, the app's
+/// CPU time counts as activity too: GTK builds a file chooser for 100-300 ms
+/// without any X or accessibility event, while the focused window's own
+/// redraw already counts as the reaction, so the quiet interval alone let
+/// the next action reach the main window. CPU use below this per poll is
+/// idle noise.
+const BUSY_CPU_NS: u64 = 1_000_000;
 const SETTLE_CAP: Duration = Duration::from_millis(600);
 /// Longest wait, from the action, for a dialog to close after its confirm
 /// key or button.
@@ -134,6 +136,18 @@ fn is_shortcut(key: &str) -> bool {
         && parts[..parts.len() - 1]
             .iter()
             .any(|m| matches!(m.as_str(), "ctrl" | "control" | "alt" | "super" | "meta" | "win")))
+}
+
+/// CPU time of all threads of `pid` (nanoseconds; 0 when unreadable).
+fn cpu_time_ns(pid: u32) -> u64 {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return 0;
+    };
+    tasks
+        .flatten()
+        .filter_map(|t| std::fs::read_to_string(t.path().join("schedstat")).ok())
+        .filter_map(|s| s.split_whitespace().next()?.parse::<u64>().ok())
+        .sum()
 }
 
 fn int_param(p: &serde_json::Map<String, Value>, k: &str) -> Option<u32> {
@@ -904,11 +918,20 @@ impl Engine {
             ("click", Some(idx)) => self.ax.as_ref().is_some_and(|ax| ax.element_is_button(idx)),
             _ => false,
         };
-        let quiet = if may_open { SETTLE_QUIET_OPENING } else { SETTLE_QUIET };
-        let mut external = || ax_activity.as_mut().is_some_and(|probe| probe());
+        let mut cpu = may_open.then(|| cpu_time_ns(w.pid));
+        let mut external = || {
+            let ax = ax_activity.as_mut().is_some_and(|probe| probe());
+            let busy = cpu.as_mut().is_some_and(|last| {
+                let now = cpu_time_ns(w.pid);
+                let busy = now.saturating_sub(*last) >= BUSY_CPU_NS;
+                *last = now;
+                busy
+            });
+            ax || busy
+        };
         let settled = self
             .desktop
-            .settle(SETTLE_REACT, quiet, SETTLE_CAP, &mut external)?;
+            .settle(SETTLE_REACT, SETTLE_QUIET, SETTLE_CAP, &mut external)?;
         trace.mark("settle");
         trace.note("reacted", settled.reacted);
         // A dialog confirmed or dismissed (Return, Escape, a button) often

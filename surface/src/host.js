@@ -17,7 +17,7 @@ import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { CuaError, toCuaError } from './errors.js';
 import { EngineClient } from './engine.js';
-import { treeDiff } from './format.js';
+import { compactTree, treeDiff } from './format.js';
 import { exposedMethods, validateRequest } from './protocol.js';
 
 export const DEFAULT_CONFIRMATION_POLICY = [
@@ -262,7 +262,7 @@ export class HostApi {
   // model receives this observation.
   axView(obs, { diff = true, shortest = false, commit = false } = {}) {
     const id = obs?.window?.window_id;
-    const full = typeof obs?.accessibility === 'string' ? obs.accessibility : '';
+    const full = typeof obs?.accessibility === 'string' ? compactTree(obs.accessibility) : '';
     const seen = this.axSeen.get(id);
     let text = full;
     if (diff && seen !== undefined && full) {

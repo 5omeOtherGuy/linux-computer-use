@@ -110,3 +110,34 @@ describe('SandboxRunner', () => {
     assert.equal(calls.length, before);
   });
 });
+
+describe('compactTree', () => {
+  test('drops what an element ID already covers and states a repeated action list once', async () => {
+    const { compactTree } = await import('../src/format.js');
+    const tree = [
+      '# accessibility: 6 elements',
+      '[1] frame "Files" (active) @0,0 900x700',
+      '  [2] button "Undo" @10,4 68x46 actions=[Click]',
+      '  [3] button desc="Swatch" @1,1 5x5 actions=[Click, Customize]',
+      '  [4] button @7,7 9x9 actions=[Press]',
+      '  [5] table cell "a.txt" @1,2 3x4 actions=[Expand or contract, Edit, Activate]',
+      '  [6] table cell "b.txt" @1,2 3x4 actions=[Expand or contract, Edit, Activate]',
+      '  [7] table cell "c.txt" (selected) @1,2 3x4 actions=[Expand or contract, Edit, Activate]',
+      '  [8] table cell "d.txt" @1,2 3x4 actions=[Edit]',
+      '  [9] drawing area @0,40 800x600',
+    ].join('\n');
+    assert.equal(compactTree(tree), [
+      '# accessibility: 6 elements',
+      '# every table cell below has actions=[Expand or contract, Edit, Activate] unless it shows its own',
+      '[1] frame "Files" (active) @0,0 900x700',
+      '  [2] button "Undo"',
+      '  [3] button desc="Swatch" actions=[Customize]',
+      '  [4] button @7,7 9x9',
+      '  [5] table cell "a.txt"',
+      '  [6] table cell "b.txt"',
+      '  [7] table cell "c.txt" (selected)',
+      '  [8] table cell "d.txt" actions=[Edit]',
+      '  [9] drawing area @0,40 800x600',
+    ].join('\n'));
+  });
+});

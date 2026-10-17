@@ -75,7 +75,7 @@ describe('real apps', { skip }, () => {
   test('a locator right after a shortcut acts in the dialog the shortcut opened', async () => {
     const { r, text } = await run(`await x.pressKey("ctrl+shift+s");
       const [f] = await x.find({role: "text", states: ["focused"]});
-      const top = (await x.getAXState({emit: false, disableDiffing: true})).split("\\n")[1];
+      const top = (await x.getAXState({emit: false, disableDiffing: true})).split("\\n").find((l) => l.startsWith("["));
       await x.click({role: "button", name: "Cancel"});
       [f && f.text, /file chooser/.test(top), (await cua.listWindows({emit: false})).filter((w) => w.title === "Save As…").length].join()`);
     assert.equal(r.isError, false, text);
