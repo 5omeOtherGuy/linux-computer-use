@@ -12,8 +12,8 @@ CLI: `agent-desktop` (source `~/projects/agent-desktop/bin/agent-desktop`); the 
 <rules>
 - Run GUI programs only through `agent-desktop run`; never set `DISPLAY=:0`, never run xdotool, wmctrl or xprop against `:0`.
 - Never run `agent-desktop view`: it opens a window on the owner's desktop and belongs to the owner's panel menu.
-- Close every workspace you create (`agent-desktop close NAME`) as soon as the GUI task ends; create at most one per task unless the brief says otherwise.
-- Exit code 3 is a refusal (workspace cap or MemAvailable below 1.2 GiB): report it or wait; do not loop, and use `run --force` only for tiny programs such as xterm.
+- Create at most one workspace per task unless the brief says otherwise. Reuse it through the task and close **only the workspace you created** immediately afterward. The CLI enforces creator ownership using the harness PID/start time and Codex thread ID when available; `close --all` selects only that creator's workspaces. Prefer `close NAME` to keep cleanup scoped to the task. Without a recognized harness, ownership binds to the invoking parent process. `--owner-pid` controls automatic cleanup, not close authorization. Older workspaces without creator metadata are refused by `close` and retain automatic cleanup.
+- Exit code 3 is a refusal (ownership, workspace cap or MemAvailable below 1.2 GiB): report it or wait; do not loop, and use `run --force` only for tiny programs such as xterm.
 - Never type credentials into a workspace unless your brief authorizes that credential; screenshots and logs persist in `~/.cache/agent-desktop/ws/NAME/` until close.
 - A workspace closes itself after 60 idle minutes (`--idle`) and when the creating claude/codex/p1 session exits (`--owner-pid auto`); do not rely on that for cleanup.
 </rules>
@@ -32,7 +32,7 @@ CLI: `agent-desktop` (source `~/projects/agent-desktop/bin/agent-desktop`); the 
 | `agent-desktop windows N [--json]` · `focus N ID\|--name REGEX` | list / raise and focus windows |
 | `agent-desktop list [--json]` · `info N` | live workspaces; details, pointer position |
 | `agent-desktop env N` | shell exports for other X tools: `eval "$(agent-desktop env N)"; xclip -o` |
-| `agent-desktop close N… \| --all` | kill everything started in it, remove its files (`--keep-files` keeps shots and logs) |
+| `agent-desktop close N… \| --all` | close only workspaces created by this session; kill everything started in them, remove their files (`--keep-files` keeps shots and logs) |
 Exit codes: 0 ok, 1 error, 2 usage or no such workspace, 3 refused, 4 timeout.
 </commands>
 

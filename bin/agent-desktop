@@ -111,6 +111,28 @@ def find_owner_session():
     return None
 
 
+def creator_identity():
+    """Identify the calling harness, independently of the cleanup --owner-pid.
+
+    Without a recognized harness, bind to the invoking process (e.g. a shell).
+    Start ticks prevent a recycled PID from acquiring an old workspace. Codex
+    can host multiple threads in one process, so bind to its thread as well.
+    """
+    pid = find_owner_session() or os.getppid()
+    start = proc_start(pid)
+    if start is None:
+        raise Fail("refused: cannot identify workspace creator", EXIT_REFUSED)
+    identity = {"pid": pid, "start": start}
+    if comm(pid) == "codex" and os.environ.get("CODEX_THREAD_ID"):
+        identity["codex_thread_id"] = os.environ["CODEX_THREAD_ID"]
+    return identity
+
+
+def created_by(w, identity):
+    # Legacy state has no creator: never infer ownership from its cleanup PID.
+    return w.state.get("creator") == identity
+
+
 def pss_kib(pid):
     try:
         with open(f"/proc/{pid}/smaps_rollup") as f:
@@ -405,6 +427,7 @@ def wait_for(pred, timeout, step=0.05):
 # ---------------------------------------------------------------- commands
 
 def cmd_new(a):
+    creator = creator_identity()
     gc()
     for tool in ("Xvnc", "openbox", "dbus-daemon", "xauth", "xdotool"):
         if not shutil.which(tool):
@@ -445,6 +468,7 @@ def cmd_new(a):
         w._state = {
             "name": name, "id": ws_id, "display": n, "geometry": a.geometry,
             "label": a.label or default_label(), "created": now(),
+            "creator": creator,
             "idle_timeout": int(a.idle * 60), "owner_pid": owner,
             "owner_start": proc_start(owner) if owner else None,
             "owner_comm": comm(owner) if owner else None,
@@ -523,6 +547,7 @@ def ws_info(w):
         "geometry": s["geometry"], "age_s": int(now() - s["created"]),
         "idle_s": int(now() - w.last_used()),
         "idle_timeout_s": s.get("idle_timeout"), "owner_pid": s.get("owner_pid"),
+        "creator": s.get("creator"),
         "owner_comm": s.get("owner_comm"),
         "apps": len([p for p in pids if p not in infra]),
         "pss_mib": round(sum(pss_kib(p) for p in pids) / 1024, 1),
@@ -774,16 +799,25 @@ def cmd_view(a):
 
 
 def cmd_close(a):
-    names = [w.name for w in all_workspaces()] if a.all else a.ws
-    if not names:
+    if a.all and a.ws:
+        raise Fail("give workspace names or --all, not both", EXIT_USAGE)
+    if not a.all and not a.ws:
         raise Fail("give workspace names or --all", EXIT_USAGE)
+    creator = creator_identity()
     rc = 0
     with Lock(RUNTIME / "lock"):
+        names = ([w.name for w in all_workspaces() if created_by(w, creator)]
+                 if a.all else a.ws)
         for n in names:
             w = Workspace(n)
             if not w.exists():
                 print(f"no such workspace: {n}", file=sys.stderr)
-                rc = EXIT_USAGE
+                rc = max(rc, EXIT_USAGE)
+                continue
+            if not created_by(w, creator):
+                print(f"refused: {n} was not created by this agent session "
+                      "(or has no verifiable creator)", file=sys.stderr)
+                rc = EXIT_REFUSED
                 continue
             close_ws(w, "close", keep_files=a.keep_files)
             print(f"closed {n}")
@@ -935,9 +969,9 @@ def main(argv=None):
     p.add_argument("--display", help="viewer display (default: $DISPLAY)")
     p.set_defaults(fn=cmd_view)
 
-    p = sub.add_parser("close", help="close workspaces and everything started in them")
+    p = sub.add_parser("close", help="close only workspaces created by this agent session")
     p.add_argument("ws", nargs="*")
-    p.add_argument("--all", action="store_true")
+    p.add_argument("--all", action="store_true", help="close all workspaces created by this session")
     p.add_argument("--keep-files", action="store_true", help="keep screenshots and logs")
     p.set_defaults(fn=cmd_close)
 
