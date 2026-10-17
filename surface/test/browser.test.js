@@ -83,9 +83,10 @@ describe('browser input validation', () => {
     assert.throws(() => parseKey('Frobnicate'), /unknown key/);
   });
 
-  test('navigation only to http(s) and file URLs', () => {
+  test('navigation only to http(s) URLs, and file URLs when the operator allows them', () => {
     assert.equal(checkUrl('https://example.org/a b'.replace(' ', '%20')), 'https://example.org/a%20b');
-    assert.equal(checkUrl('file:///tmp/x.html'), 'file:///tmp/x.html');
+    assert.throws(() => checkUrl('file:///etc/passwd', { allowFile: false }), /file URLs are not allowed/);
+    assert.equal(checkUrl('file:///tmp/x.html', { allowFile: true }), 'file:///tmp/x.html');
     for (const bad of ['javascript:alert(1)', 'data:text/html,hi', 'about:blank', 'chrome://settings', '/relative', 'http://', 'https://x.org/a b']) {
       assert.throws(() => checkUrl(bad), /invalid_params|goto:/, bad);
     }

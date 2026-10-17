@@ -52,8 +52,10 @@ function text(method, v, { allowEmpty = true } = {}) {
   return v;
 }
 
-// Navigation targets: absolute http(s) and file URLs only.
-export function checkUrl(raw) {
+// Navigation targets: absolute http(s) URLs; file URLs only when the operator
+// allows them (CUA_BROWSER_ALLOW_FILE=1), since a page can show any file the
+// browser user can read.
+export function checkUrl(raw, { allowFile = process.env.CUA_BROWSER_ALLOW_FILE === '1' } = {}) {
   if (typeof raw !== 'string' || !raw || raw.length > 8192 || /[\s\x00-\x1f\x7f]/.test(raw)) fail('goto', 'url must be an absolute http(s) or file URL without spaces');
   let u;
   try {
@@ -61,7 +63,8 @@ export function checkUrl(raw) {
   } catch {
     fail('goto', 'url must be an absolute http(s) or file URL');
   }
-  if (!['http:', 'https:', 'file:'].includes(u.protocol) || (u.protocol !== 'file:' && !u.hostname)) fail('goto', 'only http, https and file URLs can be opened');
+  if (u.protocol === 'file:' && !allowFile) fail('goto', 'file URLs are not allowed (the operator can allow them with CUA_BROWSER_ALLOW_FILE=1)');
+  if (!['http:', 'https:', 'file:'].includes(u.protocol) || (u.protocol !== 'file:' && !u.hostname)) fail('goto', 'only http and https URLs can be opened');
   return u.href;
 }
 
