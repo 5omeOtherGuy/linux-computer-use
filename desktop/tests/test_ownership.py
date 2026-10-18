@@ -228,11 +228,24 @@ class PrivateFilesTests(unittest.TestCase):
     def test_private_dir_creates_or_tightens_and_refuses_what_it_does_not_own(self):
         new = ad.private_dir(self.root / 'a' / 'b')
         self.assertEqual(self.mode(new), 0o700)
-        loose = self.root / 'loose'
-        loose.mkdir(mode=0o755)
-        os.chmod(loose, 0o777)
-        ad.private_dir(loose)
-        self.assertEqual(self.mode(loose), 0o700)
+        readable = self.root / 'readable'
+        readable.mkdir()
+        os.chmod(readable, 0o755)
+        ad.private_dir(readable)
+        self.assertEqual(self.mode(readable), 0o700)
+        # Others could have planted links in a writable one: refused as is.
+        writable = self.root / 'writable'
+        writable.mkdir()
+        os.chmod(writable, 0o777)
+        with self.assertRaises(ad.Fail):
+            ad.private_dir(writable)
+        self.assertEqual(self.mode(writable), 0o777)
+        os.chmod(writable, 0o775)
+        with patch.object(ad, 'own_group', return_value=False), self.assertRaises(ad.Fail):
+            ad.private_dir(writable)
+        with patch.object(ad, 'own_group', return_value=True):
+            ad.private_dir(writable)  # umask 002 with a private group
+        self.assertEqual(self.mode(writable), 0o700)
         os.symlink(new, self.root / 'link')
         (self.root / 'file').write_text('')
         for bad in ('link', 'file'):
@@ -240,10 +253,22 @@ class PrivateFilesTests(unittest.TestCase):
                 ad.private_dir(self.root / bad)
         self.assertEqual(self.mode(new), 0o700)
 
+    def test_workspace_files_and_the_cache_above_them_are_private(self):
+        cache = self.root / 'cache'
+        old = cache / 'ws' / 'old'
+        old.mkdir(parents=True)
+        for p in (cache, cache / 'ws', old):
+            os.chmod(p, 0o755)  # created before this check, umask 022
+        with patch.object(ad, 'CACHE', cache):
+            w = ad.Workspace('old')
+            ad.private_files(w)
+        for p in (cache, cache / 'ws', old):
+            self.assertEqual(self.mode(p), 0o700, p)
+
     def test_runtime_dir_in_tmp_checks_its_parent_too(self):
         parent = self.root / f'agent-desktop-{os.getuid()}'
         parent.mkdir()
-        os.chmod(parent, 0o777)  # as if created by someone else's umask
+        os.chmod(parent, 0o755)
         with patch.object(ad, 'TMP_RUNTIME', parent), \
                 patch.object(ad, 'RUNTIME', parent / 'agent-desktop'):
             ad.runtime_dir()

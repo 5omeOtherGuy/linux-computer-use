@@ -167,10 +167,26 @@ def marked_pids(ws_id):
     return out
 
 
+def own_group(gid):
+    """Whether `gid` is this user's private group: no other account has it as
+    primary group or lists it as a member (umask 002 makes such directories
+    group-writable)."""
+    import grp
+    import pwd
+    try:
+        me = pwd.getpwuid(UID).pw_name
+        if any(m != me for m in grp.getgrgid(gid).gr_mem):
+            return False
+        return all(u.pw_uid == UID for u in pwd.getpwall() if u.pw_gid == gid)
+    except KeyError:
+        return False
+
+
 def private_dir(path):
     """Creates `path` (and missing parents) as a directory only this user can
-    enter, or makes an existing one so; refuses a symlink, a non-directory or
-    a directory owned by another user."""
+    enter, or removes the others' access to an existing one. Refuses a
+    symlink, a non-directory, a directory owned by another user and one that
+    others could write to, since what is in it may not be ours."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -185,11 +201,22 @@ def private_dir(path):
         st = os.fstat(fd)
         if st.st_uid != UID:
             raise Fail(f"refusing to use {path}: it belongs to uid {st.st_uid}, not {UID}")
+        if st.st_mode & 0o002 or (st.st_mode & 0o020 and not own_group(st.st_gid)):
+            raise Fail(f"refusing to use {path}: other users can write to it (mode {st.st_mode & 0o7777:o}); "
+                       "check what is in it, then remove it or run chmod 700 on it")
         if st.st_mode & 0o077:
             os.fchmod(fd, 0o700)
     finally:
         os.close(fd)
     return path
+
+
+def private_files(w):
+    """The workspace's files directory (logs, screenshots, private HOME) and
+    the cache directories above it, made private (see private_dir)."""
+    for p in (CACHE, CACHE / "ws", w.files):
+        private_dir(p)
+    return w.files
 
 
 def runtime_dir():
@@ -215,7 +242,7 @@ class Lock:
 
 def log_event(msg):
     try:
-        CACHE.mkdir(parents=True, exist_ok=True)
+        CACHE.mkdir(parents=True, exist_ok=True, mode=0o700)
         p = CACHE / "events.log"
         if p.exists() and p.stat().st_size > 1 << 20:
             p.write_text("")
@@ -494,8 +521,7 @@ def cmd_new(a):
         w.dir.mkdir(parents=True, mode=0o700)
         (w.dir / "run").mkdir(mode=0o700)
         (w.dir / "touch").touch()
-        # Logs, screenshots and the private HOME are the workspace's own.
-        private_dir(w.files)
+        private_files(w)
         logs = w.files / "logs"
         logs.mkdir(exist_ok=True)
         (w.files / "shots").mkdir(exist_ok=True)
@@ -621,6 +647,8 @@ def get_ws(name):
     if not w.server_alive():
         gc()
         raise Fail(f"workspace {name} has exited", EXIT_USAGE)
+    # Also for workspaces created before their files were kept private.
+    private_files(w)
     return w
 
 

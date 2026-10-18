@@ -31,8 +31,8 @@ agent-desktop _reaper (one per user; exits 30 s after the last workspace)
 owner: panel genmon item "🖥 N" → agent-desktop-menu (zenity) → vncviewer on :0 (view-only, or "Take control")
 ```
 
-- State: `$XDG_RUNTIME_DIR/agent-desktop/ws/NAME/` (tmpfs, 0700): state, Xauthority, VNC socket, bus, runtime dir. Without `XDG_RUNTIME_DIR` it is `/tmp/agent-desktop-UID/agent-desktop`; both directories must belong to the user (anything else is refused) and are kept at 0700. The X cookie reaches `xauth` on stdin, never on a command line.
-- Files: `~/.cache/agent-desktop/ws/NAME/` (0700): screenshots, logs, private XDG home. Removed on close unless `--keep-files`. The event log is `~/.cache/agent-desktop/events.log`.
+- State: `$XDG_RUNTIME_DIR/agent-desktop/ws/NAME/` (tmpfs, 0700): state, Xauthority, VNC socket, bus, runtime dir. Without `XDG_RUNTIME_DIR` it is `/tmp/agent-desktop-UID/agent-desktop`; both directories must belong to the user and must not be writable by other users (anything else is refused), and are kept at 0700. The X cookie reaches `xauth` on stdin, never on a command line.
+- Files: `~/.cache/agent-desktop/ws/NAME/` (0700, as are `~/.cache/agent-desktop` and its `ws`, checked like the runtime directory whenever a workspace is used): screenshots, logs, private XDG home. Removed on close unless `--keep-files`. The event log is `~/.cache/agent-desktop/events.log`.
 - Cleanup kills every process of ours that carries the workspace marker in its environment: apps first, then openbox and dbus, then Xvnc. It also kills the owner viewers opened for that workspace.
 - Guards:
   - at most `AGENT_DESKTOP_MAX` (3) workspaces;
