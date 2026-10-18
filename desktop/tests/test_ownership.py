@@ -1,4 +1,4 @@
-"""Close authorization regressions; no X server, GUI, or existing workspace touched."""
+"""Close authorization and private-file regressions; no X server, GUI, or existing workspace touched."""
 import contextlib
 import importlib.machinery
 import importlib.util
@@ -214,6 +214,140 @@ class CreatorIdentityTests(unittest.TestCase):
                 ad.cmd_close(SimpleNamespace(all=False, ws=['foreign'], keep_files=False))
             self.assertEqual(result.exception.code, 3)
             close.assert_not_called()
+
+
+class PrivateFilesTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='adt-private-')
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def mode(self, p):
+        return os.lstat(p).st_mode & 0o777
+
+    def test_private_dir_creates_or_tightens_and_refuses_what_it_does_not_own(self):
+        new = ad.private_dir(self.root / 'a' / 'b')
+        self.assertEqual(self.mode(new), 0o700)
+        readable = self.root / 'readable'
+        readable.mkdir()
+        os.chmod(readable, 0o755)
+        ad.private_dir(readable)
+        self.assertEqual(self.mode(readable), 0o700)
+        # Others could have planted links in a writable one: refused as is.
+        writable = self.root / 'writable'
+        writable.mkdir()
+        os.chmod(writable, 0o777)
+        with self.assertRaises(ad.Fail):
+            ad.private_dir(writable)
+        self.assertEqual(self.mode(writable), 0o777)
+        os.chmod(writable, 0o775)
+        with patch.object(ad, 'own_group', return_value=False), self.assertRaises(ad.Fail):
+            ad.private_dir(writable)
+        with patch.object(ad, 'own_group', return_value=True):
+            ad.private_dir(writable)  # umask 002 with a private group
+        self.assertEqual(self.mode(writable), 0o700)
+        os.symlink(new, self.root / 'link')
+        (self.root / 'file').write_text('')
+        for bad in ('link', 'file'):
+            with self.assertRaises(ad.Fail):
+                ad.private_dir(self.root / bad)
+        self.assertEqual(self.mode(new), 0o700)
+
+    def test_group_write_through_an_acl_is_refused(self):
+        import struct
+        d = self.root / 'acl'
+        d.mkdir()
+        # user::rwx, user:<another uid>:rwx, group::rwx, mask::rwx, other::---
+        entries = [(0x01, 7, 0xFFFFFFFF), (0x02, 7, os.getuid() + 1), (0x04, 7, 0xFFFFFFFF),
+                   (0x10, 7, 0xFFFFFFFF), (0x20, 0, 0xFFFFFFFF)]
+        acl = struct.pack('<I', 2) + b''.join(struct.pack('<HHI', *e) for e in entries)
+        try:
+            os.setxattr(d, 'system.posix_acl_access', acl)
+        except OSError as e:
+            self.skipTest(f'no POSIX ACLs here ({e.strerror})')
+        self.assertEqual(self.mode(d), 0o770)
+        with patch.object(ad, 'own_group', return_value=True), self.assertRaises(ad.Fail):
+            ad.private_dir(d)
+
+    def test_acl_lookup_errors_refuse_unless_xattrs_are_unsupported(self):
+        import errno
+        d = self.root / 'group'
+        d.mkdir()
+        os.chmod(d, 0o770)
+        with patch.object(ad, 'own_group', return_value=True):
+            with patch.object(ad.os, 'listxattr', side_effect=OSError(errno.E2BIG, 'too big')), \
+                    self.assertRaises(ad.Fail):
+                ad.private_dir(d)
+            self.assertEqual(self.mode(d), 0o770)
+            with patch.object(ad.os, 'listxattr', side_effect=OSError(errno.EOPNOTSUPP, 'unsupported')):
+                ad.private_dir(d)
+        self.assertEqual(self.mode(d), 0o700)
+
+    def test_workspace_files_and_the_cache_above_them_are_private(self):
+        cache = self.root / 'cache'
+        old = cache / 'ws' / 'old'
+        old.mkdir(parents=True)
+        for p in (cache, cache / 'ws', old):
+            os.chmod(p, 0o755)  # created before this check, umask 022
+        with patch.object(ad, 'CACHE', cache):
+            w = ad.Workspace('old')
+            ad.private_files(w)
+        for p in (cache, cache / 'ws', old):
+            self.assertEqual(self.mode(p), 0o700, p)
+
+    def test_closing_keeps_files_in_a_cache_others_can_write(self):
+        cache = self.root / 'cache'
+        files = cache / 'ws' / 'gone'
+        files.mkdir(parents=True)
+        (files / 'log').write_text('x')
+        os.chmod(cache / 'ws', 0o777)
+        state = {'pids': {}, 'starts': {}, 'id': 'x', 'display': 100}
+        w = SimpleNamespace(name='gone', state=state, dir=self.root / 'run' / 'ws' / 'gone', files=files)
+        with patch.object(ad, 'CACHE', cache), patch.object(ad, 'WS_ROOT', self.root / 'run' / 'ws'), \
+                patch.object(ad, 'marked_pids', return_value=[]), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            ad.close_ws(w, 'test')
+        self.assertTrue((files / 'log').exists())
+        self.assertIn('kept the files of gone', err.getvalue())
+        os.chmod(cache / 'ws', 0o755)
+        with patch.object(ad, 'CACHE', cache), patch.object(ad, 'WS_ROOT', self.root / 'run' / 'ws'), \
+                patch.object(ad, 'marked_pids', return_value=[]):
+            ad.close_ws(w, 'test')
+        self.assertFalse(files.exists())
+        self.assertEqual(self.mode(cache), 0o700)
+
+    def test_runtime_dir_in_tmp_checks_its_parent_too(self):
+        parent = self.root / f'agent-desktop-{os.getuid()}'
+        parent.mkdir()
+        os.chmod(parent, 0o755)
+        with patch.object(ad, 'TMP_RUNTIME', parent), \
+                patch.object(ad, 'RUNTIME', parent / 'agent-desktop'):
+            ad.runtime_dir()
+            self.assertEqual(self.mode(parent), 0o700)
+            self.assertEqual(self.mode(parent / 'agent-desktop'), 0o700)
+            parent.chmod(0o700)
+            (parent / 'agent-desktop').rmdir()
+            os.symlink(self.root, parent / 'agent-desktop')
+            with self.assertRaises(ad.Fail):
+                ad.runtime_dir()
+
+    def test_xauth_cookie_is_not_on_the_command_line(self):
+        bin_dir = self.root / 'bin'
+        bin_dir.mkdir()
+        record = self.root / 'record'
+        fake = bin_dir / 'xauth'
+        fake.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > {record}.argv\ncat > {record}.stdin\n')
+        fake.chmod(0o755)
+        path = self.root / 'Xauthority'
+        with patch.dict(os.environ, {'PATH': f'{bin_dir}:{os.environ.get("PATH", "")}'}):
+            ad.write_xauth(path, 123)
+        argv = Path(f'{record}.argv').read_text()
+        stdin = Path(f'{record}.stdin').read_text()
+        cookie = stdin.split()[-1]
+        self.assertRegex(stdin, r'^add :123 MIT-MAGIC-COOKIE-1 [0-9a-f]{32}\n$')
+        self.assertNotIn(cookie, argv)
+        self.assertEqual(argv.split(), ['-q', '-f', str(path), 'source', '-'])
+        self.assertEqual(self.mode(path), 0o600)
 
 
 if __name__ == '__main__':
