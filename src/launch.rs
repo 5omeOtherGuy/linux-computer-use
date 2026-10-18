@@ -1,0 +1,336 @@
+//! Installed desktop applications (freedesktop desktop entries) for
+//! `launch_app`: the model names an application the way a user would pick
+//! it from the menu, never a command line. Only `Type=Application` entries
+//! that a menu would show (not `NoDisplay`, not `Hidden`) are launchable,
+//! and `Exec` field codes are expanded with no files or URLs.
+
+use std::path::{Path, PathBuf};
+
+use anyhow::{bail, Result};
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Entry {
+    /// Desktop file ID without the suffix (`org.gnome.Calculator`).
+    pub id: String,
+    /// `Name=` (untranslated).
+    pub name: String,
+    /// Command line: program and arguments.
+    pub exec: Vec<String>,
+    /// `Path=`: working directory.
+    pub path: Option<String>,
+    /// `StartupWMClass=`.
+    pub wm_class: Option<String>,
+    /// `Terminal=true`: runs in a terminal emulator (never launched).
+    pub terminal: bool,
+}
+
+impl Entry {
+    /// Names an app can be matched or denied by: ID, its last segment,
+    /// menu name, program basename and WM class.
+    pub fn names(&self) -> Vec<String> {
+        let mut out = vec![self.id.clone(), self.name.clone()];
+        if let Some(tail) = self.id.rsplit('.').next() {
+            out.push(tail.to_string());
+        }
+        if let Some(prog) = self.exec.first().and_then(|p| Path::new(p).file_name()) {
+            out.push(prog.to_string_lossy().into_owned());
+        }
+        if let Some(c) = &self.wm_class {
+            out.push(c.clone());
+        }
+        out
+    }
+}
+
+/// Where desktop entries live, in precedence order (`XDG_DATA_HOME`, then
+/// `XDG_DATA_DIRS`).
+pub fn data_dirs() -> Vec<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.map(|h| h.join(".local/share")));
+    let data_dirs = std::env::var("XDG_DATA_DIRS")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "/usr/local/share:/usr/share".to_string());
+    data_home
+        .into_iter()
+        .chain(
+            data_dirs
+                .split(':')
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from),
+        )
+        .map(|d| d.join("applications"))
+        .collect()
+}
+
+/// All launchable entries in `dirs`; an ID found in an earlier directory
+/// hides the same ID in later ones.
+pub fn load(dirs: &[PathBuf]) -> Vec<Entry> {
+    let mut out: Vec<Entry> = Vec::new();
+    for dir in dirs {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        let mut files: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+        files.sort();
+        for file in files {
+            let Some(id) = file
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_suffix(".desktop"))
+            else {
+                continue;
+            };
+            if out.iter().any(|e| e.id == id) {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            if let Some(e) = parse(id, &text) {
+                out.push(e);
+            }
+        }
+    }
+    out
+}
+
+/// The `[Desktop Entry]` group of a desktop file, if it is a launchable
+/// application.
+pub fn parse(id: &str, text: &str) -> Option<Entry> {
+    let mut in_group = false;
+    let mut kind = None;
+    let mut name = None;
+    let mut exec = None;
+    let mut path = None;
+    let mut wm_class = None;
+    let mut terminal = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(group) = line.strip_prefix('[') {
+            in_group = group.trim_end_matches(']') == "Desktop Entry";
+            continue;
+        }
+        if !in_group {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let (k, v) = (k.trim(), v.trim());
+        match k {
+            "Type" => kind = Some(v.to_string()),
+            "Name" => name = Some(v.to_string()),
+            "Exec" => exec = Some(v.to_string()),
+            "Path" => path = Some(v.to_string()).filter(|p| !p.is_empty()),
+            "StartupWMClass" => wm_class = Some(v.to_string()).filter(|c| !c.is_empty()),
+            "Terminal" => terminal = v.eq_ignore_ascii_case("true"),
+            "NoDisplay" | "Hidden" if v.eq_ignore_ascii_case("true") => return None,
+            _ => {}
+        }
+    }
+    if kind.as_deref() != Some("Application") {
+        return None;
+    }
+    let name = name?;
+    let exec = exec_args(&exec?, &name).ok()?;
+    Some(Entry {
+        id: id.to_string(),
+        name,
+        exec,
+        path,
+        wm_class,
+        terminal,
+    })
+}
+
+/// Splits an `Exec=` value into arguments (desktop entry quoting) and
+/// expands its field codes: `%c` is the name, `%%` a percent sign, and
+/// the file, URL, icon and location codes expand to nothing.
+pub fn exec_args(exec: &str, name: &str) -> Result<Vec<String>> {
+    let mut words: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    let mut started = false;
+    let mut chars = exec.chars();
+    while let Some(c) = chars.next() {
+        if quoted {
+            match c {
+                '"' => quoted = false,
+                '\\' => cur.push(
+                    chars
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("dangling backslash"))?,
+                ),
+                _ => cur.push(c),
+            }
+        } else {
+            match c {
+                '"' => {
+                    quoted = true;
+                    started = true;
+                }
+                ' ' | '\t' => {
+                    if started || !cur.is_empty() {
+                        words.push(std::mem::take(&mut cur));
+                        started = false;
+                    }
+                }
+                _ => cur.push(c),
+            }
+        }
+    }
+    if quoted {
+        bail!("unterminated quote in Exec");
+    }
+    if started || !cur.is_empty() {
+        words.push(cur);
+    }
+    let mut out = Vec::new();
+    for word in words {
+        let mut arg = String::new();
+        let mut drop_if_empty = false;
+        let mut it = word.chars();
+        while let Some(c) = it.next() {
+            if c != '%' {
+                arg.push(c);
+                continue;
+            }
+            match it.next() {
+                Some('%') => arg.push('%'),
+                Some('c') => arg.push_str(name),
+                Some('f' | 'F' | 'u' | 'U' | 'd' | 'D' | 'n' | 'N' | 'i' | 'k' | 'v' | 'm') => {
+                    drop_if_empty = true;
+                }
+                Some(o) => bail!("unknown field code %{o} in Exec"),
+                None => bail!("dangling % in Exec"),
+            }
+        }
+        if !(drop_if_empty && arg.is_empty()) {
+            out.push(arg);
+        }
+    }
+    if out.is_empty() {
+        bail!("Exec names no program");
+    }
+    Ok(out)
+}
+
+pub enum Lookup {
+    Found(Entry),
+    /// Several entries match; their IDs.
+    Ambiguous(Vec<String>),
+    NotFound,
+}
+
+/// The entry a name picks: an exact (case-insensitive) match on an ID, its
+/// last segment, the menu name, the program or the WM class; failing that,
+/// the only entry whose ID or name contains the text.
+pub fn find(entries: &[Entry], query: &str) -> Lookup {
+    let q = query.trim().to_lowercase();
+    let q = q.strip_suffix(".desktop").unwrap_or(&q).to_string();
+    if q.is_empty() {
+        return Lookup::NotFound;
+    }
+    let exact: Vec<&Entry> = entries
+        .iter()
+        .filter(|e| e.names().iter().any(|n| n.to_lowercase() == q))
+        .collect();
+    let pick = |hits: Vec<&Entry>| match hits.as_slice() {
+        [] => None,
+        [one] => Some(Lookup::Found((*one).clone())),
+        many => Some(Lookup::Ambiguous(
+            many.iter().map(|e| e.id.clone()).take(8).collect(),
+        )),
+    };
+    if let Some(r) = pick(exact) {
+        return r;
+    }
+    let partial: Vec<&Entry> = entries
+        .iter()
+        .filter(|e| e.id.to_lowercase().contains(&q) || e.name.to_lowercase().contains(&q))
+        .collect();
+    pick(partial).unwrap_or(Lookup::NotFound)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exec_quoting_and_field_codes() {
+        assert_eq!(exec_args("drawing %U", "Drawing").unwrap(), vec!["drawing"]);
+        assert_eq!(
+            exec_args("env FOO=1 \"my app\" --name=%c %f --x", "My App").unwrap(),
+            vec!["env", "FOO=1", "my app", "--name=My App", "--x"]
+        );
+        assert_eq!(
+            exec_args("a \"b \\\"c\\\" d\" 100%%", "n").unwrap(),
+            vec!["a", "b \"c\" d", "100%"]
+        );
+        assert!(exec_args("\"unterminated", "n").is_err());
+        assert!(exec_args("prog %z", "n").is_err());
+        assert!(exec_args("%F", "n").is_err());
+    }
+
+    #[test]
+    fn parse_and_find() {
+        let calc = parse(
+            "org.gnome.Calculator",
+            "[Desktop Entry]\nName=Calculator\nName[de]=Rechner\nType=Application\nExec=gnome-calculator\nTerminal=false\n[Desktop Action x]\nExec=other\n",
+        )
+        .unwrap();
+        assert_eq!(calc.exec, vec!["gnome-calculator"]);
+        assert!(parse(
+            "hidden",
+            "[Desktop Entry]\nType=Application\nName=H\nExec=h\nNoDisplay=true\n"
+        )
+        .is_none());
+        assert!(parse("link", "[Desktop Entry]\nType=Link\nName=L\nURL=x\n").is_none());
+        let term = parse(
+            "t",
+            "[Desktop Entry]\nType=Application\nName=Term\nExec=xterm\nTerminal=true\n",
+        )
+        .unwrap();
+        assert!(term.terminal);
+        let drawing = parse(
+            "com.github.maoschanz.drawing",
+            "[Desktop Entry]\nName=Drawing\nType=Application\nExec=drawing %U\nStartupWMClass=drawing\n",
+        )
+        .unwrap();
+        let xed = parse(
+            "xed",
+            "[Desktop Entry]\nName=Text Editor\nType=Application\nExec=xed %U\n",
+        )
+        .unwrap();
+        let entries = vec![calc.clone(), drawing.clone(), xed.clone()];
+        for q in [
+            "drawing",
+            "Drawing",
+            "com.github.maoschanz.drawing.desktop",
+            "DRAWING",
+        ] {
+            assert!(
+                matches!(find(&entries, q), Lookup::Found(ref e) if e == &drawing),
+                "{q}"
+            );
+        }
+        assert!(matches!(find(&entries, "gnome-calculator"), Lookup::Found(ref e) if e == &calc));
+        assert!(matches!(find(&entries, "calculator"), Lookup::Found(ref e) if e == &calc));
+        assert!(matches!(find(&entries, "text editor"), Lookup::Found(ref e) if e == &xed));
+        assert!(matches!(find(&entries, "Calc"), Lookup::Found(ref e) if e == &calc));
+        assert!(matches!(find(&entries, "nothing"), Lookup::NotFound));
+        assert!(matches!(find(&entries, ""), Lookup::NotFound));
+        let twin = Entry {
+            id: "other.drawing".into(),
+            ..drawing.clone()
+        };
+        let more = vec![drawing.clone(), twin];
+        assert!(matches!(find(&more, "drawing"), Lookup::Ambiguous(ref ids) if ids.len() == 2));
+    }
+}

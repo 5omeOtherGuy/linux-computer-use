@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+"""Owner menu: pick a live agent workspace and open a viewer for it.
+
+Started from the panel item (agent-desktop-genmon) or a keyboard shortcut.
+"Watch" opens a view-only window; "Take control" lets the owner's mouse and
+keyboard reach the workspace.
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+CLI = os.path.join(HERE, "..", "bin", "agent-desktop")
+if not os.path.exists(CLI):
+    CLI = shutil.which("agent-desktop") or "agent-desktop"
+
+
+def zenity(*args):
+    return subprocess.run(["zenity", *args], capture_output=True, text=True)
+
+
+def age(sec):
+    sec = int(sec)
+    return f"{sec}s" if sec < 90 else f"{sec // 60}m" if sec < 5400 else f"{sec // 3600}h{sec % 3600 // 60:02d}m"
+
+
+def main():
+    r = subprocess.run([CLI, "list", "--json"], capture_output=True, text=True)
+    try:
+        rows = json.loads(r.stdout)
+    except ValueError:
+        zenity("--error", "--title=Agent workspaces", f"--text=agent-desktop list failed:\n{r.stderr[-400:]}")
+        return 1
+    if not rows:
+        zenity("--info", "--title=Agent workspaces", "--text=No agent workspaces are running.", "--timeout=5")
+        return 0
+    cells = []
+    for w in rows:
+        cells += [w["name"], w.get("label") or "", w["display"], age(w["age_s"]), age(w["idle_s"]),
+                  str(w["apps"]), f"{w['pss_mib']:.0f} MiB"]
+    height = min(160 + 28 * len(rows), 600)
+    r = zenity("--list", "--title=Agent workspaces", "--text=Choose a workspace to watch.",
+               f"--width=720", f"--height={height}", "--ok-label=Watch", "--extra-button=Take control",
+               "--cancel-label=Close", "--column=Name", "--column=Label", "--column=Display",
+               "--column=Age", "--column=Idle", "--column=Apps", "--column=RAM",
+               "--print-column=1", *cells)
+    out = r.stdout.strip().splitlines()
+    if not out:
+        return 0
+    # zenity prints only the label for an extra button, not the selected row
+    control = out[0] == "Take control"
+    name = out[0]
+    if control:
+        if len(rows) == 1:
+            name = rows[0]["name"]
+        else:
+            r = zenity("--list", "--title=Take control", "--text=Take control of which workspace?",
+                       "--width=480", f"--height={height}", "--ok-label=Take control",
+                       "--column=Name", "--column=Label", "--print-column=1",
+                       *[c for w in rows for c in (w["name"], w.get("label") or "")])
+            name = r.stdout.strip()
+            if not name:
+                return 0
+    name = name.split("|")[0]
+    args = [CLI, "view", name, "--owner"] + (["--control"] if control else [])
+    r = subprocess.run(args, capture_output=True, text=True)
+    if r.returncode != 0:
+        zenity("--error", "--title=Agent workspaces", f"--text={r.stderr[-400:]}")
+    return r.returncode
+
+
+if __name__ == "__main__":
+    sys.exit(main())

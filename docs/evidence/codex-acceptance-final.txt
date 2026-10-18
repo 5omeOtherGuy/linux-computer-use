@@ -1,6 +1,0 @@
-Success. Using `linux_desktop`, verified:
-
-- Message: `Fresh Codex native desktop acceptance — Grüße 391`
-- Enable option: checked
-- “Saved successfully” visible in the screenshot
-- Window variable persisted across both `desktop_exec` calls; the second printed the exact message and checkbox state.
