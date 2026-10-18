@@ -21,9 +21,11 @@ import time
 from pathlib import Path
 
 UID = os.getuid()
+# Without AGENT_DESKTOP_RUNTIME or XDG_RUNTIME_DIR the runtime directory sits
+# in this directory of /tmp, which another user could have created first.
+TMP_RUNTIME = Path(f"/tmp/agent-desktop-{UID}")
 RUNTIME = Path(os.environ.get("AGENT_DESKTOP_RUNTIME")
-               or os.path.join(os.environ.get("XDG_RUNTIME_DIR") or f"/tmp/agent-desktop-{UID}",
-                               "agent-desktop"))
+               or os.path.join(os.environ.get("XDG_RUNTIME_DIR") or TMP_RUNTIME, "agent-desktop"))
 CACHE = Path(os.environ.get("AGENT_DESKTOP_CACHE")
              or os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
                              "agent-desktop"))
@@ -165,12 +167,43 @@ def marked_pids(ws_id):
     return out
 
 
+def private_dir(path):
+    """Creates `path` (and missing parents) as a directory only this user can
+    enter, or makes an existing one so; refuses a symlink, a non-directory or
+    a directory owned by another user."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as e:
+        raise Fail(f"refusing to use {path}: not a directory ({e.strerror})")
+    try:
+        st = os.fstat(fd)
+        if st.st_uid != UID:
+            raise Fail(f"refusing to use {path}: it belongs to uid {st.st_uid}, not {UID}")
+        if st.st_mode & 0o077:
+            os.fchmod(fd, 0o700)
+    finally:
+        os.close(fd)
+    return path
+
+
+def runtime_dir():
+    if RUNTIME.parent == TMP_RUNTIME:
+        private_dir(TMP_RUNTIME)
+    return private_dir(RUNTIME)
+
+
 class Lock:
     def __init__(self, path):
         self.path = path
 
     def __enter__(self):
-        RUNTIME.mkdir(parents=True, exist_ok=True, mode=0o700)
+        runtime_dir()
         self.f = open(self.path, "w")
         fcntl.flock(self.f, fcntl.LOCK_EX)
         return self
@@ -426,6 +459,15 @@ def wait_for(pred, timeout, step=0.05):
     return pred()
 
 
+def write_xauth(path, n):
+    """A fresh MIT-MAGIC-COOKIE-1 for display :n in the 0600 file `path`. The
+    cookie goes to xauth on stdin, never on a command line other processes
+    can read in /proc."""
+    path.touch(mode=0o600)
+    subprocess.run(["xauth", "-q", "-f", str(path), "source", "-"], check=True, text=True,
+                   input=f"add :{n} MIT-MAGIC-COOKIE-1 {secrets.token_hex(16)}\n")
+
+
 # ---------------------------------------------------------------- commands
 
 def cmd_new(a):
@@ -452,13 +494,13 @@ def cmd_new(a):
         w.dir.mkdir(parents=True, mode=0o700)
         (w.dir / "run").mkdir(mode=0o700)
         (w.dir / "touch").touch()
+        # Logs, screenshots and the private HOME are the workspace's own.
+        private_dir(w.files)
         logs = w.files / "logs"
-        logs.mkdir(parents=True, exist_ok=True)
+        logs.mkdir(exist_ok=True)
         (w.files / "shots").mkdir(exist_ok=True)
         xauth = w.dir / "Xauthority"
-        xauth.touch(mode=0o600)
-        subprocess.run(["xauth", "-q", "-f", str(xauth), "add", f":{n}", "MIT-MAGIC-COOKIE-1",
-                        secrets.token_hex(16)], check=True)
+        write_xauth(xauth, n)
         owner = None
         if a.owner_pid == "auto":
             owner = find_owner_session()
@@ -847,7 +889,7 @@ def cmd_gc(a):
 
 
 def cmd_reaper(a):
-    RUNTIME.mkdir(parents=True, exist_ok=True, mode=0o700)
+    runtime_dir()
     f = open(RUNTIME / "reaper.lock", "w")
     try:
         fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)

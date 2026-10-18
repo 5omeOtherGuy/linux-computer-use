@@ -1,4 +1,4 @@
-"""Close authorization regressions; no X server, GUI, or existing workspace touched."""
+"""Close authorization and private-file regressions; no X server, GUI, or existing workspace touched."""
 import contextlib
 import importlib.machinery
 import importlib.util
@@ -214,6 +214,64 @@ class CreatorIdentityTests(unittest.TestCase):
                 ad.cmd_close(SimpleNamespace(all=False, ws=['foreign'], keep_files=False))
             self.assertEqual(result.exception.code, 3)
             close.assert_not_called()
+
+
+class PrivateFilesTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='adt-private-')
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def mode(self, p):
+        return os.lstat(p).st_mode & 0o777
+
+    def test_private_dir_creates_or_tightens_and_refuses_what_it_does_not_own(self):
+        new = ad.private_dir(self.root / 'a' / 'b')
+        self.assertEqual(self.mode(new), 0o700)
+        loose = self.root / 'loose'
+        loose.mkdir(mode=0o755)
+        os.chmod(loose, 0o777)
+        ad.private_dir(loose)
+        self.assertEqual(self.mode(loose), 0o700)
+        os.symlink(new, self.root / 'link')
+        (self.root / 'file').write_text('')
+        for bad in ('link', 'file'):
+            with self.assertRaises(ad.Fail):
+                ad.private_dir(self.root / bad)
+        self.assertEqual(self.mode(new), 0o700)
+
+    def test_runtime_dir_in_tmp_checks_its_parent_too(self):
+        parent = self.root / f'agent-desktop-{os.getuid()}'
+        parent.mkdir()
+        os.chmod(parent, 0o777)  # as if created by someone else's umask
+        with patch.object(ad, 'TMP_RUNTIME', parent), \
+                patch.object(ad, 'RUNTIME', parent / 'agent-desktop'):
+            ad.runtime_dir()
+            self.assertEqual(self.mode(parent), 0o700)
+            self.assertEqual(self.mode(parent / 'agent-desktop'), 0o700)
+            parent.chmod(0o700)
+            (parent / 'agent-desktop').rmdir()
+            os.symlink(self.root, parent / 'agent-desktop')
+            with self.assertRaises(ad.Fail):
+                ad.runtime_dir()
+
+    def test_xauth_cookie_is_not_on_the_command_line(self):
+        bin_dir = self.root / 'bin'
+        bin_dir.mkdir()
+        record = self.root / 'record'
+        fake = bin_dir / 'xauth'
+        fake.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > {record}.argv\ncat > {record}.stdin\n')
+        fake.chmod(0o755)
+        path = self.root / 'Xauthority'
+        with patch.dict(os.environ, {'PATH': f'{bin_dir}:{os.environ.get("PATH", "")}'}):
+            ad.write_xauth(path, 123)
+        argv = Path(f'{record}.argv').read_text()
+        stdin = Path(f'{record}.stdin').read_text()
+        cookie = stdin.split()[-1]
+        self.assertRegex(stdin, r'^add :123 MIT-MAGIC-COOKIE-1 [0-9a-f]{32}\n$')
+        self.assertNotIn(cookie, argv)
+        self.assertEqual(argv.split(), ['-q', '-f', str(path), 'source', '-'])
+        self.assertEqual(self.mode(path), 0o600)
 
 
 if __name__ == '__main__':
