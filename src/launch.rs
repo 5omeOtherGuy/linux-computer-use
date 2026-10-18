@@ -3,7 +3,13 @@
 //! it from the menu, never a command line. Only `Type=Application` entries
 //! that a menu would show (not `NoDisplay`, not `Hidden`) are launchable,
 //! and `Exec` field codes are expanded with no files or URLs.
+//!
+//! The apps the model drives run as the same user as the daemon, so a
+//! desktop entry or program that this user can write is not trusted: it is
+//! never launched, though an entry still hides the same ID in directories
+//! of lower precedence.
 
+use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
@@ -65,9 +71,12 @@ pub fn data_dirs() -> Vec<PathBuf> {
         .collect()
 }
 
-/// All launchable entries in `dirs`; an ID found in an earlier directory
-/// hides the same ID in later ones.
-pub fn load(dirs: &[PathBuf]) -> Vec<Entry> {
+/// All launchable entries in `dirs`. The first file with an ID decides it
+/// (freedesktop precedence): one that is `Hidden`, `NoDisplay`, not an
+/// application, unreadable or not `trusted` hides the same ID in later
+/// directories instead of falling through to them.
+pub fn load(dirs: &[PathBuf], trusted: &dyn Fn(&Path) -> bool) -> Vec<Entry> {
+    let mut seen = std::collections::HashSet::new();
     let mut out: Vec<Entry> = Vec::new();
     for dir in dirs {
         let Ok(rd) = std::fs::read_dir(dir) else {
@@ -83,7 +92,7 @@ pub fn load(dirs: &[PathBuf]) -> Vec<Entry> {
             else {
                 continue;
             };
-            if out.iter().any(|e| e.id == id) {
+            if !seen.insert(id.to_string()) || !trusted(dir) || !trusted(&file) {
                 continue;
             }
             let Ok(text) = std::fs::read_to_string(&file) else {
@@ -95,6 +104,84 @@ pub fn load(dirs: &[PathBuf]) -> Vec<Entry> {
         }
     }
     out
+}
+
+/// Whether this user cannot change what the absolute `path` names: every
+/// directory and file met while resolving it, through every symlink, is
+/// owned by another user (normally root) and writable by neither group nor
+/// others. Fails closed: a relative path, one that cannot be resolved or
+/// examined, and everything while the daemon runs as root are not trusted.
+pub fn trusted(path: &Path) -> bool {
+    let euid = unsafe { libc::geteuid() };
+    let safe = |m: &std::fs::Metadata| m.uid() != euid && m.mode() & 0o022 == 0;
+    let parts = |p: &Path| -> Vec<std::ffi::OsString> {
+        p.components()
+            .rev()
+            .map(|c| c.as_os_str().to_owned())
+            .collect()
+    };
+    if !path.is_absolute() || !std::fs::metadata("/").is_ok_and(|m| safe(&m)) {
+        return false;
+    }
+    let mut cur = PathBuf::from("/");
+    let mut todo = parts(path);
+    let mut links = 0;
+    while let Some(part) = todo.pop() {
+        match part.to_str() {
+            Some("/") => cur = PathBuf::from("/"),
+            Some(".") => {}
+            Some("..") => {
+                cur.pop();
+            }
+            _ => {
+                let next = cur.join(&part);
+                let Ok(m) = std::fs::symlink_metadata(&next) else {
+                    return false;
+                };
+                if m.file_type().is_symlink() {
+                    // The link lives in `cur`, which is trusted; where it
+                    // points is checked as the walk continues.
+                    links += 1;
+                    let Ok(target) = std::fs::read_link(&next) else {
+                        return false;
+                    };
+                    if links > 40 {
+                        return false;
+                    }
+                    todo.extend(parts(&target));
+                } else if safe(&m) {
+                    cur = next;
+                } else {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+/// The absolute path of the program an entry runs: `program` itself when it
+/// is absolute, else the first executable file of that name in a `PATH`
+/// directory. Only `trusted` locations count, so a program this user could
+/// have written (`~/.local/bin`, a writable `PATH` entry) is never started.
+pub fn resolve_program(
+    program: &str,
+    path_var: &str,
+    trusted: &dyn Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    let runnable = |p: &Path| {
+        std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.mode() & 0o111 != 0) && trusted(p)
+    };
+    if program.contains('/') {
+        let p = Path::new(program);
+        return (p.is_absolute() && runnable(p)).then(|| p.to_path_buf());
+    }
+    path_var
+        .split(':')
+        .map(Path::new)
+        .filter(|d| d.is_absolute())
+        .map(|d| d.join(program))
+        .find(|p| runnable(p))
 }
 
 /// The `[Desktop Entry]` group of a desktop file, if it is a launchable
@@ -332,5 +419,104 @@ mod tests {
         };
         let more = vec![drawing.clone(), twin];
         assert!(matches!(find(&more, "drawing"), Lookup::Ambiguous(ref ids) if ids.len() == 2));
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("linux-cua-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Regression: a `Hidden`/`NoDisplay` entry did not hide the same ID in a
+    /// lower-precedence directory, and entries this user can write were
+    /// launched like system ones.
+    #[test]
+    fn first_entry_decides_and_untrusted_entries_are_not_launched() {
+        let root = scratch("load");
+        let (user, system) = (root.join("user"), root.join("system"));
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::create_dir_all(&system).unwrap();
+        let app = |name: &str, extra: &str| {
+            format!("[Desktop Entry]\nType=Application\nName={name}\nExec={name}\n{extra}")
+        };
+        std::fs::write(user.join("xed.desktop"), app("xed", "Hidden=true\n")).unwrap();
+        std::fs::write(user.join("calc.desktop"), app("calc", "NoDisplay=true\n")).unwrap();
+        std::fs::write(user.join("drawing.desktop"), app("sh", "")).unwrap();
+        std::fs::write(user.join("mine.desktop"), app("mine", "")).unwrap();
+        for id in ["xed", "calc", "drawing", "other"] {
+            std::fs::write(system.join(format!("{id}.desktop")), app(id, "")).unwrap();
+        }
+        let trusted = |p: &Path| !p.starts_with(&user);
+        let ids: Vec<String> = load(&[user.clone(), system.clone()], &trusted)
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert_eq!(ids, vec!["other"]);
+        // The same files when everything is trusted.
+        let ids: Vec<String> = load(&[user, system], &|_| true)
+            .into_iter()
+            .map(|e| e.exec[0].clone())
+            .collect();
+        assert_eq!(ids, vec!["sh", "mine", "other"]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn files_this_user_can_write_are_not_trusted() {
+        let root = scratch("trust");
+        let file = root.join("x.desktop");
+        std::fs::write(&file, "").unwrap();
+        assert!(!trusted(&file));
+        assert!(!trusted(&root));
+        assert!(!trusted(Path::new("relative/x.desktop")));
+        assert!(!trusted(&root.join("missing")));
+        // A link this user made to a system file is not trusted either.
+        let link = root.join("link");
+        std::os::unix::fs::symlink("/", &link).unwrap();
+        assert!(!trusted(&link));
+        if unsafe { libc::geteuid() } != 0 {
+            let root_dir = std::fs::metadata("/").unwrap();
+            assert_eq!(
+                trusted(Path::new("/")),
+                root_dir.uid() == 0 && root_dir.mode() & 0o022 == 0
+            );
+        } else {
+            assert!(!trusted(Path::new("/")), "nothing is trusted as root");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn programs_resolve_only_through_trusted_locations() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = scratch("path");
+        let (writable, system) = (root.join("home-bin"), root.join("usr-bin"));
+        for d in [&writable, &system] {
+            std::fs::create_dir_all(d).unwrap();
+            let prog = d.join("prog");
+            std::fs::write(&prog, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&prog, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(system.join("data"), "").unwrap();
+        let trusted = |p: &Path| p.starts_with(&system);
+        let path_var = format!("{}:relative:{}", writable.display(), system.display());
+        assert_eq!(
+            resolve_program("prog", &path_var, &trusted),
+            Some(system.join("prog"))
+        );
+        assert_eq!(resolve_program("data", &path_var, &trusted), None);
+        assert_eq!(resolve_program("missing", &path_var, &trusted), None);
+        let absolute = writable.join("prog");
+        assert_eq!(
+            resolve_program(absolute.to_str().unwrap(), "", &trusted),
+            None
+        );
+        assert_eq!(
+            resolve_program(absolute.to_str().unwrap(), "", &|_| true),
+            Some(absolute)
+        );
+        assert_eq!(resolve_program("home-bin/prog", "", &|_| true), None);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

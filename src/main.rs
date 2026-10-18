@@ -282,7 +282,7 @@ impl Engine {
                 "launching applications is not available on a live desktop".into(),
             ));
         }
-        let entries = launch::load(&launch::data_dirs());
+        let entries = launch::load(&launch::data_dirs(), &launch::trusted);
         let entry = match launch::find(&entries, query) {
             launch::Lookup::Found(e) => e,
             launch::Lookup::Ambiguous(ids) => {
@@ -294,7 +294,7 @@ impl Engine {
             launch::Lookup::NotFound => {
                 return Err(x11_error(
                     "not_found",
-                    format!("no installed application matches {query:?} (a desktop entry ID such as org.gnome.Calculator, its last part, the menu name or the program name)"),
+                    format!("no installed application matches {query:?} (a desktop entry ID such as org.gnome.Calculator, its last part, the menu name or the program name; entries this user can write, such as those in ~/.local/share/applications, are not launched)"),
                 ))
             }
         };
@@ -313,7 +313,18 @@ impl Engine {
             .iter()
             .map(|w| w.window_id)
             .collect();
-        let mut cmd = std::process::Command::new(&entry.exec[0]);
+        let path_var = std::env::var("PATH").unwrap_or_default();
+        let Some(program) = launch::resolve_program(&entry.exec[0], &path_var, &launch::trusted)
+        else {
+            return Err(x11_error(
+                "launch_failed",
+                format!(
+                    "cannot start {}: {} is not an executable in a directory this user cannot write",
+                    entry.name, entry.exec[0]
+                ),
+            ));
+        };
+        let mut cmd = std::process::Command::new(&program);
         cmd.args(&entry.exec[1..])
             .env("DISPLAY", self.desktop.display())
             .stdin(std::process::Stdio::null())
@@ -328,7 +339,7 @@ impl Engine {
         }
         {
             use std::os::unix::process::CommandExt as _;
-            cmd.process_group(0);
+            cmd.arg0(&entry.exec[0]).process_group(0);
         }
         let mut child = cmd.spawn().map_err(|e| {
             x11_error(
