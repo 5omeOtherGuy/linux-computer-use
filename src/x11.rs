@@ -936,6 +936,20 @@ impl Desktop {
         .check()
         .context("creating helper window")?;
 
+        // Clipboard owner changes, so a read can tell that the owner it
+        // authorized is still the one answering.
+        if live.is_none() {
+            conn.xfixes_select_selection_input(
+                helper,
+                atoms.CLIPBOARD,
+                xfixes::SelectionEventMask::SET_SELECTION_OWNER
+                    | xfixes::SelectionEventMask::SELECTION_WINDOW_DESTROY
+                    | xfixes::SelectionEventMask::SELECTION_CLIENT_CLOSE,
+            )?
+            .check()
+            .context("selecting clipboard owner events")?;
+        }
+
         let keymap = Keymap::load(&conn)?;
         conn.flush()?;
 
@@ -1008,8 +1022,15 @@ impl Desktop {
     }
 
     /// The CLIPBOARD contents as text, `None` when nobody owns the
-    /// selection or the owner offers no text.
-    pub fn clipboard_read(&mut self) -> Result<Option<String>> {
+    /// selection or the owner offers no text. Text this daemon put there
+    /// is returned as is. Otherwise the owner must be the client (or the
+    /// process) of a listed window, and `authorize` must accept that window
+    /// before the contents are requested; the read fails if the selection
+    /// changes hands meanwhile.
+    pub fn clipboard_read(
+        &mut self,
+        authorize: impl Fn(&WindowInfo) -> Result<()>,
+    ) -> Result<Option<String>> {
         if self.live.is_some() {
             return Err(xerr(
                 "unsupported",
@@ -1019,14 +1040,32 @@ impl Desktop {
         if let Some(text) = self.clipboard.as_ref().and_then(|o| o.owned_text()) {
             return Ok(Some(text));
         }
-        let owner = self
-            .conn
-            .get_selection_owner(self.atoms.CLIPBOARD)?
-            .reply()?
-            .owner;
+        let cookie = self.conn.get_selection_owner(self.atoms.CLIPBOARD)?;
+        // Owner changes the server reports with this sequence number or a
+        // later one happened after `owner` was read.
+        let since = cookie.sequence_number();
+        let owner = cookie.reply()?.owner;
         if owner == NONE {
             return Ok(None);
         }
+        let (base, pid) = self
+            .owners(&[owner])?
+            .first()
+            .copied()
+            .flatten()
+            .unwrap_or((self.client_base(owner), 0));
+        let wins = self.describe(&self.candidates()?)?;
+        let app = wins
+            .iter()
+            .find(|w| self.client_base(w.window_id) == base)
+            .or_else(|| wins.iter().find(|w| pid != 0 && w.pid == pid));
+        let Some(app) = app else {
+            return Err(xerr(
+                "app_denied",
+                "the clipboard belongs to a client with no listed window, so its app cannot be checked; nothing was read",
+            ));
+        };
+        authorize(app)?;
         let time = self.server_time()?;
         self.conn.convert_selection(
             self.helper,
@@ -1039,10 +1078,23 @@ impl Desktop {
         let start = Instant::now();
         let property = loop {
             if let Some((ev, seq)) = self.conn.poll_for_event_with_sequence()? {
-                if let Event::SelectionNotify(e) = &ev {
-                    if e.requestor == self.helper && e.selection == self.atoms.CLIPBOARD {
+                match &ev {
+                    Event::SelectionNotify(e)
+                        if e.requestor == self.helper
+                            && e.selection == self.atoms.CLIPBOARD
+                            && e.time == time =>
+                    {
                         break e.property;
                     }
+                    Event::XfixesSelectionNotify(e)
+                        if e.selection == self.atoms.CLIPBOARD && seq >= since =>
+                    {
+                        return Err(xerr(
+                            "clipboard_changed",
+                            "the clipboard changed while it was read; nothing was read, read it again",
+                        ));
+                    }
+                    _ => {}
                 }
                 self.handle(ev, seq)?;
                 continue;

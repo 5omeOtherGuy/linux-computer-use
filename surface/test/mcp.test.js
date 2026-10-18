@@ -545,6 +545,36 @@ describe('approval identity', () => {
   });
 });
 
+describe('clipboard owner', () => {
+  test('reading text an app copied needs that app approved in the current turn; deny wins', async () => {
+    let answer = 'accept';
+    const t = await startClient({ decide: () => answer });
+    try {
+      let r = await t.js('const n = await cua.getApp({windowId: 12}, {emit: false}); await n.pressKey("ctrl+c"); 1');
+      assert.equal(r.isError, false, t.text(r));
+      r = await t.js('await cua.clipboard.read()');
+      assert.match(t.text(r), /=> copied in org\.example\.Calc$/m, 'approved this turn');
+      await t.client.callTool({ name: 'turn_ended', arguments: {} });
+      answer = 'decline';
+      const asked = t.elicitations.length;
+      r = await t.js('try { await cua.clipboard.read() } catch (e) { e.code }');
+      assert.match(t.text(r), /=> approval_denied/);
+      assert.equal(t.elicitations.length, asked + 1, 'the new turn asks again');
+      assert.match(t.elicitations.at(-1).message, /org\.example\.Calc/);
+    } finally {
+      await t.close();
+    }
+    const d = await startClient({ decide: () => 'accept', env: { CUA_DENY_APPS: 'org.example.Vault', FAKE_CLIPBOARD_OWNER: '13' } });
+    try {
+      const r = await d.js('try { await cua.clipboard.read() } catch (e) { e.code }');
+      assert.match(d.text(r), /=> app_denied/);
+      assert.equal(d.elicitations.length, 0, 'a denied owner is never offered for approval');
+    } finally {
+      await d.close();
+    }
+  });
+});
+
 describe('fail-closed configuration', () => {
   test('refuses display :0', () => {
     for (const display of [':0', ':0.0', 'unix:0', '']) {
