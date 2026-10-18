@@ -17,11 +17,13 @@
 //   node benchmarks/run.mjs --label <change> [--iterations N] [--record]
 //   node benchmarks/run.mjs --task reimburse --agent codex --model gpt-6.1-sol --effort low
 //   node benchmarks/run.mjs --task xed-note --agent claude --model claude-opus-5-5 --record
-//   node benchmarks/run.mjs --task webform --controller agent-desktop --agent claude --model claude-opus-5-5 --effort low
+//   node benchmarks/run.mjs --task webform --controller agent-desktop --allow-full-access --agent claude --model claude-opus-5-5 --effort low
 //
-// `--controller agent-desktop --agent codex` runs Codex without its sandbox
-// (`danger-full-access`, never asking) and therefore needs
-// `--allow-full-access`; the command rule is only checked afterwards.
+// `--controller agent-desktop` needs `--allow-full-access`: Codex runs
+// without its sandbox (`danger-full-access`, never asking), and Claude may run
+// any `agent-desktop` command, including `agent-desktop run WS -- PROGRAM`,
+// which starts any program as the caller. The command rule is only checked
+// afterwards.
 //
 // Results append to $BENCH_ROOT/results.jsonl (default ~/.cache/linux-cua-bench);
 // `node benchmarks/report.mjs` summarises them.
@@ -62,10 +64,11 @@ if (!task || !['codex', 'claude'].includes(o.agent) || !['cua', 'agent-desktop']
   throw Error(`Usage: run.mjs --task ${Object.keys(TASKS).join('|')} [--controller cua|agent-desktop] --agent codex|claude --model MODEL [--effort E] [--tier T] [--surface js|json|all] [--iterations N] [--record] [--allow-full-access]`);
 }
 const AD = o.controller === 'agent-desktop';
-if (AD && o.agent === 'codex' && !o['allow-full-access']) {
-  throw Error('--controller agent-desktop --agent codex runs Codex with danger-full-access and approval_policy="never" '
-    + '(its sandbox hides the workspace processes); the shell rule is only checked afterwards. '
-    + 'Pass --allow-full-access to run it on this machine anyway.');
+if (AD && !o['allow-full-access']) {
+  throw Error('--controller agent-desktop gives the agent full access to this machine: Codex runs with danger-full-access '
+    + 'and approval_policy="never" (its sandbox hides the workspace processes), and Claude may run any agent-desktop command, '
+    + 'including `agent-desktop run WS -- PROGRAM`; the shell rule is only checked afterwards. '
+    + 'Pass --allow-full-access to run it anyway.');
 }
 const benchRoot = process.env.BENCH_ROOT || join(homedir(), '.cache/linux-cua-bench');
 const GEOMETRY = '1440x900';
