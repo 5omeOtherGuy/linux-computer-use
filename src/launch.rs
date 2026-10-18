@@ -713,11 +713,11 @@ mod tests {
         let writable_first = format!("{}:{}", writable.display(), sys);
         let all_trusted_dirs = |p: &Path| p.starts_with(&system) || p == writable;
         assert!(command(&entry("envtool", None), &writable_first, &all_trusted_dirs).is_err());
-        // env moves on when the first python3 cannot be executed, so every
-        // python3 on PATH counts, executable or not.
+        // env moves on when the first python3 fails to execute, so every
+        // python3 on PATH counts, not only the first trusted executable one.
         let both = root.join("both");
         std::fs::create_dir_all(&both).unwrap();
-        std::fs::write(both.join("python3"), "\x7fELF").unwrap(); // mode 0644
+        put(both.join("python3"), "\x7fELF".into());
         let two_dirs = format!("{}:{}", both.display(), writable.display());
         let dirs_trusted = |p: &Path| {
             p.starts_with(&system) || p == both || p == writable || p == both.join("python3")
