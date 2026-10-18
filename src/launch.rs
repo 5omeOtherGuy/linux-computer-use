@@ -235,7 +235,7 @@ pub fn command(
         let p = resolve_program(prog, path_var, trusted).ok_or_else(|| {
             format!("{prog} is not an executable in a location this user cannot write")
         })?;
-        interpreters(&p, &path, trusted)?;
+        interpreters(&p, &path, trusted, 0)?;
         Ok::<_, String>(p)
     };
     let program = resolve(&entry.exec[0])?;
@@ -279,63 +279,72 @@ pub fn command(
 }
 
 /// Checks the interpreter chain of `program` (a script's `#!` line, up to
-/// the kernel's four levels): each interpreter must be `trusted`, and for
-/// `#!/usr/bin/env NAME` the first `NAME` in `path`, which `env` will run,
-/// must be too.
+/// five levels): each interpreter must be `trusted`, and for
+/// `#!/usr/bin/env NAME` every `NAME` in `path` must be, since `env` moves
+/// on to the next one when one fails to execute. The line is read as the
+/// kernel reads it (bytes, split at spaces and tabs); anything else in it,
+/// such as a carriage return, invalid UTF-8 or env options, is refused.
 fn interpreters(
     program: &Path,
     path: &str,
     trusted: &dyn Fn(&Path) -> bool,
+    depth: u32,
 ) -> std::result::Result<(), String> {
-    let mut cur = program.to_path_buf();
-    for _ in 0..5 {
-        let mut head = [0u8; 256];
-        let n = std::fs::File::open(&cur)
-            .and_then(|mut f| std::io::Read::read(&mut f, &mut head))
-            .map_err(|e| format!("cannot read {}: {e}", cur.display()))?;
-        let Some(line) = head[..n].strip_prefix(b"#!") else {
-            return Ok(());
-        };
-        let line = line.split(|&b| b == b'\n').next().unwrap_or_default();
-        let line = String::from_utf8_lossy(line);
-        let line = line.trim();
-        let (interp, arg) = line.split_once([' ', '\t']).unwrap_or((line, ""));
-        let (interp, arg) = (Path::new(interp), arg.trim());
-        if !interp.is_absolute() || !trusted(interp) {
-            return Err(format!(
-                "{} runs {}, which this user can write",
-                cur.display(),
-                interp.display()
-            ));
-        }
-        cur = if interp.file_name().is_some_and(|n| n == "env") {
-            if arg.is_empty() || arg.starts_with('-') || arg.contains(['=', '/', ' ', '\t']) {
-                return Err(format!(
-                    "{} uses an unsupported env line: {line}",
-                    cur.display()
-                ));
-            }
-            let first = path
-                .split(':')
-                .map(|d| Path::new(d).join(arg))
-                .find(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.mode() & 0o111 != 0));
-            match first {
-                Some(p) if trusted(&p) => p,
-                _ => {
-                    return Err(format!(
-                        "{} runs {arg}, which is missing from PATH or writable by this user",
-                        cur.display()
-                    ))
-                }
-            }
-        } else {
-            interp.to_path_buf()
-        };
+    let refuse = |why: &str| Err(format!("{}: {why}", program.display()));
+    if depth > 5 {
+        return refuse("interpreters nest too deeply");
     }
-    Err(format!(
-        "{} nests interpreters too deeply",
-        program.display()
-    ))
+    let mut head = [0u8; 256];
+    let n = match std::fs::File::open(program)
+        .and_then(|mut f| std::io::Read::read(&mut f, &mut head))
+    {
+        Ok(n) => n,
+        Err(e) => return refuse(&format!("cannot read it ({e})")),
+    };
+    let Some(rest) = head[..n].strip_prefix(b"#!") else {
+        return Ok(());
+    };
+    let Some(end) = rest.iter().position(|&b| b == b'\n') else {
+        return refuse("its #! line is too long");
+    };
+    let Ok(line) = std::str::from_utf8(&rest[..end]) else {
+        return refuse("its #! line is not UTF-8");
+    };
+    if line.chars().any(|c| c.is_control() && c != '\t') {
+        return refuse("its #! line has control characters");
+    }
+    let line = line.trim_matches([' ', '\t']);
+    let (interp, arg) = line.split_once([' ', '\t']).unwrap_or((line, ""));
+    let (interp, arg) = (Path::new(interp), arg.trim_matches([' ', '\t']));
+    if !interp.is_absolute() || !trusted(interp) {
+        return refuse(&format!(
+            "its interpreter {} is not trusted",
+            interp.display()
+        ));
+    }
+    if interp.file_name().is_none_or(|n| n != "env") {
+        return interpreters(interp, path, trusted, depth + 1);
+    }
+    if arg.is_empty() || arg.starts_with('-') || arg.contains(['=', '/', ' ', '\t']) {
+        return refuse(&format!("unsupported #! line {line}"));
+    }
+    let mut found = false;
+    for candidate in path.split(':').map(|d| Path::new(d).join(arg)) {
+        if std::fs::symlink_metadata(&candidate).is_err() {
+            continue;
+        }
+        if !trusted(&candidate) {
+            return refuse(&format!("{} is not trusted", candidate.display()));
+        }
+        if candidate.is_file() {
+            interpreters(&candidate, path, trusted, depth + 1)?;
+            found = true;
+        }
+    }
+    if !found {
+        return refuse(&format!("{arg} is not on PATH"));
+    }
+    Ok(())
 }
 
 /// The absolute path of the program an entry runs: `program` itself when it
@@ -704,7 +713,28 @@ mod tests {
         let writable_first = format!("{}:{}", writable.display(), sys);
         let all_trusted_dirs = |p: &Path| p.starts_with(&system) || p == writable;
         assert!(command(&entry("envtool", None), &writable_first, &all_trusted_dirs).is_err());
+        // env moves on when the first python3 cannot be executed, so every
+        // python3 on PATH counts, executable or not.
+        let both = root.join("both");
+        std::fs::create_dir_all(&both).unwrap();
+        std::fs::write(both.join("python3"), "\x7fELF").unwrap(); // mode 0644
+        let two_dirs = format!("{}:{}", both.display(), writable.display());
+        let dirs_trusted = |p: &Path| {
+            p.starts_with(&system) || p == both || p == writable || p == both.join("python3")
+        };
+        let envtool = format!("{sys}/envtool");
+        assert!(command(&entry(&envtool, None), &two_dirs, &dirs_trusted).is_err());
+        let one_dir = both.display().to_string();
+        assert!(command(&entry(&envtool, None), &one_dir, &dirs_trusted).is_ok());
+        // The kernel keeps a carriage return in the interpreter name.
+        put(
+            system.join("crlf"),
+            format!("#!{} python3\r\n", env.display()),
+        );
+        put(system.join("crlf2"), format!("#!{sys}/python3\r\n"));
         for bad in [
+            "crlf",
+            "crlf2",
             "env -S drawing",
             "env -u=X drawing",
             "env FOO=1",
