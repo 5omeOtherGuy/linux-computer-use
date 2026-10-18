@@ -96,12 +96,20 @@ pub(crate) struct Trace {
 impl Trace {
     pub(crate) fn new(what: impl Into<String>) -> Self {
         let now = Instant::now();
-        Trace { what: what.into(), start: now, last: now, parts: Vec::new() }
+        Trace {
+            what: what.into(),
+            start: now,
+            last: now,
+            parts: Vec::new(),
+        }
     }
     /// Records the time since the previous mark under `name`.
     pub(crate) fn mark(&mut self, name: &str) {
         let now = Instant::now();
-        self.parts.push(format!("{name}={:.1}", (now - self.last).as_secs_f64() * 1000.0));
+        self.parts.push(format!(
+            "{name}={:.1}",
+            (now - self.last).as_secs_f64() * 1000.0
+        ));
         self.last = now;
     }
     pub(crate) fn note(&mut self, name: &str, value: impl std::fmt::Display) {
@@ -123,19 +131,40 @@ impl Trace {
 /// open dialogs ("ctrl+shift+s", "F2"), unlike typing, arrows or Tab, and
 /// unlike the editing chords (select all, clipboard, undo, moving the caret).
 fn is_shortcut(key: &str) -> bool {
-    let parts: Vec<String> = key.split('+').map(|s| s.trim().to_ascii_lowercase()).collect();
+    let parts: Vec<String> = key
+        .split('+')
+        .map(|s| s.trim().to_ascii_lowercase())
+        .collect();
     let last = parts.last().map(String::as_str).unwrap_or_default();
     let fkey = last.len() > 1 && last.starts_with('f') && last[1..].parse::<u8>().is_ok();
     let editing = matches!(
         last,
-        "a" | "c" | "x" | "v" | "z" | "y" | "home" | "end" | "left" | "right" | "up" | "down"
-            | "backspace" | "delete" | "page_up" | "page_down" | "prior" | "next"
+        "a" | "c"
+            | "x"
+            | "v"
+            | "z"
+            | "y"
+            | "home"
+            | "end"
+            | "left"
+            | "right"
+            | "up"
+            | "down"
+            | "backspace"
+            | "delete"
+            | "page_up"
+            | "page_down"
+            | "prior"
+            | "next"
     );
     fkey || (parts.len() > 1
         && !editing
-        && parts[..parts.len() - 1]
-            .iter()
-            .any(|m| matches!(m.as_str(), "ctrl" | "control" | "alt" | "super" | "meta" | "win")))
+        && parts[..parts.len() - 1].iter().any(|m| {
+            matches!(
+                m.as_str(),
+                "ctrl" | "control" | "alt" | "super" | "meta" | "win"
+            )
+        }))
 }
 
 /// CPU time of all threads of `pid` (nanoseconds; 0 when unreadable).
@@ -193,7 +222,12 @@ impl Engine {
         }
     }
 
-    async fn observe(&mut self, w: &WindowInfo, wins: &[WindowInfo], settle_ms: f64) -> Result<Value> {
+    async fn observe(
+        &mut self,
+        w: &WindowInfo,
+        wins: &[WindowInfo],
+        settle_ms: f64,
+    ) -> Result<Value> {
         let start = Instant::now();
         let (text, mut warnings) = if let Some(ax) = &mut self.ax {
             let snapshot = ax.snapshot(w).await?;
@@ -202,7 +236,10 @@ impl Engine {
             self.ax_error_reported = true;
             (String::new(), vec![self.ax_error.clone()])
         } else {
-            (String::new(), vec!["no accessibility tree (AT-SPI unavailable)".to_string()])
+            (
+                String::new(),
+                vec!["no accessibility tree (AT-SPI unavailable)".to_string()],
+            )
         };
         if text.is_empty() && warnings.is_empty() {
             warnings.push("no accessibility tree".into());
@@ -265,16 +302,28 @@ impl Engine {
             return Err(ProtocolError(json!({"code":"app_denied","message":format!("{} runs in a terminal, which is denied", entry.name)})).into());
         }
         if let Some(reason) = self.policy.launch_denied(&entry.names()) {
-            return Err(ProtocolError(json!({"code":"app_denied","message":format!("{}: {reason}", entry.name)})).into());
+            return Err(ProtocolError(
+                json!({"code":"app_denied","message":format!("{}: {reason}", entry.name)}),
+            )
+            .into());
         }
-        let before: HashSet<u32> = self.desktop.list_windows()?.iter().map(|w| w.window_id).collect();
+        let before: HashSet<u32> = self
+            .desktop
+            .list_windows()?
+            .iter()
+            .map(|w| w.window_id)
+            .collect();
         let mut cmd = std::process::Command::new(&entry.exec[0]);
         cmd.args(&entry.exec[1..])
             .env("DISPLAY", self.desktop.display())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        if let Some(dir) = entry.path.as_ref().filter(|p| std::path::Path::new(p).is_dir()) {
+        if let Some(dir) = entry
+            .path
+            .as_ref()
+            .filter(|p| std::path::Path::new(p).is_dir())
+        {
             cmd.current_dir(dir);
         }
         {
@@ -282,7 +331,10 @@ impl Engine {
             cmd.process_group(0);
         }
         let mut child = cmd.spawn().map_err(|e| {
-            x11_error("launch_failed", format!("cannot start {} ({}): {e}", entry.name, entry.exec[0]))
+            x11_error(
+                "launch_failed",
+                format!("cannot start {} ({}): {e}", entry.name, entry.exec[0]),
+            )
         })?;
         let pid = child.id();
         let start = Instant::now();
@@ -321,14 +373,18 @@ impl Engine {
             if !mine.is_empty() {
                 let ids: Vec<u32> = mine.iter().map(|w| w.window_id).collect();
                 let mut list = self.window_list()?;
-                list.as_array_mut()
-                    .expect("window list")
-                    .retain(|w| w["window_id"].as_u64().is_some_and(|id| ids.contains(&(id as u32))));
+                list.as_array_mut().expect("window list").retain(|w| {
+                    w["window_id"]
+                        .as_u64()
+                        .is_some_and(|id| ids.contains(&(id as u32)))
+                });
                 if exited.is_none() {
                     self.children.push(child);
                 }
-                return Ok(json!({"app":entry.id,"name":entry.name,"pid":pid,"windows":list,"warnings":warnings,
-                    "timing":{"launch_ms":start.elapsed().as_secs_f64()*1000.0}}));
+                return Ok(
+                    json!({"app":entry.id,"name":entry.name,"pid":pid,"windows":list,"warnings":warnings,
+                    "timing":{"launch_ms":start.elapsed().as_secs_f64()*1000.0}}),
+                );
             }
             if start.elapsed() >= LAUNCH_WAIT {
                 if exited.is_none() {
@@ -349,7 +405,8 @@ impl Engine {
 
     /// Forgets launched processes that have exited.
     fn reap(&mut self) {
-        self.children.retain_mut(|c| !matches!(c.try_wait(), Ok(Some(_))));
+        self.children
+            .retain_mut(|c| !matches!(c.try_wait(), Ok(Some(_))));
     }
 
     /// Adds a screenshot of the observed window to an observation
@@ -358,7 +415,10 @@ impl Engine {
         if observation["closed"].as_bool().unwrap_or(false) {
             return Ok(());
         }
-        let Some(id) = observation["window"]["window_id"].as_u64().and_then(|v| u32::try_from(v).ok()) else {
+        let Some(id) = observation["window"]["window_id"]
+            .as_u64()
+            .and_then(|v| u32::try_from(v).ok())
+        else {
             return Ok(());
         };
         let w = self.desktop.window(id)?;
@@ -406,10 +466,18 @@ impl Engine {
     /// the window the model last saw. Key-typed text is never sent to an
     /// alert or to a dialog whose accessibility tree is unknown: text meant
     /// for another window must not answer an unexpected "Save changes?".
-    async fn enter_text(&mut self, w: &WindowInfo, text: &str, frame: Option<u32>, via_clipboard: bool) -> Result<Vec<Value>> {
+    async fn enter_text(
+        &mut self,
+        w: &WindowInfo,
+        text: &str,
+        frame: Option<u32>,
+        via_clipboard: bool,
+    ) -> Result<Vec<Value>> {
         let mut warnings = Vec::new();
         let outcome = match self.ax.as_mut() {
-            Some(ax) => Self::with_input_watch(&mut self.desktop, ax.text_input(w, text, None)).await?,
+            Some(ax) => {
+                Self::with_input_watch(&mut self.desktop, ax.text_input(w, text, None)).await?
+            }
             None => ax::TextInput::NoTarget("AT-SPI is unavailable".into()),
         };
         let mut target = None;
@@ -422,12 +490,23 @@ impl Engine {
         let dialog = w.transient_for.is_some() || ax.is_some_and(|ax| ax.window_is_alert(w));
         if dialog {
             let refuse = |why: String| {
-                x11_error("input_refused", format!("{why}; the text was not typed. Read the window (getAXState) first"))
+                x11_error(
+                    "input_refused",
+                    format!("{why}; the text was not typed. Read the window (getAXState) first"),
+                )
             };
             match ax.and_then(|ax| ax.window_role(w)) {
-                None => return Err(refuse(format!("window {} {:?} is a dialog whose accessibility tree is unknown", w.window_id, w.title))),
+                None => {
+                    return Err(refuse(format!(
+                        "window {} {:?} is a dialog whose accessibility tree is unknown",
+                        w.window_id, w.title
+                    )))
+                }
                 Some(_) if ax.is_some_and(|ax| ax.window_is_alert(w)) => {
-                    return Err(refuse(format!("window {} {:?} is an alert with no text field", w.window_id, w.title)))
+                    return Err(refuse(format!(
+                        "window {} {:?} is an alert with no text field",
+                        w.window_id, w.title
+                    )))
                 }
                 Some(_) => {}
             }
@@ -443,7 +522,9 @@ impl Engine {
             // The dialog's only text field (GTK's file chooser location entry
             // does not report focus): inserted there semantically.
             let ax = self.ax.as_mut().expect("target came from AT-SPI");
-            match Self::with_input_watch(&mut self.desktop, ax.text_input(w, text, Some(idx))).await? {
+            match Self::with_input_watch(&mut self.desktop, ax.text_input(w, text, Some(idx)))
+                .await?
+            {
                 ax::TextInput::Inserted(ws) => warnings.extend(ws.into_iter().map(Value::from)),
                 ax::TextInput::SingleLine => return self.enter_line(w, text, Some(idx)).await,
                 ax::TextInput::NoTarget(r) => bail!("text field {idx}: {r}"),
@@ -461,12 +542,19 @@ impl Engine {
             // user would: through the clipboard, which also carries text
             // the keyboard map cannot type.
             self.desktop.clipboard_write(text)?;
-            self.desktop
-                .action(w, "press_key", &json!({"window_id": w.window_id, "key": "ctrl+v"}))?;
-            warnings.push(json!(format!("pasted through the clipboard (ctrl+v) into the window's focus ({reason})")));
+            self.desktop.action(
+                w,
+                "press_key",
+                &json!({"window_id": w.window_id, "key": "ctrl+v"}),
+            )?;
+            warnings.push(json!(format!(
+                "pasted through the clipboard (ctrl+v) into the window's focus ({reason})"
+            )));
         } else {
             self.desktop.type_keys(w, text)?;
-            warnings.push(json!(format!("typed as key events to the window's focus ({reason})")));
+            warnings.push(json!(format!(
+                "typed as key events to the window's focus ({reason})"
+            )));
         }
         // Readback where the app reports the focused text object.
         if let Some(ax) = self.ax.as_ref() {
@@ -488,21 +576,32 @@ impl Engine {
 
     /// Single-line field: the text with at most one trailing newline, which
     /// is pressed as Return after the insertion completed.
-    async fn enter_line(&mut self, w: &WindowInfo, text: &str, idx: Option<u32>) -> Result<Vec<Value>> {
+    async fn enter_line(
+        &mut self,
+        w: &WindowInfo,
+        text: &str,
+        idx: Option<u32>,
+    ) -> Result<Vec<Value>> {
         let Some(line) = text.strip_suffix('\n').filter(|l| !l.contains('\n')) else {
             return Err(x11_error("invalid_params", "the focused field is single-line and the text has a line break inside; type the parts separately with pressKey(\"Tab\") or pressKey(\"Return\") between them".into()));
         };
         let mut warnings = Vec::new();
         if !line.is_empty() {
-            let ax = self.ax.as_mut().expect("single-line target came from AT-SPI");
+            let ax = self
+                .ax
+                .as_mut()
+                .expect("single-line target came from AT-SPI");
             match Self::with_input_watch(&mut self.desktop, ax.text_input(w, line, idx)).await? {
                 ax::TextInput::Inserted(ws) => warnings.extend(ws.into_iter().map(Value::from)),
                 _ => bail!("the single-line field lost focus before the text was inserted; nothing was typed"),
             }
         }
         // InsertText returned after the app applied it; the Return follows.
-        self.desktop
-            .action(w, "press_key", &json!({"window_id": w.window_id, "key": "Return"}))?;
+        self.desktop.action(
+            w,
+            "press_key",
+            &json!({"window_id": w.window_id, "key": "Return"}),
+        )?;
         Ok(warnings)
     }
 
@@ -512,7 +611,8 @@ impl Engine {
         self.reap();
         let keys: &[&str] =
             match method {
-                "list_apps" | "list_windows" | "turn_ended" | "clipboard_read" | "clipboard_release" => &[],
+                "list_apps" | "list_windows" | "turn_ended" | "clipboard_read"
+                | "clipboard_release" => &[],
                 "launch_app" => &["app"],
                 "clipboard_write" => &["text"],
                 "approve_app" => &["window_id", "app_id"],
@@ -532,7 +632,17 @@ impl Engine {
                     "modifiers",
                     "hold_ms",
                 ],
-                "drag" => &["window_id", "app", "frame_window", "observe", "screenshot", "from", "to", "path", "modifiers"],
+                "drag" => &[
+                    "window_id",
+                    "app",
+                    "frame_window",
+                    "observe",
+                    "screenshot",
+                    "from",
+                    "to",
+                    "path",
+                    "modifiers",
+                ],
                 "scroll" => &[
                     "window_id",
                     "app",
@@ -546,11 +656,50 @@ impl Engine {
                     "pixels",
                     "modifiers",
                 ],
-                "mouse_move" => &["window_id", "app", "frame_window", "observe", "screenshot", "element_index", "x", "y", "dx", "dy"],
-                "type_text" | "paste" => &["window_id", "app", "frame_window", "observe", "screenshot", "text"],
-                "press_key" => &["window_id", "app", "observe", "screenshot", "key", "hold_ms"],
-                "set_value" => &["window_id", "app", "observe", "screenshot", "element_index", "value"],
-                "perform_secondary_action" => &["window_id", "app", "observe", "screenshot", "element_index", "action"],
+                "mouse_move" => &[
+                    "window_id",
+                    "app",
+                    "frame_window",
+                    "observe",
+                    "screenshot",
+                    "element_index",
+                    "x",
+                    "y",
+                    "dx",
+                    "dy",
+                ],
+                "type_text" | "paste" => &[
+                    "window_id",
+                    "app",
+                    "frame_window",
+                    "observe",
+                    "screenshot",
+                    "text",
+                ],
+                "press_key" => &[
+                    "window_id",
+                    "app",
+                    "observe",
+                    "screenshot",
+                    "key",
+                    "hold_ms",
+                ],
+                "set_value" => &[
+                    "window_id",
+                    "app",
+                    "observe",
+                    "screenshot",
+                    "element_index",
+                    "value",
+                ],
+                "perform_secondary_action" => &[
+                    "window_id",
+                    "app",
+                    "observe",
+                    "screenshot",
+                    "element_index",
+                    "action",
+                ],
                 _ => return Err(ProtocolError(
                     json!({"code":"unknown_method","message":format!("Unknown method {method}")}),
                 )
@@ -593,7 +742,8 @@ impl Engine {
                 return self.launch(name).await;
             }
             "clipboard_write" => {
-                self.desktop.clipboard_write(p["text"].as_str().unwrap_or_default())?;
+                self.desktop
+                    .clipboard_write(p["text"].as_str().unwrap_or_default())?;
                 return Ok(json!({"written":true}));
             }
             "clipboard_read" => {
@@ -708,7 +858,9 @@ impl Engine {
                 },
                 None => None,
             };
-            let pointer = ["x", "from", "path", "dx"].iter().any(|k| p.contains_key(*k));
+            let pointer = ["x", "from", "path", "dx"]
+                .iter()
+                .any(|k| p.contains_key(*k));
             let active = self
                 .desktop
                 .active_window(&wins, id)
@@ -785,7 +937,8 @@ impl Engine {
                         let (x, y) = (x - ox, y - oy);
                         if let Some(rect) = popup {
                             Some((x, y, HitArea::Popup(rect)))
-                        } else if (0..w.width as i32).contains(&x) && (0..w.height as i32).contains(&y)
+                        } else if (0..w.width as i32).contains(&x)
+                            && (0..w.height as i32).contains(&y)
                         {
                             Some((x, y, HitArea::Body))
                         } else {
@@ -833,7 +986,11 @@ impl Engine {
                     Some((idx, (sx, sy), text)) => {
                         self.desktop.check_typeable(text)?;
                         let (ox, oy) = self.desktop.origin(w.window_id)?;
-                        self.desktop.click_element_point(&w, &json!({"x": sx - ox, "y": sy - oy}), HitArea::Body)?;
+                        self.desktop.click_element_point(
+                            &w,
+                            &json!({"x": sx - ox, "y": sy - oy}),
+                            HitArea::Body,
+                        )?;
                         // The click may have hit an overlay or a read-only
                         // input: Ctrl+A and the value would then go to another
                         // field or trigger page shortcuts.
@@ -843,7 +1000,11 @@ impl Engine {
                                 format!("clicking element {idx} did not give it focus as a writable field (covered by another element, or read-only); nothing was typed"),
                             ));
                         }
-                        let key = if text.is_empty() { "ctrl+a BackSpace" } else { "ctrl+a" };
+                        let key = if text.is_empty() {
+                            "ctrl+a BackSpace"
+                        } else {
+                            "ctrl+a"
+                        };
                         for k in key.split(' ') {
                             self.desktop.action(
                                 &w,
@@ -914,7 +1075,10 @@ impl Engine {
         trace.mark("act");
         let start = Instant::now();
         let may_open = match (method, element) {
-            ("press_key", _) => p.get("key").and_then(Value::as_str).is_some_and(is_shortcut),
+            ("press_key", _) => p
+                .get("key")
+                .and_then(Value::as_str)
+                .is_some_and(is_shortcut),
             ("click", Some(idx)) => self.ax.as_ref().is_some_and(|ax| ax.element_is_button(idx)),
             _ => false,
         };
@@ -946,9 +1110,10 @@ impl Engine {
                 )
             }),
             ("click", Some(idx)) => self.ax.as_ref().is_some_and(|ax| ax.element_is_button(idx)),
-            ("type_text" | "paste", _) => {
-                p.get("text").and_then(Value::as_str).is_some_and(|t| t.ends_with('\n'))
-            }
+            ("type_text" | "paste", _) => p
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|t| t.ends_with('\n')),
             _ => false,
         };
         if w.transient_for.is_some() && confirms {
@@ -982,8 +1147,7 @@ impl Engine {
                     (Some(c.clone()), vec![c])
                 }
                 Err(e)
-                    if e
-                        .downcast_ref::<x11::X11Error>()
+                    if e.downcast_ref::<x11::X11Error>()
                         .is_some_and(|x| x.code == "window_not_found") =>
                 {
                     (None, Vec::new())
@@ -1018,10 +1182,13 @@ impl Engine {
             // other window): it happened; there is nothing left to observe.
             None => closed_result(&w, start),
         };
-        if observation["window"]["window_id"] != json!(w.window_id) && !observation["closed"].as_bool().unwrap_or(false) {
+        if observation["window"]["window_id"] != json!(w.window_id)
+            && !observation["closed"].as_bool().unwrap_or(false)
+        {
             warnings.push(json!(format!(
                 "the app's active window is now {} {:?}; the observation shows it",
-                observation["window"]["window_id"], observation["window"]["title"].as_str().unwrap_or("")
+                observation["window"]["window_id"],
+                observation["window"]["title"].as_str().unwrap_or("")
             )));
         }
         if !settled.reacted {
@@ -1067,10 +1234,13 @@ impl Engine {
         if w.transient_for.is_none() || o["accessibility"] != "" {
             return Ok(o);
         }
-        if !self
-            .desktop
-            .wait_closed(w.window_id, CLOSING_WAIT, DIALOG_IDLE, CLOSING_WAIT, external)?
-        {
+        if !self.desktop.wait_closed(
+            w.window_id,
+            CLOSING_WAIT,
+            DIALOG_IDLE,
+            CLOSING_WAIT,
+            external,
+        )? {
             return Ok(o);
         }
         self.desktop
@@ -1309,13 +1479,22 @@ mod tests {
         let (main, dialog) = (win(1, "doc"), win(2, "Replace?"));
         let wins = vec![main.clone(), dialog.clone()];
         let e = coordinate_window(1, &wins, &dialog).unwrap_err();
-        assert_eq!(e.downcast_ref::<x11::X11Error>().unwrap().code, "input_refused");
+        assert_eq!(
+            e.downcast_ref::<x11::X11Error>().unwrap().code,
+            "input_refused"
+        );
         assert!(e.to_string().contains("\"Replace?\""), "{e}");
         assert_eq!(coordinate_window(2, &wins, &dialog).unwrap().window_id, 2);
-        assert_eq!(coordinate_window(1, &wins[..1], &main).unwrap().window_id, 1);
+        assert_eq!(
+            coordinate_window(1, &wins[..1], &main).unwrap().window_id,
+            1
+        );
         // The window the model saw has closed.
         let e = coordinate_window(2, &wins[..1], &main).unwrap_err();
-        assert_eq!(e.downcast_ref::<x11::X11Error>().unwrap().code, "window_not_found");
+        assert_eq!(
+            e.downcast_ref::<x11::X11Error>().unwrap().code,
+            "window_not_found"
+        );
     }
 
     #[test]
@@ -1331,14 +1510,27 @@ mod tests {
         assert!(args(&["--bogus"]).is_err());
         // Regression: WM_CLASS alone (client-set) used to be enough.
         assert!(args(&["--live-desktop", "--allow-app", "Gedit"]).is_err());
-        assert!(args(&["--live-desktop", "--allow-app", "x", "--allow-exe", "/nonexistent/x"]).is_err());
+        assert!(args(&[
+            "--live-desktop",
+            "--allow-app",
+            "x",
+            "--allow-exe",
+            "/nonexistent/x"
+        ])
+        .is_err());
         let s = args(&["--live-desktop", "--allow-app", "Gedit", "--pid", "42"])
             .unwrap()
             .unwrap();
         assert!(s.apps.contains("gedit") && s.pids.contains(&42));
-        let s = args(&["--live-desktop", "--allow-app", "sh", "--allow-exe", "/bin/sh"])
-            .unwrap()
-            .unwrap();
+        let s = args(&[
+            "--live-desktop",
+            "--allow-app",
+            "sh",
+            "--allow-exe",
+            "/bin/sh",
+        ])
+        .unwrap()
+        .unwrap();
         assert!(s.exes.contains(&std::fs::canonicalize("/bin/sh").unwrap()));
         let a = parse_args(["--first-element-id", "5000"].iter().map(|s| s.to_string())).unwrap();
         assert_eq!(a.first_element_id, 5000);

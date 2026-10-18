@@ -393,7 +393,11 @@ pub enum ClickPlan {
     /// Pointer click at a screen point. `popup`: the element's screen
     /// rectangle, which must lie on the app's popup window under the point
     /// (an open menu); otherwise no popup may cover the point.
-    Pointer { x: i32, y: i32, popup: Option<(i32, i32, i32, i32)> },
+    Pointer {
+        x: i32,
+        y: i32,
+        popup: Option<(i32, i32, i32, i32)>,
+    },
     /// AT-SPI action (no visible geometry, or the centre is covered).
     Action { warning: Option<String> },
 }
@@ -1282,8 +1286,14 @@ fn handle_event(log: &Mutex<EventLog>, msg: &Message) {
     let detail = parsed.as_ref().map(|p| p.0.as_str()).unwrap_or_default();
     if crate::trace_on() {
         *log.kinds.entry(format!("{member}:{detail}")).or_default() += 1;
-        if log.kinds.len() == 1 || (member == "ChildrenChanged" && path == REGISTRY_ROOT) || iface.ends_with("Window") {
-            eprintln!("trace atspi {member}:{detail} {sender}{path} t={:?}", crate::since_start());
+        if log.kinds.len() == 1
+            || (member == "ChildrenChanged" && path == REGISTRY_ROOT)
+            || iface.ends_with("Window")
+        {
+            eprintln!(
+                "trace atspi {member}:{detail} {sender}{path} t={:?}",
+                crate::since_start()
+            );
         }
     }
     if let Some(how) = forget_for(&member, detail) {
@@ -1318,7 +1328,10 @@ fn handle_event(log: &Mutex<EventLog>, msg: &Message) {
                         if detail.starts_with("remove") {
                             log.removed.insert(r.clone(), seq);
                         }
-                        log.dirty.entry(sender.clone()).or_default().push((r, Forget::Node));
+                        log.dirty
+                            .entry(sender.clone())
+                            .or_default()
+                            .push((r, Forget::Node));
                     }
                 }
             }
@@ -1500,17 +1513,27 @@ impl Accessibility {
     /// Role of the window's accessible frame in its latest usable
     /// observation; None when the window has no mapped frame.
     pub fn window_role(&self, w: &WindowInfo) -> Option<u32> {
-        let ws = self.obs.windows.get(&w.window_id).filter(|ws| ws.pid == w.pid && ws.valid)?;
-        ws.frame.as_ref().and_then(|f| ws.ids.get(f)).map(|&(_, role)| role)
+        let ws = self
+            .obs
+            .windows
+            .get(&w.window_id)
+            .filter(|ws| ws.pid == w.pid && ws.valid)?;
+        ws.frame
+            .as_ref()
+            .and_then(|f| ws.ids.get(f))
+            .map(|&(_, role)| role)
     }
 
     /// The window's only editable text field in its latest observation.
     pub fn sole_text_field(&self, w: &WindowInfo) -> Option<u32> {
-        let ws = self.obs.windows.get(&w.window_id).filter(|ws| ws.pid == w.pid && ws.valid)?;
-        let mut fields = ws
-            .elements
-            .iter()
-            .filter(|(_, e)| e.has_iface(I_EDIT) && has(e.states, S_EDITABLE) && !has(e.states, S_READ_ONLY));
+        let ws = self
+            .obs
+            .windows
+            .get(&w.window_id)
+            .filter(|ws| ws.pid == w.pid && ws.valid)?;
+        let mut fields = ws.elements.iter().filter(|(_, e)| {
+            e.has_iface(I_EDIT) && has(e.states, S_EDITABLE) && !has(e.states, S_READ_ONLY)
+        });
         match (fields.next(), fields.next()) {
             (Some((&i, _)), None) => Some(i),
             _ => None,
@@ -1520,19 +1543,28 @@ impl Accessibility {
     /// Text of the object that last reported focus in the window's app, if
     /// it has the Text interface (readback after typing key events).
     pub async fn focused_text(&self, w: &WindowInfo) -> Option<String> {
-        let ws = self.obs.windows.get(&w.window_id).filter(|ws| ws.pid == w.pid)?;
+        let ws = self
+            .obs
+            .windows
+            .get(&w.window_id)
+            .filter(|ws| ws.pid == w.pid)?;
         let bus = ws.frame.as_ref()?.bus.clone();
         let r = self.events.lock().ok()?.focused.get(&bus).cloned()?;
-        let n: i32 = get_prop(&self.conn, &r, I_TEXT, "CharacterCount").await.ok()?;
-        call(&self.conn, &r, I_TEXT, "GetText", &(0i32, n.min(4000))).await.ok()
+        let n: i32 = get_prop(&self.conn, &r, I_TEXT, "CharacterCount")
+            .await
+            .ok()?;
+        call(&self.conn, &r, I_TEXT, "GetText", &(0i32, n.min(4000)))
+            .await
+            .ok()
     }
 
     /// Whether element `idx` was last observed as a push button.
     pub fn element_is_button(&self, idx: u32) -> bool {
-        self.obs
-            .windows
-            .values()
-            .any(|ws| ws.ids.values().any(|&(id, role)| id == idx && role == R_PUSH_BUTTON))
+        self.obs.windows.values().any(|ws| {
+            ws.ids
+                .values()
+                .any(|&(id, role)| id == idx && role == R_PUSH_BUTTON)
+        })
     }
 
     /// Clear observation state (element bindings, diffs and cached trees).
@@ -1681,7 +1713,11 @@ impl Accessibility {
     /// by an earlier observation is reused while it is still showing (one
     /// call, which also serves as the liveness probe); otherwise the app's
     /// top-levels are enumerated and scored.
-    async fn map_window(&mut self, w: &WindowInfo, warnings: &mut Vec<String>) -> Result<(ObjRef, Node)> {
+    async fn map_window(
+        &mut self,
+        w: &WindowInfo,
+        warnings: &mut Vec<String>,
+    ) -> Result<(ObjRef, Node)> {
         let bound = self
             .obs
             .windows
@@ -1923,10 +1959,19 @@ impl Accessibility {
                     c.forget(r, *how);
                 }
                 if crate::trace_on() {
-                    let kinds = self.events.lock().ok().map(|mut l| std::mem::take(&mut l.kinds)).unwrap_or_default();
+                    let kinds = self
+                        .events
+                        .lock()
+                        .ok()
+                        .map(|mut l| std::mem::take(&mut l.kinds))
+                        .unwrap_or_default();
                     let mut kinds: Vec<(String, usize)> = kinds.into_iter().collect();
                     kinds.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
-                    let kinds: Vec<String> = kinds.iter().take(8).map(|(k, n)| format!("{k}={n}")).collect();
+                    let kinds: Vec<String> = kinds
+                        .iter()
+                        .take(8)
+                        .map(|(k, n)| format!("{k}={n}"))
+                        .collect();
                     eprintln!(
                         "trace store {bus} dirty={} forgot={} nodes={} kids={} events[{}]",
                         dirty.len(),
@@ -2046,8 +2091,10 @@ impl Accessibility {
                 "unrecognized Cache.GetItems signature {:?}; using bounded live traversal",
                 body.signature().to_string()
             ));
-            self.caches
-                .insert(bus.to_string(), AppCache::empty(false, Some(now + CACHE_RETRY)));
+            self.caches.insert(
+                bus.to_string(),
+                AppCache::empty(false, Some(now + CACHE_RETRY)),
+            );
             return;
         }
         if nodes.is_empty() {
@@ -2234,7 +2281,11 @@ impl Accessibility {
         tree
     }
 
-    async fn snapshot_inner(&mut self, w: &WindowInfo, warnings: &mut Vec<String>) -> Result<String> {
+    async fn snapshot_inner(
+        &mut self,
+        w: &WindowInfo,
+        warnings: &mut Vec<String>,
+    ) -> Result<String> {
         let mut trace = crate::Trace::new(format!("snapshot {}", w.window_id));
         let snap_seq = self.event_seq();
         self.obs.begin(w);
@@ -2334,7 +2385,14 @@ impl Accessibility {
                 match f {
                     Fetch::Rect(r) => {
                         let e = extents(conn, &r, COORD_SCREEN).await.ok().flatten();
-                        Fetched::Rect(r, e.map(|e| Rect { x: e.x - ox, y: e.y - oy, ..e }))
+                        Fetched::Rect(
+                            r,
+                            e.map(|e| Rect {
+                                x: e.x - ox,
+                                y: e.y - oy,
+                                ..e
+                            }),
+                        )
                     }
                     Fetch::Detail(r, n, actions) => {
                         let d = fetch_details(conn, &r, &n, actions).await;
@@ -2452,9 +2510,18 @@ impl Accessibility {
 
         // Number fields of an app with a decimal-comma locale: say so up
         // front (once per process) rather than after a reformatted input.
-        if elements.values().any(|e| matches!(e.role, R_SPIN_BUTTON | R_EDITBAR)) {
+        if elements
+            .values()
+            .any(|e| matches!(e.role, R_SPIN_BUTTON | R_EDITBAR))
+        {
             if let Some(h) = numeric_locale(w.pid).and_then(|l| decimal_hint(&l, "125.50")) {
-                warnings.push(format!("hint: number input: {}", h.replace("type 125,50 rather than 125.50", "type numbers like 125,50, not 125.50")));
+                warnings.push(format!(
+                    "hint: number input: {}",
+                    h.replace(
+                        "type 125,50 rather than 125.50",
+                        "type numbers like 125,50, not 125.50"
+                    )
+                ));
             }
         }
         let obs = &mut self.obs;
@@ -2604,7 +2671,11 @@ impl Accessibility {
             g.top_role.is_some_and(is_popup_role)
         };
         let r = g.rect;
-        Ok(ClickPlan::Pointer { x, y, popup: popup.then_some((r.x, r.y, r.w, r.h)) })
+        Ok(ClickPlan::Pointer {
+            x,
+            y,
+            popup: popup.then_some((r.x, r.y, r.w, r.h)),
+        })
     }
 
     /// Screen centre of a text field that exposes Text but not EditableText
@@ -2696,14 +2767,24 @@ impl Accessibility {
             .windows
             .get(&w.window_id)
             .filter(|ws| ws.pid == w.pid)
-            .or_else(|| self.obs.windows.values().find(|ws| ws.pid == w.pid && ws.frame.is_some()))
+            .or_else(|| {
+                self.obs
+                    .windows
+                    .values()
+                    .find(|ws| ws.pid == w.pid && ws.frame.is_some())
+            })
             .and_then(|ws| ws.frame.as_ref())
             .map(|f| f.bus.clone())
         else {
             return Ok(None);
         };
         let confirmed = self.blocked.contains(&bus);
-        let until = Instant::now() + if confirmed { KEY_PROBE_TIMEOUT } else { KEY_BUSY_WAIT };
+        let until = Instant::now()
+            + if confirmed {
+                KEY_PROBE_TIMEOUT
+            } else {
+                KEY_BUSY_WAIT
+            };
         loop {
             match self.probe(&bus, KEY_PROBE_TIMEOUT).await {
                 Some(true) => return Ok(None),
@@ -3306,7 +3387,11 @@ impl Accessibility {
     /// that last reported gaining focus, if it is editable text inside the
     /// window; else the single focused editable element of the latest
     /// observation (state checked live).
-    async fn focused_editable(&mut self, w: &WindowInfo, element_index: Option<u32>) -> Result<Elem> {
+    async fn focused_editable(
+        &mut self,
+        w: &WindowInfo,
+        element_index: Option<u32>,
+    ) -> Result<Elem> {
         if let Some(idx) = element_index {
             let el = self.resolve(w, idx).await?;
             if !el.has_iface(I_EDIT) {
@@ -3350,11 +3435,7 @@ impl Accessibility {
                 }
             }
         }
-        let ws = self
-            .obs
-            .windows
-            .get(&w.window_id)
-            .expect("checked above");
+        let ws = self.obs.windows.get(&w.window_id).expect("checked above");
         let editable: Vec<(u32, ObjRef)> = ws
             .elements
             .iter()
@@ -3385,7 +3466,10 @@ impl Accessibility {
                 Ok(el)
             }
             [] => bail!("no focused editable text element in the latest observation"),
-            many => bail!("{} editable elements report focus; pass element_index", many.len()),
+            many => bail!(
+                "{} editable elements report focus; pass element_index",
+                many.len()
+            ),
         }
     }
 }
@@ -3467,8 +3551,16 @@ fn interesting(n: &Node, d: Option<&Details>) -> bool {
 
 /// Text, value and actions of an object. `actions` are the names already
 /// known from an earlier observation (they do not change for a widget).
-async fn fetch_details(conn: &Connection, r: &ObjRef, n: &Node, actions: Option<Vec<String>>) -> Details {
-    let mut d = Details { actions, ..Details::default() };
+async fn fetch_details(
+    conn: &Connection,
+    r: &ObjRef,
+    n: &Node,
+    actions: Option<Vec<String>>,
+) -> Details {
+    let mut d = Details {
+        actions,
+        ..Details::default()
+    };
     if n.has_iface(I_TEXT) && n.role != R_PASSWORD_TEXT {
         if let Ok(count) = get_prop::<i32>(conn, r, I_TEXT, "CharacterCount").await {
             if count > 0 {
@@ -3718,8 +3810,14 @@ struct ClickGeometry {
 /// Menu items are not clipped by their parent menu, whose extents are those
 /// of its menu-bar entry rather than of the popup; their hit test starts at
 /// that menu, which reports its items at points on the popup.
-async fn click_geometry(conn: &Connection, el: &Elem, menu_item: bool) -> Result<Option<ClickGeometry>> {
-    let Some(rect) = extents(conn, &el.r, COORD_SCREEN).await?.filter(|r| r.w > 0 && r.h > 0)
+async fn click_geometry(
+    conn: &Connection,
+    el: &Elem,
+    menu_item: bool,
+) -> Result<Option<ClickGeometry>> {
+    let Some(rect) = extents(conn, &el.r, COORD_SCREEN)
+        .await?
+        .filter(|r| r.w > 0 && r.h > 0)
     else {
         return Ok(None);
     };
@@ -3754,7 +3852,11 @@ async fn click_geometry(conn: &Connection, el: &Elem, menu_item: bool) -> Result
         }
         cur = p;
     }
-    let start = if menu_item { ancestors.first() } else { ancestors.last() };
+    let start = if menu_item {
+        ancestors.first()
+    } else {
+        ancestors.last()
+    };
     let Some(start) = start.cloned() else {
         return Ok(None);
     };
@@ -3790,8 +3892,14 @@ async fn hit_at_point(conn: &Connection, target: &ObjRef, g: &ClickGeometry) -> 
         }
     };
     for _ in 0..MAX_DEPTH {
-        let r: Result<(String, OwnedObjectPath)> =
-            call(conn, &cur, I_COMPONENT, "GetAccessibleAtPoint", &(x, y, COORD_SCREEN)).await;
+        let r: Result<(String, OwnedObjectPath)> = call(
+            conn,
+            &cur,
+            I_COMPONENT,
+            "GetAccessibleAtPoint",
+            &(x, y, COORD_SCREEN),
+        )
+        .await;
         let r = match r {
             Ok(r) => ObjRef::from_wire(&r),
             Err(e) => {
@@ -3803,7 +3911,15 @@ async fn hit_at_point(conn: &Connection, target: &ObjRef, g: &ClickGeometry) -> 
             // The toolkit stops at a container above the element (GTK's
             // scrolled window answers null for the rows of a tree view). An
             // element of a table is then resolved by its row geometry.
-            trace("stop", format!("at {} (null={}) parent={:?}", cur.path, r.is_null(), parent.map(|p| &p.path)));
+            trace(
+                "stop",
+                format!(
+                    "at {} (null={}) parent={:?}",
+                    cur.path,
+                    r.is_null(),
+                    parent.map(|p| &p.path)
+                ),
+            );
             return table_hit(conn, target, &g.ancestors, (x, y)).await;
         }
         if &r == target {
@@ -3814,7 +3930,9 @@ async fn hit_at_point(conn: &Connection, target: &ObjRef, g: &ClickGeometry) -> 
             let mut up = r.clone();
             let mut hit_parent = None;
             for step in 0..MAX_DEPTH {
-                let Ok(parent) = get_prop::<(String, OwnedObjectPath)>(conn, &up, I_ACC, "Parent").await else {
+                let Ok(parent) =
+                    get_prop::<(String, OwnedObjectPath)>(conn, &up, I_ACC, "Parent").await
+                else {
                     break;
                 };
                 let p = ObjRef::from_wire(&parent);
@@ -3854,7 +3972,12 @@ async fn hit_at_point(conn: &Connection, target: &ObjRef, g: &ClickGeometry) -> 
 /// that implements it (GTK's multi-renderer cells sit inside a container
 /// cell). `Unknown` when no near ancestor is a table or a row has no
 /// geometry.
-async fn table_hit(conn: &Connection, target: &ObjRef, ancestors: &[ObjRef], (_, y): (i32, i32)) -> PointHit {
+async fn table_hit(
+    conn: &Connection,
+    target: &ObjRef,
+    ancestors: &[ObjRef],
+    (_, y): (i32, i32),
+) -> PointHit {
     let trace = |what: &str, detail: String| {
         if crate::trace_on() {
             eprintln!("trace table_hit {what} {detail}");
@@ -3880,7 +4003,10 @@ async fn table_hit(conn: &Connection, target: &ObjRef, ancestors: &[ObjRef], (_,
             }
             // Not a table (or not answering): try the next ancestor.
             (r, c) => {
-                trace("row/col", format!("{}: {:?} {:?}", table.path, r.err(), c.err()));
+                trace(
+                    "row/col",
+                    format!("{}: {:?} {:?}", table.path, r.err(), c.err()),
+                );
                 child = table;
             }
         }
@@ -3896,7 +4022,10 @@ async fn table_hit(conn: &Connection, target: &ObjRef, ancestors: &[ObjRef], (_,
             return PointHit::Unknown;
         }
     };
-    trace("table", format!("{} row={row} col={col} nrows={nrows} y={y}", table.path));
+    trace(
+        "table",
+        format!("{} row={row} col={col} nrows={nrows} y={y}", table.path),
+    );
     if row < 0 || col < 0 || nrows <= 0 {
         return PointHit::Unknown;
     }
@@ -3906,7 +4035,9 @@ async fn table_hit(conn: &Connection, target: &ObjRef, ancestors: &[ObjRef], (_,
             break;
         }
         let mid = lo + (hi - lo) / 2;
-        let Ok(cell) = call::<_, WireRef>(conn, table, I_TABLE, "GetAccessibleAt", &(mid, col)).await else {
+        let Ok(cell) =
+            call::<_, WireRef>(conn, table, I_TABLE, "GetAccessibleAt", &(mid, col)).await
+        else {
             return PointHit::Unknown;
         };
         let cell = ObjRef::from_wire(&cell);
@@ -3924,7 +4055,9 @@ async fn table_hit(conn: &Connection, target: &ObjRef, ancestors: &[ObjRef], (_,
         } else if mid == row {
             return PointHit::Element;
         } else {
-            let name: String = get_prop(conn, &cell, I_ACC, "Name").await.unwrap_or_default();
+            let name: String = get_prop(conn, &cell, I_ACC, "Name")
+                .await
+                .unwrap_or_default();
             return PointHit::Other(format!(
                 "table cell {} in row {mid} (the element is in row {row})",
                 quote(&name, 40)
@@ -4125,8 +4258,14 @@ fn decimal_hint(locale: &str, text: &str) -> Option<String> {
     let b = text.as_bytes();
     let dot = (1..b.len().saturating_sub(1))
         .find(|&i| b[i] == b'.' && b[i - 1].is_ascii_digit() && b[i + 1].is_ascii_digit())?;
-    let start = (0..dot).rev().take_while(|&i| b[i].is_ascii_digit()).last()?;
-    let end = (dot + 1..b.len()).take_while(|&i| b[i].is_ascii_digit()).last()? + 1;
+    let start = (0..dot)
+        .rev()
+        .take_while(|&i| b[i].is_ascii_digit())
+        .last()?;
+    let end = (dot + 1..b.len())
+        .take_while(|&i| b[i].is_ascii_digit())
+        .last()?
+        + 1;
     let number = &text[start..end];
     Some(format!(
         "the app formats numbers for locale {locale}, whose decimal separator is a comma: type {} rather than {number}",
@@ -4285,12 +4424,20 @@ mod tests {
             desc: String::new(),
             states: 1 << S_SHOWING,
         };
-        let (frame, pane, cell) = (ObjRef::new(":1.2", "/f"), ObjRef::new(":1.2", "/p"), ObjRef::new(":1.2", "/c"));
+        let (frame, pane, cell) = (
+            ObjRef::new(":1.2", "/f"),
+            ObjRef::new(":1.2", "/p"),
+            ObjRef::new(":1.2", "/c"),
+        );
         let mut tree = Tree::default();
         tree.nodes.insert(frame.clone(), node(R_FRAME, None));
-        tree.nodes.insert(pane.clone(), node(R_DIRECTORY_PANE, Some(&frame)));
+        tree.nodes
+            .insert(pane.clone(), node(R_DIRECTORY_PANE, Some(&frame)));
         // A sidebar cell outside the pane does not count.
-        tree.nodes.insert(ObjRef::new(":1.2", "/side"), node(R_TABLE_CELL, Some(&frame)));
+        tree.nodes.insert(
+            ObjRef::new(":1.2", "/side"),
+            node(R_TABLE_CELL, Some(&frame)),
+        );
         assert!(empty_item_view_hint(&tree).unwrap().contains("Ctrl+2"));
         tree.nodes.insert(cell, node(R_TABLE_CELL, Some(&pane)));
         assert!(empty_item_view_hint(&tree).is_none());

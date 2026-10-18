@@ -250,9 +250,19 @@ mod tests {
         let mut p = Policy::default();
         p.deny.insert("drawing".into());
         let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        assert!(p.launch_denied(&names(&["com.github.maoschanz.drawing", "Drawing", "drawing"])).is_some());
-        assert!(p.launch_denied(&names(&["org.gnome.Terminal", "Terminal"])).is_some());
-        assert!(p.launch_denied(&names(&["xed", "Text Editor", "xed"])).is_none());
+        assert!(p
+            .launch_denied(&names(&[
+                "com.github.maoschanz.drawing",
+                "Drawing",
+                "drawing"
+            ]))
+            .is_some());
+        assert!(p
+            .launch_denied(&names(&["org.gnome.Terminal", "Terminal"]))
+            .is_some());
+        assert!(p
+            .launch_denied(&names(&["xed", "Text Editor", "xed"]))
+            .is_none());
     }
 
     /// Regression: an unknown process identity used to skip the executable

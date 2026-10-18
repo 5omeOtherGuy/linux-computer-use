@@ -232,7 +232,11 @@ fn serve(
         while let Some(ev) = conn.poll_for_event()? {
             match ev {
                 Event::SelectionRequest(e) if e.owner == win => {
-                    let property = if e.property == NONE { e.target } else { e.property };
+                    let property = if e.property == NONE {
+                        e.target
+                    } else {
+                        e.property
+                    };
                     let served = match &text {
                         Some(_) if e.target == atoms.TARGETS => conn
                             .change_property32(

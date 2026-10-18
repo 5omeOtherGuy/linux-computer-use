@@ -55,7 +55,12 @@ pub fn data_dirs() -> Vec<PathBuf> {
         .unwrap_or_else(|| "/usr/local/share:/usr/share".to_string());
     data_home
         .into_iter()
-        .chain(data_dirs.split(':').filter(|s| !s.is_empty()).map(PathBuf::from))
+        .chain(
+            data_dirs
+                .split(':')
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from),
+        )
         .map(|d| d.join("applications"))
         .collect()
 }
@@ -65,7 +70,9 @@ pub fn data_dirs() -> Vec<PathBuf> {
 pub fn load(dirs: &[PathBuf]) -> Vec<Entry> {
     let mut out: Vec<Entry> = Vec::new();
     for dir in dirs {
-        let Ok(rd) = std::fs::read_dir(dir) else { continue };
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            continue;
+        };
         let mut files: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
         files.sort();
         for file in files {
@@ -79,7 +86,9 @@ pub fn load(dirs: &[PathBuf]) -> Vec<Entry> {
             if out.iter().any(|e| e.id == id) {
                 continue;
             }
-            let Ok(text) = std::fs::read_to_string(&file) else { continue };
+            let Ok(text) = std::fs::read_to_string(&file) else {
+                continue;
+            };
             if let Some(e) = parse(id, &text) {
                 out.push(e);
             }
@@ -110,7 +119,9 @@ pub fn parse(id: &str, text: &str) -> Option<Entry> {
         if !in_group {
             continue;
         }
-        let Some((k, v)) = line.split_once('=') else { continue };
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
         let (k, v) = (k.trim(), v.trim());
         match k {
             "Type" => kind = Some(v.to_string()),
@@ -151,7 +162,11 @@ pub fn exec_args(exec: &str, name: &str) -> Result<Vec<String>> {
         if quoted {
             match c {
                 '"' => quoted = false,
-                '\\' => cur.push(chars.next().ok_or_else(|| anyhow::anyhow!("dangling backslash"))?),
+                '\\' => cur.push(
+                    chars
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("dangling backslash"))?,
+                ),
                 _ => cur.push(c),
             }
         } else {
@@ -254,7 +269,10 @@ mod tests {
             exec_args("env FOO=1 \"my app\" --name=%c %f --x", "My App").unwrap(),
             vec!["env", "FOO=1", "my app", "--name=My App", "--x"]
         );
-        assert_eq!(exec_args("a \"b \\\"c\\\" d\" 100%%", "n").unwrap(), vec!["a", "b \"c\" d", "100%"]);
+        assert_eq!(
+            exec_args("a \"b \\\"c\\\" d\" 100%%", "n").unwrap(),
+            vec!["a", "b \"c\" d", "100%"]
+        );
         assert!(exec_args("\"unterminated", "n").is_err());
         assert!(exec_args("prog %z", "n").is_err());
         assert!(exec_args("%F", "n").is_err());
@@ -268,19 +286,39 @@ mod tests {
         )
         .unwrap();
         assert_eq!(calc.exec, vec!["gnome-calculator"]);
-        assert!(parse("hidden", "[Desktop Entry]\nType=Application\nName=H\nExec=h\nNoDisplay=true\n").is_none());
+        assert!(parse(
+            "hidden",
+            "[Desktop Entry]\nType=Application\nName=H\nExec=h\nNoDisplay=true\n"
+        )
+        .is_none());
         assert!(parse("link", "[Desktop Entry]\nType=Link\nName=L\nURL=x\n").is_none());
-        let term = parse("t", "[Desktop Entry]\nType=Application\nName=Term\nExec=xterm\nTerminal=true\n").unwrap();
+        let term = parse(
+            "t",
+            "[Desktop Entry]\nType=Application\nName=Term\nExec=xterm\nTerminal=true\n",
+        )
+        .unwrap();
         assert!(term.terminal);
         let drawing = parse(
             "com.github.maoschanz.drawing",
             "[Desktop Entry]\nName=Drawing\nType=Application\nExec=drawing %U\nStartupWMClass=drawing\n",
         )
         .unwrap();
-        let xed = parse("xed", "[Desktop Entry]\nName=Text Editor\nType=Application\nExec=xed %U\n").unwrap();
+        let xed = parse(
+            "xed",
+            "[Desktop Entry]\nName=Text Editor\nType=Application\nExec=xed %U\n",
+        )
+        .unwrap();
         let entries = vec![calc.clone(), drawing.clone(), xed.clone()];
-        for q in ["drawing", "Drawing", "com.github.maoschanz.drawing.desktop", "DRAWING"] {
-            assert!(matches!(find(&entries, q), Lookup::Found(ref e) if e == &drawing), "{q}");
+        for q in [
+            "drawing",
+            "Drawing",
+            "com.github.maoschanz.drawing.desktop",
+            "DRAWING",
+        ] {
+            assert!(
+                matches!(find(&entries, q), Lookup::Found(ref e) if e == &drawing),
+                "{q}"
+            );
         }
         assert!(matches!(find(&entries, "gnome-calculator"), Lookup::Found(ref e) if e == &calc));
         assert!(matches!(find(&entries, "calculator"), Lookup::Found(ref e) if e == &calc));
@@ -288,7 +326,10 @@ mod tests {
         assert!(matches!(find(&entries, "Calc"), Lookup::Found(ref e) if e == &calc));
         assert!(matches!(find(&entries, "nothing"), Lookup::NotFound));
         assert!(matches!(find(&entries, ""), Lookup::NotFound));
-        let twin = Entry { id: "other.drawing".into(), ..drawing.clone() };
+        let twin = Entry {
+            id: "other.drawing".into(),
+            ..drawing.clone()
+        };
         let more = vec![drawing.clone(), twin];
         assert!(matches!(find(&more, "drawing"), Lookup::Ambiguous(ref ids) if ids.len() == 2));
     }

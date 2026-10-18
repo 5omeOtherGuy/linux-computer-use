@@ -415,7 +415,12 @@ fn close_wait_over(
     still: Duration,
     max: Duration,
 ) -> bool {
-    waited >= max || if active { since_activity >= idle } else { waited >= still }
+    waited >= max
+        || if active {
+            since_activity >= idle
+        } else {
+            waited >= still
+        }
 }
 
 /// Pre-Unicode keysyms that keyboard maps still use for some characters.
@@ -1014,7 +1019,11 @@ impl Desktop {
         if let Some(text) = self.clipboard.as_ref().and_then(|o| o.owned_text()) {
             return Ok(Some(text));
         }
-        let owner = self.conn.get_selection_owner(self.atoms.CLIPBOARD)?.reply()?.owner;
+        let owner = self
+            .conn
+            .get_selection_owner(self.atoms.CLIPBOARD)?
+            .reply()?
+            .owner;
         if owner == NONE {
             return Ok(None);
         }
@@ -1052,7 +1061,14 @@ impl Desktop {
         }
         let reply = self
             .conn
-            .get_property(true, self.helper, property, AtomEnum::ANY, 0, CLIPBOARD_MAX / 4)?
+            .get_property(
+                true,
+                self.helper,
+                property,
+                AtomEnum::ANY,
+                0,
+                CLIPBOARD_MAX / 4,
+            )?
             .reply()?;
         self.conn.flush()?;
         if reply.type_ == self.atoms.INCR {
@@ -1441,7 +1457,10 @@ impl Desktop {
         // pixels of overlapping windows. Exposures make the client repaint
         // all of it (the redirected window counts as fully visible). Damage
         // reported at or after this request's sequence number is that repaint.
-        let fence = self.conn.clear_area(true, win, 0, 0, 0, 0)?.sequence_number();
+        let fence = self
+            .conn
+            .clear_area(true, win, 0, 0, 0, 0)?
+            .sequence_number();
         let geom = match self.conn.get_geometry(win)?.reply() {
             Ok(g) => g,
             Err(e) => {
@@ -1781,8 +1800,10 @@ impl Desktop {
                     // A popup can be unmapped and destroyed before we get
                     // here; it is then simply gone. Popup tracking never
                     // fails the pump (input may already have been sent).
-                    if let Some(Some(owner)) =
-                        self.owners(&[e.window]).ok().and_then(|o| o.first().copied())
+                    if let Some(Some(owner)) = self
+                        .owners(&[e.window])
+                        .ok()
+                        .and_then(|o| o.first().copied())
                     {
                         self.popups.insert(e.window, owner);
                         // Popups of clients we read are redirected right away.
@@ -1809,7 +1830,9 @@ impl Desktop {
             Event::CreateNotify(e)
                 if e.parent == self.root
                     && !e.override_redirect
-                    && self.settle_target.is_some_and(|t| self.client_base(t) == self.client_base(e.window)) =>
+                    && self
+                        .settle_target
+                        .is_some_and(|t| self.client_base(t) == self.client_base(e.window)) =>
             {
                 // The app being acted on is building a new top-level (a
                 // dialog): settling waits for it to map. Its own MapNotify is
@@ -1831,13 +1854,21 @@ impl Desktop {
                     self.creating.insert(e.window, Instant::now());
                 }
                 if crate::trace_on() {
-                    eprintln!("trace x11 CreateNotify {:#x} viewable={viewable:?} t={:?}", e.window, crate::since_start());
+                    eprintln!(
+                        "trace x11 CreateNotify {:#x} viewable={viewable:?} t={:?}",
+                        e.window,
+                        crate::since_start()
+                    );
                 }
                 self.note_activity();
             }
             Event::MapNotify(e) if self.creating.remove(&e.window).is_some() => {
                 if crate::trace_on() {
-                    eprintln!("trace x11 MapNotify {:#x} t={:?}", e.window, crate::since_start());
+                    eprintln!(
+                        "trace x11 MapNotify {:#x} t={:?}",
+                        e.window,
+                        crate::since_start()
+                    );
                 }
                 self.note_activity();
             }
@@ -1857,10 +1888,8 @@ impl Desktop {
                     }
                 }
             }
-            Event::MappingNotify(e) => {
-                if e.request != xproto::Mapping::POINTER {
-                    self.keymap = Keymap::load(&self.conn)?;
-                }
+            Event::MappingNotify(e) if e.request != xproto::Mapping::POINTER => {
+                self.keymap = Keymap::load(&self.conn)?;
             }
             // Asynchronous errors from unchecked requests on vanished windows.
             _ => {}
@@ -1997,7 +2026,11 @@ impl Desktop {
             let left = if self.activity {
                 // Accessibility events without anything shown yet: the app
                 // is still at work (building a dialog), with pauses.
-                let quiet = if self.x_activity { quiet } else { quiet.max(QUIET_INVISIBLE) };
+                let quiet = if self.x_activity {
+                    quiet
+                } else {
+                    quiet.max(QUIET_INVISIBLE)
+                };
                 let quiet_for = now - self.last_activity.max(start);
                 if quiet_for >= quiet {
                     return Ok(Settled {
@@ -2071,7 +2104,14 @@ impl Desktop {
                 return Ok(true);
             }
             let now = Instant::now();
-            if close_wait_over(active, now - self.last_activity, now - start, idle, still, max) {
+            if close_wait_over(
+                active,
+                now - self.last_activity,
+                now - start,
+                idle,
+                still,
+                max,
+            ) {
                 trace.mark("gave_up");
                 trace.note("active", active);
                 trace.note("since_activity_ms", (now - self.last_activity).as_millis());
@@ -2461,7 +2501,15 @@ impl Desktop {
     /// accessibility layer and are rejected here.
     pub fn action(&mut self, info: &WindowInfo, method: &str, p: &Value) -> Result<()> {
         let allowed: &[&str] = match method {
-            "click" => &["window_id", "x", "y", "button", "click_count", "modifiers", "hold_ms"],
+            "click" => &[
+                "window_id",
+                "x",
+                "y",
+                "button",
+                "click_count",
+                "modifiers",
+                "hold_ms",
+            ],
             "drag" => &["window_id", "from", "to", "path", "modifiers"],
             "scroll" => &["window_id", "x", "y", "direction", "pixels", "modifiers"],
             "press_key" => &["window_id", "key", "hold_ms"],
@@ -2506,7 +2554,12 @@ impl Desktop {
     /// which may lie on a popup beyond the window. Used instead of AT-SPI
     /// DoAction where the toolkit would run a nested main loop inside the
     /// accessibility call (GTK menu items opening modal dialogs).
-    pub fn click_element_point(&mut self, info: &WindowInfo, click: &Value, area: HitArea) -> Result<()> {
+    pub fn click_element_point(
+        &mut self,
+        info: &WindowInfo,
+        click: &Value,
+        area: HitArea,
+    ) -> Result<()> {
         let mut time = self.server_time()?;
         let r = self.do_click(info, click, &mut time, area);
         self.conn.flush()?;
@@ -2570,7 +2623,13 @@ impl Desktop {
         Ok(())
     }
 
-    fn do_click(&mut self, info: &WindowInfo, p: &Value, time: &mut u32, area: HitArea) -> Result<()> {
+    fn do_click(
+        &mut self,
+        info: &WindowInfo,
+        p: &Value,
+        time: &mut u32,
+        area: HitArea,
+    ) -> Result<()> {
         let (x, y) = point(p, "x", "y")?;
         let button = match p.get("button") {
             None => 1u8,
@@ -2606,7 +2665,15 @@ impl Desktop {
             *time = time.wrapping_add(10);
             self.send(
                 t.win,
-                self.pointer_event(xproto::BUTTON_RELEASE_EVENT, button, *time, &t, x, y, state | mask),
+                self.pointer_event(
+                    xproto::BUTTON_RELEASE_EVENT,
+                    button,
+                    *time,
+                    &t,
+                    x,
+                    y,
+                    state | mask,
+                ),
             )?;
             if r.is_err() {
                 break;
@@ -2626,8 +2693,10 @@ impl Desktop {
             let (x0, y0) = segment[0];
             let (x1, y1) = segment[1];
             for i in 1..=DRAG_STEPS {
-                let point = (x0 + (x1 - x0) * i / DRAG_STEPS,
-                             y0 + (y1 - y0) * i / DRAG_STEPS);
+                let point = (
+                    x0 + (x1 - x0) * i / DRAG_STEPS,
+                    y0 + (y1 - y0) * i / DRAG_STEPS,
+                );
                 self.hit_test(info, point.0, point.1, HitArea::Window)?;
                 motions.push((point.0, point.1, i == DRAG_STEPS));
             }
@@ -2755,10 +2824,9 @@ impl Desktop {
 /// `modifiers: ["shift", "ctrl", ...]` held during a pointer action.
 fn parse_modifiers(v: Option<&Value>) -> Result<Vec<Modifier>> {
     let Some(v) = v else { return Ok(Vec::new()) };
-    let arr = v
-        .as_array()
-        .filter(|a| a.len() <= 4)
-        .ok_or_else(|| invalid("modifiers must be an array of at most 4 of shift, ctrl, alt, super"))?;
+    let arr = v.as_array().filter(|a| a.len() <= 4).ok_or_else(|| {
+        invalid("modifiers must be an array of at most 4 of shift, ctrl, alt, super")
+    })?;
     let mut out = Vec::new();
     for m in arr {
         let m = parse_modifier(
@@ -2835,9 +2903,13 @@ fn drag_points(p: &Value) -> Result<Vec<(i32, i32)>> {
         if p.get("from").is_some() || p.get("to").is_some() {
             return Err(invalid("provide path or from/to, not both"));
         }
-        let path = path.as_array().filter(|v| (2..=256).contains(&v.len()))
+        let path = path
+            .as_array()
+            .filter(|v| (2..=256).contains(&v.len()))
             .ok_or_else(|| invalid("path must contain 2..=256 [x, y] points"))?;
-        path.iter().map(|v| pair(&json!({"point": v}), "point")).collect()
+        path.iter()
+            .map(|v| pair(&json!({"point": v}), "point"))
+            .collect()
     } else {
         Ok(vec![pair(p, "from")?, pair(p, "to")?])
     }
@@ -2849,13 +2921,22 @@ mod tests {
 
     #[test]
     fn continuous_drag_validation() {
-        assert_eq!(drag_points(&json!({"path": [[1,2], [9,2], [9,8], [1,2]]})).unwrap(),
-                   vec![(1,2), (9,2), (9,8), (1,2)]);
-        assert_eq!(drag_points(&json!({"from": [1,2], "to": [3,4]})).unwrap(), vec![(1,2), (3,4)]);
-        for p in [json!({"path": []}), json!({"path": [[1,2]]}),
-                  json!({"path": [[1,2], [3,4,5]]}), json!({"path": [[1,2], [3.5,4]]}),
-                  json!({"path": [[1,2], [3,4]], "from": [1,2]}),
-                  json!({"path": vec![[1,2]; 257]})] {
+        assert_eq!(
+            drag_points(&json!({"path": [[1,2], [9,2], [9,8], [1,2]]})).unwrap(),
+            vec![(1, 2), (9, 2), (9, 8), (1, 2)]
+        );
+        assert_eq!(
+            drag_points(&json!({"from": [1,2], "to": [3,4]})).unwrap(),
+            vec![(1, 2), (3, 4)]
+        );
+        for p in [
+            json!({"path": []}),
+            json!({"path": [[1,2]]}),
+            json!({"path": [[1,2], [3,4,5]]}),
+            json!({"path": [[1,2], [3.5,4]]}),
+            json!({"path": [[1,2], [3,4]], "from": [1,2]}),
+            json!({"path": vec![[1,2]; 257]}),
+        ] {
             assert!(drag_points(&p).is_err(), "{p}");
         }
     }
@@ -2867,12 +2948,24 @@ mod tests {
             vec![Modifier::Shift, Modifier::Ctrl]
         );
         assert_eq!(parse_modifiers(None).unwrap(), vec![]);
-        for v in [json!("shift"), json!(["cmd"]), json!([1]), json!(["a", "b", "c", "d", "e"])] {
+        for v in [
+            json!("shift"),
+            json!(["cmd"]),
+            json!([1]),
+            json!(["a", "b", "c", "d", "e"]),
+        ] {
             assert!(parse_modifiers(Some(&v)).is_err(), "{v}");
         }
         assert_eq!(hold_ms(&json!({})).unwrap(), Duration::ZERO);
-        assert_eq!(hold_ms(&json!({"hold_ms": 250})).unwrap(), Duration::from_millis(250));
-        for v in [json!({"hold_ms": -1}), json!({"hold_ms": 10_001}), json!({"hold_ms": "1"})] {
+        assert_eq!(
+            hold_ms(&json!({"hold_ms": 250})).unwrap(),
+            Duration::from_millis(250)
+        );
+        for v in [
+            json!({"hold_ms": -1}),
+            json!({"hold_ms": 10_001}),
+            json!({"hold_ms": "1"}),
+        ] {
             assert!(hold_ms(&v).is_err(), "{v}");
         }
     }
@@ -2931,7 +3024,11 @@ mod tests {
         // GPT-style spellings: any case, Enter for Return, arrow names; a
         // lone capital letter keeps its case, with modifiers it names the key.
         for k in ["Ctrl+s", "ctrl+S", "CTRL+s", "Control+s"] {
-            assert_eq!(parse_key_combo(k).unwrap(), (vec![Modifier::Ctrl], 's' as u32), "{k}");
+            assert_eq!(
+                parse_key_combo(k).unwrap(),
+                (vec![Modifier::Ctrl], 's' as u32),
+                "{k}"
+            );
         }
         for k in ["Enter", "ENTER", "return"] {
             assert_eq!(parse_key_combo(k).unwrap(), (vec![], XK_RETURN), "{k}");
