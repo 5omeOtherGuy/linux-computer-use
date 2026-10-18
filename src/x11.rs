@@ -811,6 +811,8 @@ pub struct Desktop {
     display: String,
     /// CLIPBOARD owner (own connection and thread), started on first use.
     clipboard: Option<crate::clipboard::Owner>,
+    /// Sequence number of the latest CLIPBOARD owner change XFixes reported.
+    clipboard_seq: u64,
 }
 
 impl Desktop {
@@ -936,6 +938,20 @@ impl Desktop {
         .check()
         .context("creating helper window")?;
 
+        // Clipboard owner changes, so a read can tell that the owner it
+        // authorized is still the one answering.
+        if live.is_none() {
+            conn.xfixes_select_selection_input(
+                helper,
+                atoms.CLIPBOARD,
+                xfixes::SelectionEventMask::SET_SELECTION_OWNER
+                    | xfixes::SelectionEventMask::SELECTION_WINDOW_DESTROY
+                    | xfixes::SelectionEventMask::SELECTION_CLIENT_CLOSE,
+            )?
+            .check()
+            .context("selecting clipboard owner events")?;
+        }
+
         let keymap = Keymap::load(&conn)?;
         conn.flush()?;
 
@@ -961,6 +977,7 @@ impl Desktop {
             live,
             display: display.to_string(),
             clipboard: None,
+            clipboard_seq: 0,
         };
         desktop.scan_popups()?;
         Ok(desktop)
@@ -1008,8 +1025,16 @@ impl Desktop {
     }
 
     /// The CLIPBOARD contents as text, `None` when nobody owns the
-    /// selection or the owner offers no text.
-    pub fn clipboard_read(&mut self) -> Result<Option<String>> {
+    /// selection or the owner offers no text. Text this daemon put there
+    /// is returned as is. Otherwise the owner window must be a listed
+    /// window, or the windows listed for its client (failing that, for its
+    /// process) must all be of one app, and `authorize` must accept that
+    /// window before the contents are requested. The read fails with
+    /// `clipboard_changed` when the selection changes hands meanwhile.
+    pub fn clipboard_read(
+        &mut self,
+        authorize: impl Fn(&WindowInfo) -> Result<()>,
+    ) -> Result<Option<String>> {
         if self.live.is_some() {
             return Err(xerr(
                 "unsupported",
@@ -1019,15 +1044,61 @@ impl Desktop {
         if let Some(text) = self.clipboard.as_ref().and_then(|o| o.owned_text()) {
             return Ok(Some(text));
         }
-        let owner = self
-            .conn
-            .get_selection_owner(self.atoms.CLIPBOARD)?
-            .reply()?
-            .owner;
+        let cookie = self.conn.get_selection_owner(self.atoms.CLIPBOARD)?;
+        // Owner changes that carry this sequence number or a later one
+        // happened after `owner` was read (`handle` records them).
+        let since = cookie.sequence_number();
+        let owner = cookie.reply()?.owner;
         if owner == NONE {
             return Ok(None);
         }
+        let changed = |d: &Self| -> Result<()> {
+            if d.clipboard_seq >= since {
+                return Err(xerr(
+                    "clipboard_changed",
+                    "the clipboard changed while it was read; nothing was read, read it again",
+                ));
+            }
+            Ok(())
+        };
+        let (base, pid) = self
+            .owners(&[owner])?
+            .first()
+            .copied()
+            .flatten()
+            .unwrap_or((self.client_base(owner), 0));
+        let wins = self.describe(&self.candidates()?)?;
+        let app = match wins.iter().find(|w| w.window_id == owner) {
+            Some(w) => w,
+            None => {
+                let mut group: Vec<&WindowInfo> = wins
+                    .iter()
+                    .filter(|w| self.client_base(w.window_id) == base)
+                    .collect();
+                if group.is_empty() && pid != 0 {
+                    group = wins.iter().filter(|w| w.pid == pid).collect();
+                }
+                let Some(&first) = group.first() else {
+                    return Err(xerr(
+                        "app_denied",
+                        "the clipboard belongs to a client with no listed window, so its app cannot be checked; nothing was read",
+                    ));
+                };
+                if group
+                    .iter()
+                    .any(|w| w.app_id != first.app_id || w.pid != first.pid)
+                {
+                    return Err(xerr(
+                        "app_denied",
+                        "the clipboard belongs to a client whose windows belong to several apps, so its app cannot be told; nothing was read",
+                    ));
+                }
+                first
+            }
+        };
+        authorize(app)?;
         let time = self.server_time()?;
+        changed(self)?;
         self.conn.convert_selection(
             self.helper,
             self.atoms.CLIPBOARD,
@@ -1039,12 +1110,17 @@ impl Desktop {
         let start = Instant::now();
         let property = loop {
             if let Some((ev, seq)) = self.conn.poll_for_event_with_sequence()? {
-                if let Event::SelectionNotify(e) = &ev {
-                    if e.requestor == self.helper && e.selection == self.atoms.CLIPBOARD {
+                match &ev {
+                    Event::SelectionNotify(e)
+                        if e.requestor == self.helper
+                            && e.selection == self.atoms.CLIPBOARD
+                            && e.time == time =>
+                    {
                         break e.property;
                     }
+                    _ => self.handle(ev, seq)?,
                 }
-                self.handle(ev, seq)?;
+                changed(self)?;
                 continue;
             }
             let left = CLIPBOARD_WAIT.saturating_sub(start.elapsed());
@@ -1056,6 +1132,7 @@ impl Desktop {
             }
             self.wait_readable(left.min(Duration::from_millis(50)))?;
         };
+        changed(self)?;
         if property == NONE {
             return Ok(None);
         }
@@ -1071,6 +1148,12 @@ impl Desktop {
             )?
             .reply()?;
         self.conn.flush()?;
+        // Events that arrived before the property's reply: an owner change
+        // among them may have answered in place of the authorized owner.
+        while let Some((ev, seq)) = self.conn.poll_for_event_with_sequence()? {
+            self.handle(ev, seq)?;
+        }
+        changed(self)?;
         if reply.type_ == self.atoms.INCR {
             return Err(xerr(
                 "unsupported",
@@ -1794,6 +1877,9 @@ impl Desktop {
                 if self.relevant(e.drawable) {
                     self.note_activity();
                 }
+            }
+            Event::XfixesSelectionNotify(e) if e.selection == self.atoms.CLIPBOARD => {
+                self.clipboard_seq = self.clipboard_seq.max(seq);
             }
             Event::MapNotify(e) if e.event == self.root => {
                 if e.override_redirect && e.window != self.helper {
@@ -2918,6 +3004,103 @@ fn drag_points(p: &Value) -> Result<Vec<(i32, i32)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Opt-in, on a private X server (never `:0`, which `connect` refuses):
+    /// `CUA_X11_TEST_DISPLAY=:78 cargo test --locked x11::tests::clipboard`.
+    /// Skipped (passes) without the variable, so the gate stays hermetic.
+    #[test]
+    fn clipboard_read_authorizes_the_owner_and_notices_a_new_one() {
+        let Ok(display) = std::env::var("CUA_X11_TEST_DISPLAY") else {
+            return;
+        };
+        let mut d = Desktop::connect(&display).unwrap();
+        let clip = d.atoms.CLIPBOARD;
+        let code = |r: Result<Option<String>>| {
+            r.unwrap_err()
+                .downcast_ref::<X11Error>()
+                .map(|e| e.code)
+                .unwrap_or("other")
+        };
+        // A client with a listed window (later two, of different apps) that
+        // owns the clipboard directly, through an unlisted helper window, or
+        // through a second connection of the same process.
+        let (app, _) = x11rb::connect(Some(&display)).unwrap();
+        let root = app.setup().roots[0].root;
+        let window = |c: &RustConnection, class: Option<&[u8]>, map: bool| {
+            let w = c.generate_id().unwrap();
+            c.create_window(
+                0,
+                w,
+                root,
+                0,
+                0,
+                50,
+                50,
+                0,
+                WindowClass::INPUT_OUTPUT,
+                0,
+                &CreateWindowAux::new(),
+            )
+            .unwrap();
+            if let Some(class) = class {
+                c.change_property8(
+                    PropMode::REPLACE,
+                    w,
+                    AtomEnum::WM_CLASS,
+                    AtomEnum::STRING,
+                    class,
+                )
+                .unwrap();
+            }
+            if map {
+                c.map_window(w).unwrap();
+            }
+            c.get_input_focus().unwrap().reply().unwrap();
+            w
+        };
+        let a = window(&app, Some(b"alpha\0Alpha\0"), true);
+        let own = |c: &RustConnection, w: Window| {
+            c.set_selection_owner(w, clip, x11rb::CURRENT_TIME).unwrap();
+            c.get_input_focus().unwrap().reply().unwrap();
+        };
+        let seen = std::cell::RefCell::new(Vec::new());
+        let deny = |w: &WindowInfo| {
+            seen.borrow_mut().push(w.app_id.clone());
+            Err(xerr("app_denied", "denied by the test"))
+        };
+        // The exact owner window is the one authorized.
+        own(&app, a);
+        assert_eq!(code(d.clipboard_read(deny)), "app_denied");
+        assert_eq!(seen.take(), vec!["Alpha".to_string()]);
+        // An unlisted helper window of that client: the client's app.
+        let helper = window(&app, None, false);
+        own(&app, helper);
+        assert_eq!(code(d.clipboard_read(deny)), "app_denied");
+        assert_eq!(seen.take(), vec!["Alpha".to_string()]);
+        // A second connection of the same process: the process's app.
+        let (other, _) = x11rb::connect(Some(&display)).unwrap();
+        let unlisted = window(&other, None, false);
+        own(&other, unlisted);
+        assert_eq!(code(d.clipboard_read(deny)), "app_denied");
+        assert_eq!(seen.take(), vec!["Alpha".to_string()]);
+        // ... unless its windows belong to two apps.
+        window(&app, Some(b"beta\0Beta\0"), true);
+        for owner in [(&app, helper), (&other, unlisted)] {
+            own(owner.0, owner.1);
+            assert_eq!(code(d.clipboard_read(deny)), "app_denied");
+            assert!(
+                seen.take().is_empty(),
+                "an ambiguous owner is not authorized"
+            );
+        }
+        // A new owner after the check aborts the read.
+        own(&app, a);
+        let switch = |_: &WindowInfo| {
+            own(&other, unlisted);
+            Ok(())
+        };
+        assert_eq!(code(d.clipboard_read(switch)), "clipboard_changed");
+    }
 
     #[test]
     fn continuous_drag_validation() {

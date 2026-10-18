@@ -34,7 +34,10 @@ let notesDialog = false;
 const active = (win, params) => (params.app && win.pid === 101 && notesDialog ? WINDOWS.find((w) => w.window_id === 14) : win);
 let pointer = null;
 const typed = [];
-let clipboard = null;
+// The clipboard text and the window whose app owns it (null: this daemon,
+// after clipboard_write). FAKE_CLIPBOARD_OWNER starts it owned by a window;
+// ctrl+c in a window makes its app the owner.
+let clipboard = process.env.FAKE_CLIPBOARD_OWNER ? { text: 'owned at start', owner: Number(process.env.FAKE_CLIPBOARD_OWNER) } : null;
 // launch_app "opens" a window of a new app (approval needed like any other).
 const LAUNCHED = { window_id: 21, title: 'Launched', app_id: 'org.example.Launched', pid: 121, width: 500, height: 400 };
 
@@ -108,10 +111,12 @@ async function handle(method, params) {
     }
     case 'clipboard_write':
       record({ event: 'performed', method, params });
-      clipboard = params.text;
+      clipboard = { text: params.text, owner: null };
       return { written: true };
     case 'clipboard_read':
-      return { text: clipboard };
+      // As the daemon: the owning app is checked like a window read.
+      if (clipboard?.owner) windowFor({ window_id: clipboard.owner });
+      return { text: clipboard?.text ?? null };
     case 'clipboard_release':
       clipboard = null;
       return { released: true };
@@ -134,6 +139,7 @@ async function handle(method, params) {
   if (method === 'type_text' || method === 'paste') typed.push(params.text);
   if (params.x !== undefined) pointer = [params.x, params.y];
   record({ event: 'performed', method, params, pointer });
+  if (method === 'press_key' && params.key === 'ctrl+c') clipboard = { text: `copied in ${win.app_id}`, owner: win.window_id };
   if (method === 'click' && params.x === 777) notesDialog = true;
   if (method === 'press_key' && params.key === 'Escape') notesDialog = false;
   if (params.observe === false) {

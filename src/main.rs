@@ -186,18 +186,6 @@ fn int_param(p: &serde_json::Map<String, Value>, k: &str) -> Option<u32> {
 }
 
 impl Engine {
-    fn authorize(&self, w: &WindowInfo) -> std::result::Result<(), Value> {
-        match self.policy.decide(w) {
-            policy::Decision::Allowed => Ok(()),
-            policy::Decision::Denied(reason) => Err(
-                json!({"code":"app_denied","message":format!("App is denied: {reason}; approval cannot override it")}),
-            ),
-            policy::Decision::NeedsApproval => Err(
-                json!({"code":"approval_required","message":"User approval required before reading or controlling this app", "data":{"app_id":w.app_id,"window_id":w.window_id,"title":w.title,"executable":policy::executable(w.pid)}}),
-            ),
-        }
-    }
-
     fn remember(&mut self, wins: &[WindowInfo]) {
         for w in wins {
             self.known.insert(w.window_id, (w.pid, w.app_id.clone()));
@@ -750,7 +738,12 @@ impl Engine {
                 return Ok(json!({"written":true}));
             }
             "clipboard_read" => {
-                let text = self.desktop.clipboard_read()?;
+                // The app that owns the clipboard is checked like a window
+                // read: deny wins, and it needs approval unless allowed.
+                let policy = &self.policy;
+                let text = self.desktop.clipboard_read(|w| {
+                    authorize(policy, w).map_err(|e| ProtocolError(e).into())
+                })?;
                 return Ok(json!({"text":text}));
             }
             "clipboard_release" => {
@@ -811,7 +804,7 @@ impl Engine {
             .try_into()?;
         if method == "approve_app" {
             let w = self.desktop.window(id)?;
-            if let Err(denied @ Value::Object(_)) = self.authorize(&w) {
+            if let Err(denied @ Value::Object(_)) = authorize(&self.policy, &w) {
                 if denied["code"] == "app_denied" {
                     return Err(ProtocolError(denied).into());
                 }
@@ -885,7 +878,7 @@ impl Engine {
             self.remember(std::slice::from_ref(&w));
             ((w.pid, w.app_id.clone()), vec![w.clone()], w)
         };
-        self.authorize(&w).map_err(ProtocolError)?;
+        authorize(&self.policy, &w).map_err(ProtocolError)?;
         self.desktop.check_user_input()?;
         trace.mark("resolve");
         if method == "get_screenshot" {
@@ -1164,7 +1157,7 @@ impl Engine {
                 // The caller observes later (the end of a cell with several
                 // actions): the result names the window the action landed
                 // on and the app's windows after it, without a tree.
-                self.authorize(&current).map_err(ProtocolError)?;
+                authorize(&self.policy, &current).map_err(ProtocolError)?;
                 let others: Vec<Value> = wins
                     .iter()
                     .filter(|o| o.window_id != current.window_id)
@@ -1230,7 +1223,7 @@ impl Engine {
         start: Instant,
         external: &mut dyn FnMut() -> bool,
     ) -> Result<Value> {
-        self.authorize(&w).map_err(ProtocolError)?;
+        authorize(&self.policy, &w).map_err(ProtocolError)?;
         let settle_ms = |start: Instant| start.elapsed().as_secs_f64() * 1000.0;
         let o = self.observe(&w, &wins, settle_ms(start)).await?;
         let Some(app) = scope else { return Ok(o) };
@@ -1252,7 +1245,7 @@ impl Engine {
         self.remember(&wins);
         match self.desktop.active_window(&wins, preferred) {
             Some(behind) => {
-                self.authorize(&behind).map_err(ProtocolError)?;
+                authorize(&self.policy, &behind).map_err(ProtocolError)?;
                 self.observe(&behind, &wins, settle_ms(start)).await
             }
             None => Ok(closed_result(&w, start)),
@@ -1290,6 +1283,19 @@ fn coordinate_window(frame: u32, wins: &[WindowInfo], active: &WindowInfo) -> Re
         ));
     }
     Ok(w.clone())
+}
+
+/// The error for a window the policy does not allow, if any.
+fn authorize(policy: &policy::Policy, w: &WindowInfo) -> std::result::Result<(), Value> {
+    match policy.decide(w) {
+        policy::Decision::Allowed => Ok(()),
+        policy::Decision::Denied(reason) => Err(
+            json!({"code":"app_denied","message":format!("App is denied: {reason}; approval cannot override it")}),
+        ),
+        policy::Decision::NeedsApproval => Err(
+            json!({"code":"approval_required","message":"User approval required before reading or controlling this app", "data":{"app_id":w.app_id,"window_id":w.window_id,"title":w.title,"executable":policy::executable(w.pid)}}),
+        ),
+    }
 }
 
 fn x11_error(code: &'static str, message: String) -> anyhow::Error {
