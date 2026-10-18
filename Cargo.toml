@@ -1,0 +1,20 @@
+[package]
+name = "linux-cua"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+futures-util = "0.3"
+libc = "0.2"
+png = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+x11rb = { version = "0.13", features = ["composite", "damage", "res", "shm", "xfixes", "shape", "xinput"] }
+zbus = { version = "5", features = ["tokio"], default-features = false }
+
+[profile.release]
+lto = "thin"

@@ -1,0 +1,220 @@
+"""Close authorization regressions; no X server, GUI, or existing workspace touched."""
+import contextlib
+import importlib.machinery
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+CLI = Path(__file__).resolve().parents[1] / 'bin/agent-desktop'
+loader = importlib.machinery.SourceFileLoader('desktop_ownership', str(CLI))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+ad = importlib.util.module_from_spec(spec)
+loader.exec_module(ad)
+
+# A persistent harness provides a real, stable /proc ancestor across CLI calls.
+WORKER = r'''
+import ctypes, json, os, subprocess, sys
+ctypes.CDLL(None).prctl(15, b'codex', 0, 0, 0)
+print('ready', flush=True)
+for line in sys.stdin:
+    request = json.loads(line)
+    env = dict(os.environ)
+    env.update(request.get('env', {}))
+    result = subprocess.run([sys.executable, sys.argv[1], *request['args']],
+                            env=env, capture_output=True, text=True)
+    print(json.dumps({'code': result.returncode, 'out': result.stdout,
+                      'err': result.stderr}), flush=True)
+'''
+
+
+class CloseOwnershipTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='adt-ownership-')
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.runtime = self.root / 'runtime'
+        self.cache = self.root / 'cache'
+        self.workers = []
+        for thread in ('thread-a', 'thread-b'):
+            env = dict(os.environ, AGENT_DESKTOP_RUNTIME=str(self.runtime),
+                       AGENT_DESKTOP_CACHE=str(self.cache), CODEX_THREAD_ID=thread)
+            p = subprocess.Popen([sys.executable, '-u', '-c', WORKER, str(CLI)],
+                                 env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                 stderr=subprocess.PIPE, text=True)
+            self.workers.append(p)
+            self.addCleanup(self.stop_worker, p)
+            self.assertEqual(p.stdout.readline().strip(), 'ready')
+
+    def stop_worker(self, p):
+        p.stdin.close()
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait(timeout=5)
+        p.stdout.close()
+        p.stderr.close()
+
+    def identity(self, index=0):
+        return {'pid': self.workers[index].pid,
+                'start': ad.proc_start(self.workers[index].pid),
+                'codex_thread_id': ('thread-a', 'thread-b')[index]}
+
+    def workspace(self, name, creator, **extra):
+        directory = self.runtime / 'ws' / name
+        directory.mkdir(parents=True)
+        state = dict(name=name, id='ownership-test-' + name, display=100,
+                     pids={}, starts={}, creator=creator)
+        state.update(extra)
+        (directory / 'state.json').write_text(json.dumps(state))
+        files = self.cache / 'ws' / name
+        files.mkdir(parents=True)
+        (files / 'sentinel').write_text(name)
+        return directory, files
+
+    def call(self, *args, worker=0, **env):
+        p = self.workers[worker]
+        p.stdin.write(json.dumps({'args': args, 'env': env}) + '\n')
+        p.stdin.flush()
+        return json.loads(p.stdout.readline())
+
+    def test_creator_can_close_and_keep_files(self):
+        directory, files = self.workspace('mine', self.identity())
+        result = self.call('close', 'mine', '--keep-files')
+        self.assertEqual(result['code'], 0, result)
+        self.assertFalse(directory.exists())
+        self.assertTrue((files / 'sentinel').exists())
+
+    def test_foreign_creator_refused_even_with_matching_cleanup_owner(self):
+        directory, files = self.workspace('other', self.identity(1),
+                                          owner_pid=self.workers[0].pid)
+        result = self.call('close', 'other')
+        self.assertEqual(result['code'], 3, result)
+        self.assertIn('not created by this agent session', result['err'])
+        self.assertTrue(directory.exists())
+        self.assertTrue((files / 'sentinel').exists())
+        self.assertFalse((self.cache / 'events.log').exists())
+        self.assertEqual(self.call('close', 'other', worker=1)['code'], 0)
+
+    def test_pid_reuse_thread_change_and_legacy_state_fail_closed(self):
+        original = self.identity()
+        variants = [dict(original, start=original['start'] + 1),
+                    dict(original, codex_thread_id='other-thread'), None]
+        for index, creator in enumerate(variants):
+            with self.subTest(creator=creator):
+                name = f'foreign-{index}'
+                directory, files = self.workspace(name, creator)
+                if creator is None:
+                    state_file = directory / 'state.json'
+                    state = json.loads(state_file.read_text())
+                    del state['creator']
+                    state['owner_pid'] = original['pid']
+                    state['owner_start'] = original['start']
+                    state_file.write_text(json.dumps(state))
+                result = self.call('close', name)
+                self.assertEqual(result['code'], 3, result)
+                self.assertTrue(directory.exists())
+                self.assertTrue(files.exists())
+        directory, _ = self.workspace('missing-thread', original)
+        self.assertEqual(self.call('close', 'missing-thread', CODEX_THREAD_ID='')['code'], 3)
+        self.assertTrue(directory.exists())
+
+    def test_all_closes_only_creator_workspaces(self):
+        mine, files = self.workspace('mine', self.identity())
+        other, other_files = self.workspace('other', self.identity(1))
+        legacy, _ = self.workspace('legacy', None)
+        result = self.call('close', '--all')
+        self.assertEqual(result['code'], 0, result)
+        self.assertEqual(result['out'], 'closed mine\n')
+        self.assertFalse(mine.exists())
+        self.assertFalse(files.exists())
+        self.assertTrue(other.exists())
+        self.assertTrue(other_files.exists())
+        self.assertTrue(legacy.exists())
+        self.assertEqual(self.call('close', '--all')['code'], 0)
+
+    def test_explicit_mixed_names_check_each_workspace(self):
+        mine, _ = self.workspace('mine', self.identity())
+        other, _ = self.workspace('other', self.identity(1))
+        result = self.call('close', 'other', 'mine')
+        self.assertEqual(result['code'], 3, result)
+        self.assertTrue(other.exists())
+        self.assertFalse(mine.exists())
+
+    def test_all_with_names_refused_without_closing(self):
+        directory, _ = self.workspace('mine', self.identity())
+        self.assertEqual(self.call('close', 'mine', '--all')['code'], 2)
+        self.assertTrue(directory.exists())
+
+
+class CreatorIdentityTests(unittest.TestCase):
+    def test_no_harness_binds_to_parent_and_requires_live_identity(self):
+        with patch.object(ad, 'find_owner_session', return_value=None), \
+                patch.object(ad.os, 'getppid', return_value=123), \
+                patch.object(ad, 'proc_start', return_value=456), \
+                patch.object(ad, 'comm', return_value='bash'):
+            self.assertEqual(ad.creator_identity(), {'pid': 123, 'start': 456})
+        with patch.object(ad, 'proc_start', return_value=None):
+            with self.assertRaises(ad.Fail) as error:
+                ad.creator_identity()
+            self.assertEqual(error.exception.code, ad.EXIT_REFUSED)
+
+    def test_new_records_creator_independently_of_cleanup_owner(self):
+        creator = {'pid': 123, 'start': 456}
+        for owner_arg in ('none', 'auto', '789'):
+            with self.subTest(owner_pid=owner_arg), tempfile.TemporaryDirectory() as tmp:
+                captured = {}
+
+                class Captured(Exception):
+                    pass
+
+                def capture_env(workspace):
+                    captured.update(workspace.state)
+                    raise Captured()
+
+                args = SimpleNamespace(geometry='1280x800', name='new-test', idle=60,
+                                       owner_pid=owner_arg, label='test', share_home=False,
+                                       audio=False, glx=False)
+                with contextlib.ExitStack() as stack:
+                    for name, value in [('RUNTIME', Path(tmp)),
+                                        ('WS_ROOT', Path(tmp) / 'ws'),
+                                        ('CACHE', Path(tmp) / 'cache')]:
+                        stack.enter_context(patch.object(ad, name, value))
+                    for name, value in [('creator_identity', creator), ('gc', 0),
+                                        ('ram_guard', None), ('pick_display', 100),
+                                        ('find_owner_session', 789), ('alive', True),
+                                        ('proc_start', 999), ('comm', 'other')]:
+                        stack.enter_context(patch.object(ad, name, return_value=value))
+                    stack.enter_context(patch.object(ad.shutil, 'which', return_value='/tool'))
+                    stack.enter_context(patch.object(ad.subprocess, 'run'))
+                    stack.enter_context(patch.object(ad.Workspace, 'env', capture_env))
+                    with self.assertRaises(Captured):
+                        ad.cmd_new(args)
+                self.assertEqual(captured['creator'], creator)
+                self.assertEqual(captured['owner_pid'], None if owner_arg == 'none' else 789)
+
+    def test_refusal_never_calls_process_or_file_cleanup(self):
+        w = SimpleNamespace(name='foreign', state={'creator': {'pid': 2, 'start': 3}},
+                            exists=lambda: True)
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.object(ad, 'RUNTIME', Path(tmp)), \
+                patch.object(ad, 'creator_identity', return_value={'pid': 4, 'start': 5}), \
+                patch.object(ad, 'Workspace', return_value=w), \
+                patch.object(ad, 'close_ws') as close, \
+                contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as result:
+                ad.cmd_close(SimpleNamespace(all=False, ws=['foreign'], keep_files=False))
+            self.assertEqual(result.exception.code, 3)
+            close.assert_not_called()
+
+
+if __name__ == '__main__':
+    unittest.main()
