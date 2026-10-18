@@ -314,29 +314,23 @@ impl Engine {
             .map(|w| w.window_id)
             .collect();
         let path_var = std::env::var("PATH").unwrap_or_default();
-        let Some(program) = launch::resolve_program(&entry.exec[0], &path_var, &launch::trusted)
-        else {
-            return Err(x11_error(
+        let plan = launch::command(&entry, &path_var, &launch::trusted).map_err(|why| {
+            x11_error(
                 "launch_failed",
-                format!(
-                    "cannot start {}: {} is not an executable in a directory this user cannot write",
-                    entry.name, entry.exec[0]
-                ),
-            ));
-        };
-        let mut cmd = std::process::Command::new(&program);
-        cmd.args(&entry.exec[1..])
+                format!("cannot start {}: {why}", entry.name),
+            )
+        })?;
+        let mut cmd = std::process::Command::new(&plan.program);
+        cmd.args(&plan.args)
+            .current_dir(&plan.cwd)
             .env("DISPLAY", self.desktop.display())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        if let Some(dir) = entry
-            .path
-            .as_ref()
-            .filter(|p| std::path::Path::new(p).is_dir())
-        {
-            cmd.current_dir(dir);
-        }
+        match &plan.path {
+            Some(path) => cmd.env("PATH", path),
+            None => cmd.env_remove("PATH"),
+        };
         {
             use std::os::unix::process::CommandExt as _;
             cmd.arg0(&entry.exec[0]).process_group(0);

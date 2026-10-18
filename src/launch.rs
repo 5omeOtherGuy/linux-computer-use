@@ -71,39 +71,51 @@ pub fn data_dirs() -> Vec<PathBuf> {
         .collect()
 }
 
-/// All launchable entries in `dirs`. The first file with an ID decides it
-/// (freedesktop precedence): one that is `Hidden`, `NoDisplay`, not an
-/// application, unreadable or not `trusted` hides the same ID in later
-/// directories instead of falling through to them.
+/// All launchable entries in `dirs`. A file's desktop ID is its path below
+/// the directory with `/` replaced by `-` (`kde/foo.desktop` is `kde-foo`).
+/// The first file with an ID decides it (freedesktop precedence): one that
+/// is `Hidden`, `NoDisplay`, not an application, unreadable or not
+/// `trusted` hides the same ID in later directories instead of falling
+/// through to them.
 pub fn load(dirs: &[PathBuf], trusted: &dyn Fn(&Path) -> bool) -> Vec<Entry> {
     let mut seen = std::collections::HashSet::new();
     let mut out: Vec<Entry> = Vec::new();
     for dir in dirs {
-        let Ok(rd) = std::fs::read_dir(dir) else {
-            continue;
-        };
-        let mut files: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+        let mut files = Vec::new();
+        desktop_files(dir, "", 0, &mut files);
         files.sort();
-        for file in files {
-            let Some(id) = file
-                .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(|n| n.strip_suffix(".desktop"))
-            else {
-                continue;
-            };
-            if !seen.insert(id.to_string()) || !trusted(dir) || !trusted(&file) {
+        for (file, id) in files {
+            if !seen.insert(id.clone()) || !trusted(&file) {
                 continue;
             }
             let Ok(text) = std::fs::read_to_string(&file) else {
                 continue;
             };
-            if let Some(e) = parse(id, &text) {
+            if let Some(e) = parse(&id, &text) {
                 out.push(e);
             }
         }
     }
     out
+}
+
+/// `(path, desktop ID)` of the `.desktop` files in `dir` and its
+/// subdirectories (at most 8 levels, which also ends symlink loops).
+fn desktop_files(dir: &Path, prefix: &str, depth: u32, out: &mut Vec<(PathBuf, String)>) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let (path, name) = (e.path(), e.file_name());
+        let Some(name) = name.to_str() else { continue };
+        if path.is_dir() {
+            if depth < 8 {
+                desktop_files(&path, &format!("{prefix}{name}-"), depth + 1, out);
+            }
+        } else if let Some(stem) = name.strip_suffix(".desktop") {
+            out.push((path, format!("{prefix}{stem}")));
+        }
+    }
 }
 
 /// Whether this user cannot change what the absolute `path` names: every
@@ -158,6 +170,74 @@ pub fn trusted(path: &Path) -> bool {
         }
     }
     true
+}
+
+/// How an entry is started.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Command {
+    /// Absolute, trusted program; `argv[0]` stays `entry.exec[0]`.
+    pub program: PathBuf,
+    pub args: Vec<String>,
+    /// Trusted working directory: `Path=`, else `/`.
+    pub cwd: PathBuf,
+    /// The child's `PATH`: the trusted absolute directories of `path_var`
+    /// (`None`: unset, so lookups use the C library's system default).
+    pub path: Option<String>,
+}
+
+/// The command for `entry`, with every input this user could have written
+/// refused: the program and an `env` launcher's command must resolve to
+/// `trusted` files, `Path=` must be a trusted directory, and the child
+/// searches only trusted `PATH` directories (for an `env` or `#!/usr/bin/env`
+/// lookup of its own). This does not extend to an app's own configuration
+/// or plugins.
+pub fn command(
+    entry: &Entry,
+    path_var: &str,
+    trusted: &dyn Fn(&Path) -> bool,
+) -> std::result::Result<Command, String> {
+    let dirs: Vec<&str> = path_var
+        .split(':')
+        .filter(|d| Path::new(d).is_absolute() && trusted(Path::new(d)))
+        .collect();
+    let path = (!dirs.is_empty()).then(|| dirs.join(":"));
+    let resolve = |prog: &str| {
+        resolve_program(prog, path_var, trusted).ok_or_else(|| {
+            format!("{prog} is not an executable in a location this user cannot write")
+        })
+    };
+    let program = resolve(&entry.exec[0])?;
+    let mut args = entry.exec[1..].to_vec();
+    if program.file_name().is_some_and(|n| n == "env") {
+        // `env [NAME=VALUE ...] COMMAND [ARG ...]` only: its command is
+        // resolved here, so `env` never searches a PATH on its own.
+        let assignment = |a: &str| a.find('=').is_some_and(|i| i > 0) && !a.starts_with('-');
+        let Some(i) = args.iter().position(|a| !assignment(a)) else {
+            return Err("its env launcher names no command".into());
+        };
+        if args[i].starts_with('-') {
+            return Err(format!("its env launcher uses an option ({})", args[i]));
+        }
+        let cmd = resolve(&args[i])?;
+        args[i] = cmd.to_string_lossy().into_owned();
+    }
+    let cwd = match &entry.path {
+        None => PathBuf::from("/"),
+        Some(p) if Path::new(p).is_absolute() && Path::new(p).is_dir() && trusted(Path::new(p)) => {
+            PathBuf::from(p)
+        }
+        Some(p) => {
+            return Err(format!(
+                "its working directory {p} is missing, relative or writable by this user"
+            ))
+        }
+    };
+    Ok(Command {
+        program,
+        args,
+        cwd,
+        path,
+    })
 }
 
 /// The absolute path of the program an entry runs: `program` itself when it
@@ -444,7 +524,13 @@ mod tests {
         std::fs::write(user.join("calc.desktop"), app("calc", "NoDisplay=true\n")).unwrap();
         std::fs::write(user.join("drawing.desktop"), app("sh", "")).unwrap();
         std::fs::write(user.join("mine.desktop"), app("mine", "")).unwrap();
-        for id in ["xed", "calc", "drawing", "other"] {
+        std::fs::create_dir_all(user.join("kde")).unwrap();
+        std::fs::write(
+            user.join("kde/okular.desktop"),
+            app("okular", "Hidden=true\n"),
+        )
+        .unwrap();
+        for id in ["xed", "calc", "drawing", "other", "kde-okular"] {
             std::fs::write(system.join(format!("{id}.desktop")), app(id, "")).unwrap();
         }
         let trusted = |p: &Path| !p.starts_with(&user);
@@ -459,6 +545,71 @@ mod tests {
             .map(|e| e.exec[0].clone())
             .collect();
         assert_eq!(ids, vec!["sh", "mine", "other"]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn commands_take_no_input_this_user_can_write() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = scratch("command");
+        let (writable, system) = (root.join("home-bin"), root.join("usr-bin"));
+        for d in [&writable, &system] {
+            std::fs::create_dir_all(d).unwrap();
+            for prog in ["env", "drawing"] {
+                std::fs::write(d.join(prog), "#!/bin/sh\n").unwrap();
+                std::fs::set_permissions(d.join(prog), std::fs::Permissions::from_mode(0o755))
+                    .unwrap();
+            }
+        }
+        let trusted = |p: &Path| p.starts_with(&system);
+        let path_var = format!("{}:{}", writable.display(), system.display());
+        let entry = |exec: &str, path: Option<&Path>| Entry {
+            id: "x".into(),
+            name: "X".into(),
+            exec: exec_args(exec, "X").unwrap(),
+            path: path.map(|p| p.display().to_string()),
+            wm_class: None,
+            terminal: false,
+        };
+        let c = command(&entry("env FOO=1 drawing --new", None), &path_var, &trusted).unwrap();
+        assert_eq!(c.program, system.join("env"));
+        assert_eq!(
+            c.args,
+            vec![
+                "FOO=1".to_string(),
+                system.join("drawing").display().to_string(),
+                "--new".into()
+            ]
+        );
+        assert_eq!(c.cwd, PathBuf::from("/"));
+        assert_eq!(c.path, Some(system.display().to_string()));
+        for bad in [
+            "env -S drawing",
+            "env -u=X drawing",
+            "env FOO=1",
+            "env missing",
+        ] {
+            assert!(
+                command(&entry(bad, None), &path_var, &trusted).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(command(&entry("drawing", Some(&writable)), &path_var, &trusted).is_err());
+        assert!(command(
+            &entry("drawing", Some(Path::new("rel"))),
+            &path_var,
+            &|_| true
+        )
+        .is_err());
+        let c = command(&entry("drawing", Some(&system)), &path_var, &trusted).unwrap();
+        assert_eq!((c.program, c.cwd), (system.join("drawing"), system.clone()));
+        let c = command(
+            &entry("drawing", None),
+            &writable.display().to_string(),
+            &|_| true,
+        );
+        assert_eq!(c.unwrap().path, Some(writable.display().to_string()));
+        assert!(command(&entry("drawing", None), "", &trusted).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 
