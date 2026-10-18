@@ -7,7 +7,10 @@
 #   panel/install-panel.sh --uninstall  # remove the panel item (links stay)
 #
 # Options: --panel N (default 1), --bin-dir DIR (default ~/.local/bin),
-#          --no-packages, --no-restart.
+#          --no-packages, --no-restart,
+#          --replace-links (point existing command links elsewhere at this checkout).
+# Existing files in the bin dir are never replaced; existing links to another
+# checkout only with --replace-links. Both are checked before any change.
 # A backup of the panel channel is written before any panel change.
 set -euo pipefail
 
@@ -17,6 +20,7 @@ PANEL=1
 BIN_DIR="$HOME/.local/bin"
 PACKAGES=1
 RESTART=1
+REPLACE_LINKS=0
 CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}"
 STATE="$CONFIG/agent-desktop"
 PKGS=(tigervnc-standalone-server tigervnc-viewer openbox xdotool wmctrl xauth dbus-daemon
@@ -30,7 +34,8 @@ while [ $# -gt 0 ]; do
         --bin-dir) BIN_DIR="$2"; shift ;;
         --no-packages) PACKAGES=0 ;;
         --no-restart) RESTART=0 ;;
-        -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+        --replace-links) REPLACE_LINKS=1 ;;
+        -h|--help) sed -n '2,15p' "$0"; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
     shift
@@ -80,6 +85,21 @@ if [ "$MODE" = uninstall ]; then
     exit 0
 fi
 
+# 0. command links: check every destination before changing anything
+LINKS=(bin/agent-desktop panel/agent-desktop-menu panel/agent-desktop-genmon)
+for f in "${LINKS[@]}"; do
+    dest="$BIN_DIR/$(basename "$f")"
+    if [ -L "$dest" ]; then
+        if [ "$(readlink -f -- "$dest")" != "$(readlink -f -- "$REPO/$f")" ] && [ "$REPLACE_LINKS" != 1 ]; then
+            say "existing link $dest -> $(readlink -- "$dest"); use --replace-links to point it here"
+            exit 1
+        fi
+    elif [ -e "$dest" ]; then
+        say "refusing to replace $dest: it is not a symlink"
+        exit 1
+    fi
+done
+
 # 1. packages
 if [ "$PACKAGES" = 1 ]; then
     missing=()
@@ -99,8 +119,13 @@ fi
 
 # 2. command links
 do_ mkdir -p "$BIN_DIR"
-for f in bin/agent-desktop panel/agent-desktop-menu panel/agent-desktop-genmon; do
-    do_ ln -sfn "$REPO/$f" "$BIN_DIR/$(basename "$f")"
+for f in "${LINKS[@]}"; do
+    dest="$BIN_DIR/$(basename "$f")"
+    if [ -L "$dest" ]; then
+        [ "$(readlink -f -- "$dest")" = "$(readlink -f -- "$REPO/$f")" ] && continue
+        do_ rm -- "$dest"
+    fi
+    do_ ln -sn -- "$REPO/$f" "$dest"
 done
 
 # 3. panel item

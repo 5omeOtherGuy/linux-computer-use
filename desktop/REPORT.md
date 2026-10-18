@@ -84,7 +84,7 @@ The design already relied on these installed tools: `xdotool wmctrl xauth dbus-d
                                                               # adds a Generic Monitor item left of the tray, restarts the panel
    desktop/panel/install-panel.sh --uninstall
    ```
-   The script backs up the panel channel to `~/.config/agent-desktop/panel-backup-*.txt` before any panel change. It records the plugin id in `~/.config/agent-desktop/panel-plugin-id`.
+   It never replaces an existing file in `~/.local/bin`, and replaces a link to another checkout only with `--replace-links`; both are checked before any change. The script backs up the panel channel to `~/.config/agent-desktop/panel-backup-*.txt` before any panel change. It records the plugin id in `~/.config/agent-desktop/panel-plugin-id`.
    To add the item by hand instead: right-click the panel → Panel → Add New Items → Generic Monitor. Set Command `~/.local/bin/agent-desktop-genmon`, untick Label, and set the period to 3 s.
    To use a keyboard shortcut instead of the panel item: Settings → Keyboard → Application Shortcuts → `~/.local/bin/agent-desktop-menu`.
 2. Skill (after review): link the bundled skill with `python3 scripts/install-desktop.py` from the repository root. Add a read trigger only if wanted: the skill's description names its trigger (any GUI program).
