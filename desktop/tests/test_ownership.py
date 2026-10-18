@@ -253,6 +253,22 @@ class PrivateFilesTests(unittest.TestCase):
                 ad.private_dir(self.root / bad)
         self.assertEqual(self.mode(new), 0o700)
 
+    def test_group_write_through_an_acl_is_refused(self):
+        import struct
+        d = self.root / 'acl'
+        d.mkdir()
+        # user::rwx, user:<another uid>:rwx, group::rwx, mask::rwx, other::---
+        entries = [(0x01, 7, 0xFFFFFFFF), (0x02, 7, os.getuid() + 1), (0x04, 7, 0xFFFFFFFF),
+                   (0x10, 7, 0xFFFFFFFF), (0x20, 0, 0xFFFFFFFF)]
+        acl = struct.pack('<I', 2) + b''.join(struct.pack('<HHI', *e) for e in entries)
+        try:
+            os.setxattr(d, 'system.posix_acl_access', acl)
+        except OSError as e:
+            self.skipTest(f'no POSIX ACLs here ({e.strerror})')
+        self.assertEqual(self.mode(d), 0o770)
+        with patch.object(ad, 'own_group', return_value=True), self.assertRaises(ad.Fail):
+            ad.private_dir(d)
+
     def test_workspace_files_and_the_cache_above_them_are_private(self):
         cache = self.root / 'cache'
         old = cache / 'ws' / 'old'
@@ -264,6 +280,27 @@ class PrivateFilesTests(unittest.TestCase):
             ad.private_files(w)
         for p in (cache, cache / 'ws', old):
             self.assertEqual(self.mode(p), 0o700, p)
+
+    def test_closing_keeps_files_in_a_cache_others_can_write(self):
+        cache = self.root / 'cache'
+        files = cache / 'ws' / 'gone'
+        files.mkdir(parents=True)
+        (files / 'log').write_text('x')
+        os.chmod(cache / 'ws', 0o777)
+        state = {'pids': {}, 'starts': {}, 'id': 'x', 'display': 100}
+        w = SimpleNamespace(name='gone', state=state, dir=self.root / 'run' / 'ws' / 'gone', files=files)
+        with patch.object(ad, 'CACHE', cache), patch.object(ad, 'WS_ROOT', self.root / 'run' / 'ws'), \
+                patch.object(ad, 'marked_pids', return_value=[]), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            ad.close_ws(w, 'test')
+        self.assertTrue((files / 'log').exists())
+        self.assertIn('kept the files of gone', err.getvalue())
+        os.chmod(cache / 'ws', 0o755)
+        with patch.object(ad, 'CACHE', cache), patch.object(ad, 'WS_ROOT', self.root / 'run' / 'ws'), \
+                patch.object(ad, 'marked_pids', return_value=[]):
+            ad.close_ws(w, 'test')
+        self.assertFalse(files.exists())
+        self.assertEqual(self.mode(cache), 0o700)
 
     def test_runtime_dir_in_tmp_checks_its_parent_too(self):
         parent = self.root / f'agent-desktop-{os.getuid()}'
