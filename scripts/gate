@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# scripts/gate: everything a change must pass, in one command. CI job `gate` runs exactly this.
+#   Rust:    cargo fmt --check, cargo clippy -D warnings, cargo test (builds the engine)
+#   Node:    syntax check of every tracked .js/.mjs file, npm ci and npm test in surface/
+#   Python:  syntax check of every tracked Python file, the display-free unit tests
+#   Shell:   syntax check of every tracked shell script
+#   Secrets: scripts/secret-scan.sh over a copy of the tracked files
+# Hermetic: temporary HOME and XDG directories, no display, session bus or provider keys,
+# and every opt-in live suite (CUA_REAL_ENGINE, CUA_BROWSER_CDP, ...) switched off. Network
+# use is limited to installing the locked dependencies (Cargo.lock, surface/package-lock.json).
+# Needs cargo (with rustfmt and clippy), node >= 22.13 with npm, python3 with `websockets`.
+# Quiet on success; on failure it prints each failing step and its output.
+# usage: scripts/gate
+set -uo pipefail
+cd "$(dirname "$0")/.." || exit 2
+ROOT=$PWD
+
+for tool in cargo node npm python3 git tar; do
+  command -v "$tool" >/dev/null || { echo "gate: $tool is not installed; the gate needs it" >&2; exit 2; }
+done
+python3 -c 'import websockets' 2>/dev/null ||
+  { echo "gate: the Python module websockets is missing (apt install python3-websockets, or pip install websockets)" >&2; exit 2; }
+
+GATE_TMP=$(mktemp -d) || exit 2
+trap 'rm -rf "$GATE_TMP"' EXIT
+
+# Keep the toolchain and dependency caches, then hide the real home and session.
+export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+export npm_config_cache="${npm_config_cache:-$HOME/.npm}"
+export HOME="$GATE_TMP/home" XDG_CONFIG_HOME="$GATE_TMP/config" XDG_CACHE_HOME="$GATE_TMP/cache"
+export XDG_DATA_HOME="$GATE_TMP/data" XDG_STATE_HOME="$GATE_TMP/state" XDG_RUNTIME_DIR="$GATE_TMP/run"
+export TMPDIR="$GATE_TMP/tmp" PYTHONDONTWRITEBYTECODE=1 GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" "$TMPDIR"
+mkdir -m 700 "$XDG_RUNTIME_DIR"
+unset DISPLAY WAYLAND_DISPLAY XAUTHORITY DBUS_SESSION_BUS_ADDRESS AT_SPI_BUS_ADDRESS SESSION_MANAGER \
+  TMUX TMUX_PANE ANTHROPIC_API_KEY OPENAI_API_KEY BENCH_ROOT
+while IFS= read -r name; do unset "$name"; done < <(compgen -e | grep -E '^(CUA_|AGENT_DESKTOP)')
+
+fail=0
+step() { # label command...
+  local label=$1 out; shift
+  if ! out=$("$@" 2>&1); then
+    printf 'gate: FAILED: %s\n%s\n' "$label" "$out" >&2
+    fail=1
+  fi
+}
+
+git ls-files -z > "$GATE_TMP/files" || { echo "gate: FAILED: git ls-files" >&2; exit 2; }
+js=() py=() sh=()
+while IFS= read -r -d '' f; do
+  [ -f "$f" ] || continue   # deleted in the working tree
+  case $f in
+    *.js|*.mjs) js+=("$f"); continue;;
+    *.py) py+=("$f"); continue;;
+    *.sh) sh+=("$f"); continue;;
+  esac
+  first=
+  IFS= read -r first < "$f" || true
+  case $first in
+    '#!'*python3*) py+=("$f");;
+    '#!'*bash*|'#!/bin/sh'*|'#!/usr/bin/env sh'*) sh+=("$f");;
+  esac
+done < "$GATE_TMP/files"
+
+# Secret scan first, on the tracked files only (not target/ or node_modules/).
+mkdir "$GATE_TMP/tree"
+step "copy tracked files" bash -c 'set -o pipefail; tar --null -T "$1" -cf - | tar -xf - -C "$2"' _ "$GATE_TMP/files" "$GATE_TMP/tree"
+step "secret scan (scripts/secret-scan.sh)" scripts/secret-scan.sh "$GATE_TMP/tree"
+
+for f in "${sh[@]}"; do
+  case $(head -n1 "$f") in *bash*) step "bash -n $f" bash -n "$f";; *) step "sh -n $f" sh -n "$f";; esac
+done
+for f in "${js[@]}"; do step "node --check $f" node --check "$f"; done
+step "python syntax" python3 -c '
+import sys
+for f in sys.argv[1:]:
+    with open(f, encoding="utf-8") as h:
+        compile(h.read(), f, "exec")
+' "${py[@]}"
+
+step "cargo fmt --check" cargo fmt --check
+step "cargo clippy" cargo clippy --locked --quiet --all-targets -- -D warnings
+step "cargo test" cargo test --locked --quiet
+
+step "npm ci (surface)" npm ci --prefix surface --ignore-scripts --no-audit --no-fund
+step "npm test (surface)" npm test --prefix surface
+
+step "python tests/test_install_desktop.py" python3 -m unittest discover -s tests -p test_install_desktop.py
+for t in test_ownership.py test_native.py test_browser.py; do
+  step "python desktop/tests/$t" python3 -m unittest discover -s desktop/tests -p "$t"
+done
+
+[ $fail -eq 0 ] && echo "gate: ok"
+exit $fail
