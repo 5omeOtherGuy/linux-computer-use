@@ -282,7 +282,8 @@ impl Engine {
                 "launching applications is not available on a live desktop".into(),
             ));
         }
-        let entries = launch::load(&launch::data_dirs(), &launch::trusted);
+        let entries = launch::load(&launch::data_dirs(), &launch::trusted)
+            .map_err(|why| x11_error("launch_failed", why))?;
         let entry = match launch::find(&entries, query) {
             launch::Lookup::Found(e) => e,
             launch::Lookup::Ambiguous(ids) => {
@@ -323,14 +324,11 @@ impl Engine {
         let mut cmd = std::process::Command::new(&plan.program);
         cmd.args(&plan.args)
             .current_dir(&plan.cwd)
+            .env("PATH", &plan.path)
             .env("DISPLAY", self.desktop.display())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        match &plan.path {
-            Some(path) => cmd.env("PATH", path),
-            None => cmd.env_remove("PATH"),
-        };
         {
             use std::os::unix::process::CommandExt as _;
             cmd.arg0(&entry.exec[0]).process_group(0);

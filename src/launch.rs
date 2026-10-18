@@ -76,13 +76,23 @@ pub fn data_dirs() -> Vec<PathBuf> {
 /// The first file with an ID decides it (freedesktop precedence): one that
 /// is `Hidden`, `NoDisplay`, not an application, unreadable or not
 /// `trusted` hides the same ID in later directories instead of falling
-/// through to them.
-pub fn load(dirs: &[PathBuf], trusted: &dyn Fn(&Path) -> bool) -> Vec<Entry> {
+/// through to them. Fails when a directory holds more than `MAX_FILES`
+/// entries, rather than skip what it could not read.
+pub fn load(
+    dirs: &[PathBuf],
+    trusted: &dyn Fn(&Path) -> bool,
+) -> std::result::Result<Vec<Entry>, String> {
     let mut seen = std::collections::HashSet::new();
     let mut out: Vec<Entry> = Vec::new();
     for dir in dirs {
         let mut files = Vec::new();
-        desktop_files(dir, "", 0, &mut files);
+        let mut budget = MAX_FILES;
+        if !desktop_files(dir, "", 0, &mut budget, &mut files) {
+            return Err(format!(
+                "{} holds more than {MAX_FILES} files; no application is launched",
+                dir.display()
+            ));
+        }
         files.sort();
         for (file, id) in files {
             if !seen.insert(id.clone()) || !trusted(&file) {
@@ -96,26 +106,43 @@ pub fn load(dirs: &[PathBuf], trusted: &dyn Fn(&Path) -> bool) -> Vec<Entry> {
             }
         }
     }
-    out
+    Ok(out)
 }
 
-/// `(path, desktop ID)` of the `.desktop` files in `dir` and its
-/// subdirectories (at most 8 levels, which also ends symlink loops).
-fn desktop_files(dir: &Path, prefix: &str, depth: u32, out: &mut Vec<(PathBuf, String)>) {
+const MAX_FILES: usize = 10_000;
+
+/// Collects `(path, desktop ID)` of the `.desktop` files in `dir` and its
+/// subdirectories, at most 8 levels deep and never through a symlinked
+/// directory (so there are no cycles). False when more than `budget`
+/// directory entries were met.
+fn desktop_files(
+    dir: &Path,
+    prefix: &str,
+    depth: u32,
+    budget: &mut usize,
+    out: &mut Vec<(PathBuf, String)>,
+) -> bool {
     let Ok(rd) = std::fs::read_dir(dir) else {
-        return;
+        return true;
     };
     for e in rd.flatten() {
+        if *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
         let (path, name) = (e.path(), e.file_name());
         let Some(name) = name.to_str() else { continue };
-        if path.is_dir() {
-            if depth < 8 {
-                desktop_files(&path, &format!("{prefix}{name}-"), depth + 1, out);
+        if e.file_type().is_ok_and(|t| t.is_dir()) {
+            if depth < 8
+                && !desktop_files(&path, &format!("{prefix}{name}-"), depth + 1, budget, out)
+            {
+                return false;
             }
         } else if let Some(stem) = name.strip_suffix(".desktop") {
             out.push((path, format!("{prefix}{stem}")));
         }
     }
+    true
 }
 
 /// Whether this user cannot change what the absolute `path` names: every
@@ -180,17 +207,17 @@ pub struct Command {
     pub args: Vec<String>,
     /// Trusted working directory: `Path=`, else `/`.
     pub cwd: PathBuf,
-    /// The child's `PATH`: the trusted absolute directories of `path_var`
-    /// (`None`: unset, so lookups use the C library's system default).
-    pub path: Option<String>,
+    /// The child's `PATH`: the trusted absolute directories of `path_var`.
+    pub path: String,
 }
 
 /// The command for `entry`, with every input this user could have written
-/// refused: the program and an `env` launcher's command must resolve to
-/// `trusted` files, `Path=` must be a trusted directory, and the child
-/// searches only trusted `PATH` directories (for an `env` or `#!/usr/bin/env`
-/// lookup of its own). This does not extend to an app's own configuration
-/// or plugins.
+/// refused: the program, an `env` launcher's command and the interpreters
+/// of a script (`#!` lines, `#!/usr/bin/env NAME` looked up in the child's
+/// `PATH`) must resolve to `trusted` files, `Path=` must be a trusted
+/// directory, and the child's `PATH` holds only trusted directories. What
+/// the app itself runs later, its configuration and its plugins are outside
+/// this check.
 pub fn command(
     entry: &Entry,
     path_var: &str,
@@ -200,11 +227,16 @@ pub fn command(
         .split(':')
         .filter(|d| Path::new(d).is_absolute() && trusted(Path::new(d)))
         .collect();
-    let path = (!dirs.is_empty()).then(|| dirs.join(":"));
+    if dirs.is_empty() {
+        return Err("no PATH directory is outside this user's reach".into());
+    }
+    let path = dirs.join(":");
     let resolve = |prog: &str| {
-        resolve_program(prog, path_var, trusted).ok_or_else(|| {
+        let p = resolve_program(prog, path_var, trusted).ok_or_else(|| {
             format!("{prog} is not an executable in a location this user cannot write")
-        })
+        })?;
+        interpreters(&p, &path, trusted)?;
+        Ok::<_, String>(p)
     };
     let program = resolve(&entry.exec[0])?;
     let mut args = entry.exec[1..].to_vec();
@@ -218,8 +250,14 @@ pub fn command(
         if args[i].starts_with('-') {
             return Err(format!("its env launcher uses an option ({})", args[i]));
         }
-        let cmd = resolve(&args[i])?;
-        args[i] = cmd.to_string_lossy().into_owned();
+        if args[..i].iter().any(|a| a.starts_with("PATH=")) {
+            return Err("its env launcher sets PATH".into());
+        }
+        let cmd = resolve(&args[i])?.to_string_lossy().into_owned();
+        if cmd.contains('=') {
+            return Err(format!("its env launcher's command {cmd} contains '='"));
+        }
+        args[i] = cmd;
     }
     let cwd = match &entry.path {
         None => PathBuf::from("/"),
@@ -238,6 +276,66 @@ pub fn command(
         cwd,
         path,
     })
+}
+
+/// Checks the interpreter chain of `program` (a script's `#!` line, up to
+/// the kernel's four levels): each interpreter must be `trusted`, and for
+/// `#!/usr/bin/env NAME` the first `NAME` in `path`, which `env` will run,
+/// must be too.
+fn interpreters(
+    program: &Path,
+    path: &str,
+    trusted: &dyn Fn(&Path) -> bool,
+) -> std::result::Result<(), String> {
+    let mut cur = program.to_path_buf();
+    for _ in 0..5 {
+        let mut head = [0u8; 256];
+        let n = std::fs::File::open(&cur)
+            .and_then(|mut f| std::io::Read::read(&mut f, &mut head))
+            .map_err(|e| format!("cannot read {}: {e}", cur.display()))?;
+        let Some(line) = head[..n].strip_prefix(b"#!") else {
+            return Ok(());
+        };
+        let line = line.split(|&b| b == b'\n').next().unwrap_or_default();
+        let line = String::from_utf8_lossy(line);
+        let line = line.trim();
+        let (interp, arg) = line.split_once([' ', '\t']).unwrap_or((line, ""));
+        let (interp, arg) = (Path::new(interp), arg.trim());
+        if !interp.is_absolute() || !trusted(interp) {
+            return Err(format!(
+                "{} runs {}, which this user can write",
+                cur.display(),
+                interp.display()
+            ));
+        }
+        cur = if interp.file_name().is_some_and(|n| n == "env") {
+            if arg.is_empty() || arg.starts_with('-') || arg.contains(['=', '/', ' ', '\t']) {
+                return Err(format!(
+                    "{} uses an unsupported env line: {line}",
+                    cur.display()
+                ));
+            }
+            let first = path
+                .split(':')
+                .map(|d| Path::new(d).join(arg))
+                .find(|p| std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.mode() & 0o111 != 0));
+            match first {
+                Some(p) if trusted(&p) => p,
+                _ => {
+                    return Err(format!(
+                        "{} runs {arg}, which is missing from PATH or writable by this user",
+                        cur.display()
+                    ))
+                }
+            }
+        } else {
+            interp.to_path_buf()
+        };
+    }
+    Err(format!(
+        "{} nests interpreters too deeply",
+        program.display()
+    ))
 }
 
 /// The absolute path of the program an entry runs: `program` itself when it
@@ -530,17 +628,21 @@ mod tests {
             app("okular", "Hidden=true\n"),
         )
         .unwrap();
+        // A symlinked directory is not followed, so a cycle costs nothing.
+        std::os::unix::fs::symlink(".", user.join("loop")).unwrap();
         for id in ["xed", "calc", "drawing", "other", "kde-okular"] {
             std::fs::write(system.join(format!("{id}.desktop")), app(id, "")).unwrap();
         }
         let trusted = |p: &Path| !p.starts_with(&user);
         let ids: Vec<String> = load(&[user.clone(), system.clone()], &trusted)
+            .unwrap()
             .into_iter()
             .map(|e| e.id)
             .collect();
         assert_eq!(ids, vec!["other"]);
         // The same files when everything is trusted.
         let ids: Vec<String> = load(&[user, system], &|_| true)
+            .unwrap()
             .into_iter()
             .map(|e| e.exec[0].clone())
             .collect();
@@ -553,16 +655,33 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let root = scratch("command");
         let (writable, system) = (root.join("home-bin"), root.join("usr-bin"));
+        let put = |path: PathBuf, text: String| {
+            std::fs::write(&path, text).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
         for d in [&writable, &system] {
             std::fs::create_dir_all(d).unwrap();
-            for prog in ["env", "drawing"] {
-                std::fs::write(d.join(prog), "#!/bin/sh\n").unwrap();
-                std::fs::set_permissions(d.join(prog), std::fs::Permissions::from_mode(0o755))
-                    .unwrap();
+            for prog in ["env", "drawing", "python3"] {
+                put(d.join(prog), "\x7fELF".into()); // not a script
             }
         }
+        let (env, sys) = (system.join("env"), system.display());
+        // Scripts: a trusted interpreter, an untrusted one, and env lookups.
+        put(system.join("tool"), format!("#!{sys}/python3 -u\n"));
+        put(
+            system.join("bad"),
+            format!("#!{}/python3\n", writable.display()),
+        );
+        put(
+            system.join("envtool"),
+            format!("#! {} python3\n", env.display()),
+        );
+        put(
+            system.join("envopt"),
+            format!("#!{} -S python3 -u\n", env.display()),
+        );
         let trusted = |p: &Path| p.starts_with(&system);
-        let path_var = format!("{}:{}", writable.display(), system.display());
+        let path_var = format!("{}:{}", writable.display(), sys);
         let entry = |exec: &str, path: Option<&Path>| Entry {
             id: "x".into(),
             name: "X".into(),
@@ -571,29 +690,33 @@ mod tests {
             wm_class: None,
             terminal: false,
         };
-        let c = command(&entry("env FOO=1 drawing --new", None), &path_var, &trusted).unwrap();
-        assert_eq!(c.program, system.join("env"));
-        assert_eq!(
-            c.args,
-            vec![
-                "FOO=1".to_string(),
-                system.join("drawing").display().to_string(),
-                "--new".into()
-            ]
-        );
+        let run = |exec: &str, path_var: &str| command(&entry(exec, None), path_var, &trusted);
+        let c = run("env FOO=1 drawing --new", &path_var).unwrap();
+        assert_eq!(c.program, env);
+        let drawing = system.join("drawing").display().to_string();
+        assert_eq!(c.args, vec!["FOO=1".to_string(), drawing, "--new".into()]);
         assert_eq!(c.cwd, PathBuf::from("/"));
-        assert_eq!(c.path, Some(system.display().to_string()));
+        assert_eq!(c.path, sys.to_string());
+        for good in ["tool", "envtool", "env A=1 envtool"] {
+            assert!(run(good, &path_var).is_ok(), "{good}");
+        }
+        // env finds the writable python3 first in this PATH.
+        let writable_first = format!("{}:{}", writable.display(), sys);
+        let all_trusted_dirs = |p: &Path| p.starts_with(&system) || p == writable;
+        assert!(command(&entry("envtool", None), &writable_first, &all_trusted_dirs).is_err());
         for bad in [
             "env -S drawing",
             "env -u=X drawing",
             "env FOO=1",
             "env missing",
+            "env PATH=/home/u/bin drawing",
+            "bad",
+            "envopt",
         ] {
-            assert!(
-                command(&entry(bad, None), &path_var, &trusted).is_err(),
-                "{bad}"
-            );
+            assert!(run(bad, &path_var).is_err(), "{bad}");
         }
+        assert!(run("drawing", "").is_err(), "no trusted PATH directory");
+        assert!(run("drawing", &writable.display().to_string()).is_err());
         assert!(command(&entry("drawing", Some(&writable)), &path_var, &trusted).is_err());
         assert!(command(
             &entry("drawing", Some(Path::new("rel"))),
@@ -603,13 +726,6 @@ mod tests {
         .is_err());
         let c = command(&entry("drawing", Some(&system)), &path_var, &trusted).unwrap();
         assert_eq!((c.program, c.cwd), (system.join("drawing"), system.clone()));
-        let c = command(
-            &entry("drawing", None),
-            &writable.display().to_string(),
-            &|_| true,
-        );
-        assert_eq!(c.unwrap().path, Some(writable.display().to_string()));
-        assert!(command(&entry("drawing", None), "", &trusted).is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 
