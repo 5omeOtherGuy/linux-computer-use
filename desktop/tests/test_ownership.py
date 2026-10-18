@@ -269,6 +269,20 @@ class PrivateFilesTests(unittest.TestCase):
         with patch.object(ad, 'own_group', return_value=True), self.assertRaises(ad.Fail):
             ad.private_dir(d)
 
+    def test_acl_lookup_errors_refuse_unless_xattrs_are_unsupported(self):
+        import errno
+        d = self.root / 'group'
+        d.mkdir()
+        os.chmod(d, 0o770)
+        with patch.object(ad, 'own_group', return_value=True):
+            with patch.object(ad.os, 'listxattr', side_effect=OSError(errno.E2BIG, 'too big')), \
+                    self.assertRaises(ad.Fail):
+                ad.private_dir(d)
+            self.assertEqual(self.mode(d), 0o770)
+            with patch.object(ad.os, 'listxattr', side_effect=OSError(errno.EOPNOTSUPP, 'unsupported')):
+                ad.private_dir(d)
+        self.assertEqual(self.mode(d), 0o700)
+
     def test_workspace_files_and_the_cache_above_them_are_private(self):
         cache = self.root / 'cache'
         old = cache / 'ws' / 'old'

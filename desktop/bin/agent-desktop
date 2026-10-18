@@ -7,6 +7,7 @@ drawn on, or sent to, the owner's display. The owner can watch a workspace
 through a VNC viewer attached to the workspace's unix socket.
 """
 import argparse
+import errno
 import fcntl
 import json
 import os
@@ -182,11 +183,13 @@ def own_group(gid):
         return False
 
 
-def has_acl(fd):
+def has_acl(fd, path):
     try:
         return "system.posix_acl_access" in os.listxattr(fd)
-    except OSError:  # no extended attributes here, so no ACL either
-        return False
+    except OSError as e:
+        if e.errno in (errno.ENOTSUP, errno.EOPNOTSUPP):  # no xattrs here, so no ACL
+            return False
+        raise Fail(f"refusing to use {path}: cannot read its ACL ({e.strerror})")
 
 
 def private_dir(path):
@@ -210,7 +213,7 @@ def private_dir(path):
             raise Fail(f"refusing to use {path}: it belongs to uid {st.st_uid}, not {UID}")
         # With an access ACL the group bits are the ACL mask, which may
         # grant other users write access.
-        if st.st_mode & 0o002 or (st.st_mode & 0o020 and not (own_group(st.st_gid) and not has_acl(fd))):
+        if st.st_mode & 0o002 or (st.st_mode & 0o020 and not (own_group(st.st_gid) and not has_acl(fd, path))):
             raise Fail(f"refusing to use {path}: other users can write to it (mode {st.st_mode & 0o7777:o}); "
                        "check what is in it, then remove it or run chmod 700 on it")
         if st.st_mode & 0o077:
