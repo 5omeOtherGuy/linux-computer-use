@@ -282,7 +282,8 @@ impl Engine {
                 "launching applications is not available on a live desktop".into(),
             ));
         }
-        let entries = launch::load(&launch::data_dirs());
+        let entries = launch::load(&launch::data_dirs(), &launch::trusted)
+            .map_err(|why| x11_error("launch_failed", why))?;
         let entry = match launch::find(&entries, query) {
             launch::Lookup::Found(e) => e,
             launch::Lookup::Ambiguous(ids) => {
@@ -294,7 +295,7 @@ impl Engine {
             launch::Lookup::NotFound => {
                 return Err(x11_error(
                     "not_found",
-                    format!("no installed application matches {query:?} (a desktop entry ID such as org.gnome.Calculator, its last part, the menu name or the program name)"),
+                    format!("no installed application matches {query:?} (a desktop entry ID such as org.gnome.Calculator, its last part, the menu name or the program name; entries this user can write, such as those in ~/.local/share/applications, are not launched)"),
                 ))
             }
         };
@@ -313,22 +314,24 @@ impl Engine {
             .iter()
             .map(|w| w.window_id)
             .collect();
-        let mut cmd = std::process::Command::new(&entry.exec[0]);
-        cmd.args(&entry.exec[1..])
+        let path_var = std::env::var("PATH").unwrap_or_default();
+        let plan = launch::command(&entry, &path_var, &launch::trusted).map_err(|why| {
+            x11_error(
+                "launch_failed",
+                format!("cannot start {}: {why}", entry.name),
+            )
+        })?;
+        let mut cmd = std::process::Command::new(&plan.program);
+        cmd.args(&plan.args)
+            .current_dir(&plan.cwd)
+            .env("PATH", &plan.path)
             .env("DISPLAY", self.desktop.display())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        if let Some(dir) = entry
-            .path
-            .as_ref()
-            .filter(|p| std::path::Path::new(p).is_dir())
-        {
-            cmd.current_dir(dir);
-        }
         {
             use std::os::unix::process::CommandExt as _;
-            cmd.process_group(0);
+            cmd.arg0(&entry.exec[0]).process_group(0);
         }
         let mut child = cmd.spawn().map_err(|e| {
             x11_error(
