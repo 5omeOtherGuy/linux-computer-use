@@ -34,7 +34,7 @@ Changes to the sensitive paths above get an independent review (another agent or
 - Never point the engine, a test or a benchmark at display `:0`, the owner's session bus or another agent's workspace. Use a private display (`agent-desktop new --a11y`) and close only the workspace you created.
 - The raw NDJSON API (including `approve_app`) is a trusted-host API. Never expose it to model code or a network socket; every model call goes through the surface's validation and approval.
 - Deny always wins over allow and approval. Do not weaken a safety check or a test of one to make something pass.
-- `scripts/gate` is hermetic: no display, credentials or real home. Display and live suites are opt-in and never part of the gate: `CUA_REAL_ENGINE` (`surface/test/real-apps.test.js`, `drawing.test.js`), `CUA_BROWSER_CDP` (`surface/test/browser.test.js`), `desktop/tests/test_agent_desktop.py` and `test_fast.py` (create real workspaces), `bench/integration.mjs`.
+- `scripts/gate` is hermetic: no display, credentials or real home. Display and live suites are opt-in and never part of the gate: `CUA_X11_TEST_DISPLAY=:N` (Rust tests on a private X server, e.g. `cargo test --locked x11::tests::clipboard`), `CUA_REAL_ENGINE` (`surface/test/real-apps.test.js`, `drawing.test.js`), `CUA_BROWSER_CDP` (`surface/test/browser.test.js`), `desktop/tests/test_agent_desktop.py` and `test_fast.py` (create real workspaces), `bench/integration.mjs`.
 - `bench/model.mjs` makes paid provider API calls unless `--dry-run` is given; `benchmarks/run.mjs` starts real agents (`codex exec`, `claude -p`), with `--controller agent-desktop` in full-access mode. Run either only when the owner asks.
 - On small machines build with `CARGO_BUILD_JOBS=2`.
 
